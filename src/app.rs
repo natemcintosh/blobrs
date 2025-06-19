@@ -65,8 +65,8 @@ impl App {
             KeyCode::Char('c' | 'C') if key_event.modifiers == KeyModifiers::CONTROL => {
                 self.events.send(AppEvent::Quit)
             }
-            KeyCode::Right => self.events.send(AppEvent::Increment),
-            KeyCode::Left => self.events.send(AppEvent::Decrement),
+            KeyCode::Right | KeyCode::Up => self.events.send(AppEvent::Increment),
+            KeyCode::Left | KeyCode::Down => self.events.send(AppEvent::Decrement),
             // Other handlers you could add here.
             _ => {}
         }

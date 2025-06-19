@@ -21,9 +21,9 @@ impl Widget for &App {
             .border_type(BorderType::Rounded);
 
         let text = format!(
-            "This is a tui template.\n\
+            "This is a TUI template.\n\
                 Press `Esc`, `Ctrl-C` or `q` to stop running.\n\
-                Press left and right to increment and decrement the counter respectively.\n\
+                Press left/down and right/up to increment and decrement the counter respectively.\n\
                 Counter: {}",
             self.counter
         );
