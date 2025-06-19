@@ -44,7 +44,9 @@ impl App {
         match self.events.next()? {
             Event::Tick => self.tick(),
             Event::Crossterm(event) => match event {
-                crossterm::event::Event::Key(key_event) => self.handle_key_event(key_event)?,
+                ratatui::crossterm::event::Event::Key(key_event) => {
+                    self.handle_key_event(key_event)?
+                }
                 _ => {}
             },
             Event::App(app_event) => match app_event {
