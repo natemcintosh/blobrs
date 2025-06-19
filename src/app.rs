@@ -3,24 +3,34 @@ use ratatui::{
     DefaultTerminal,
     crossterm::event::{KeyCode, KeyEvent, KeyModifiers},
 };
+use std::{env, fs};
 
 /// Application.
 #[derive(Debug)]
 pub struct App {
     /// Is the application running?
     pub running: bool,
-    /// Counter.
-    pub counter: u8,
     /// Event handler.
     pub events: EventHandler,
+    /// Current working directory.
+    pub current_dir: String,
+    /// List of files in the current directory.
+    pub files: Vec<String>,
 }
 
 impl Default for App {
     fn default() -> Self {
+        let current_dir = env::current_dir()
+            .unwrap_or_else(|_| std::path::PathBuf::from("."))
+            .to_string_lossy()
+            .to_string();
+        let files = Self::read_directory(&current_dir);
+
         Self {
             running: true,
-            counter: 0,
             events: EventHandler::new(),
+            current_dir,
+            files,
         }
     }
 }
@@ -50,8 +60,6 @@ impl App {
                 _ => {}
             },
             Event::App(app_event) => match app_event {
-                AppEvent::Increment => self.increment_counter(),
-                AppEvent::Decrement => self.decrement_counter(),
                 AppEvent::Quit => self.quit(),
             },
         }
@@ -65,8 +73,8 @@ impl App {
             KeyCode::Char('c' | 'C') if key_event.modifiers == KeyModifiers::CONTROL => {
                 self.events.send(AppEvent::Quit)
             }
-            KeyCode::Right | KeyCode::Up => self.events.send(AppEvent::Increment),
-            KeyCode::Left | KeyCode::Down => self.events.send(AppEvent::Decrement),
+
+            KeyCode::Char('r') | KeyCode::F(5) => self.refresh_files(),
             // Other handlers you could add here.
             _ => {}
         }
@@ -84,11 +92,30 @@ impl App {
         self.running = false;
     }
 
-    pub fn increment_counter(&mut self) {
-        self.counter = self.counter.saturating_add(1);
+    /// Read the contents of a directory and return a sorted list of file names.
+    fn read_directory(path: &str) -> Vec<String> {
+        match fs::read_dir(path) {
+            Ok(entries) => {
+                let mut files = Vec::new();
+                for entry in entries.flatten() {
+                    if let Some(name) = entry.file_name().to_str() {
+                        let prefix = if entry.path().is_dir() {
+                            "📁 "
+                        } else {
+                            "📄 "
+                        };
+                        files.push(format!("{}{}", prefix, name));
+                    }
+                }
+                files.sort();
+                files
+            }
+            Err(_) => vec!["Failed to read directory".to_string()],
+        }
     }
 
-    pub fn decrement_counter(&mut self) {
-        self.counter = self.counter.saturating_sub(1);
+    /// Refresh the file list for the current directory.
+    pub fn refresh_files(&mut self) {
+        self.files = Self::read_directory(&self.current_dir);
     }
 }
