@@ -2,7 +2,7 @@ use ratatui::{
     buffer::Buffer,
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Style, Stylize},
-    widgets::{Block, BorderType, List, ListItem, ListState, Paragraph, Widget},
+    widgets::{Block, BorderType, List, ListItem, ListState, Paragraph, Widget, Wrap},
 };
 
 use crate::app::{App, AppState};
@@ -29,7 +29,35 @@ impl Widget for &App {
 }
 
 impl App {
+    /// Calculate the height needed for footer text with wrapping
+    fn calculate_footer_height(&self, text: &str, available_width: u16) -> u16 {
+        if available_width <= 4 {
+            return 3; // Minimum height for borders and padding
+        }
+
+        // Account for borders and padding (2 for left/right borders, 2 for padding)
+        let text_width = available_width.saturating_sub(4);
+
+        if text_width == 0 {
+            return 3;
+        }
+
+        // Calculate lines needed: text length / available width, with minimum of 3 and maximum of 6
+        let lines_needed = (text.len() as u16).div_ceil(text_width).clamp(1, 4);
+
+        // Add 2 for top and bottom borders
+        lines_needed + 2
+    }
+
     fn render_container_selection(&self, area: Rect, buf: &mut Buffer) {
+        // Calculate footer height based on instruction text
+        let instructions = if self.container_search_mode {
+            "Search Mode: Type to filter containers • `Enter` to confirm • `Esc` to cancel • `Ctrl+↑`/`Ctrl+↓` to navigate"
+        } else {
+            "Press `Ctrl-C` or `q` or `Esc` to quit • `r`/`F5` to refresh • `↑`/`↓` or `k`/`j` to navigate • `→`/`l`/`Enter` to select container • `/` to search"
+        };
+        let footer_height = self.calculate_footer_height(instructions, area.width);
+
         // Create a vertical layout
         let mut constraints = vec![
             Constraint::Min(0), // Main content area
@@ -59,7 +87,7 @@ impl App {
             constraints.push(Constraint::Length(error_height)); // Error/loading area
         }
 
-        constraints.push(Constraint::Length(3)); // Footer for instructions
+        constraints.push(Constraint::Length(footer_height)); // Footer for instructions
 
         let chunks = Layout::default()
             .direction(Direction::Vertical)
@@ -98,13 +126,15 @@ impl App {
 
         let title = if self.container_search_mode {
             format!(
-                " Azure Storage Account: {} - Select Container [SEARCH] ",
-                self.storage_account
+                " Azure Storage Account: {} - Select Container [SEARCH] ({} shown) ",
+                self.storage_account,
+                self.containers.len()
             )
         } else {
             format!(
-                " Azure Storage Account: {} - Select Container ",
-                self.storage_account
+                " Azure Storage Account: {} - Select Container ({} containers) ",
+                self.storage_account,
+                self.containers.len()
             )
         };
 
@@ -157,21 +187,25 @@ impl App {
             chunk_index += 1;
         }
 
-        // Footer with instructions
-        let instructions = if self.container_search_mode {
-            "Search Mode: Type to filter containers • `Enter` to confirm • `Esc` to cancel • `Ctrl+↑`/`Ctrl+↓` to navigate"
-        } else {
-            "Press `Ctrl-C` or `q` to quit • `Esc` to quit • `r`/`F5` to refresh • `↑`/`↓` or `k`/`j` to navigate • `→`/`l`/`Enter` to select container • `/` to search"
-        };
+        // Footer with instructions (using pre-calculated text)
         let footer = Paragraph::new(instructions)
             .block(Block::bordered().border_type(BorderType::Rounded))
             .fg(Color::Cyan)
-            .alignment(Alignment::Center);
+            .alignment(Alignment::Center)
+            .wrap(Wrap { trim: true });
 
         footer.render(chunks[chunk_index], buf);
     }
 
     fn render_blob_browsing(&self, area: Rect, buf: &mut Buffer) {
+        // Calculate footer height based on instruction text
+        let instructions = if self.search_mode {
+            "Search Mode: Type to filter • `Enter` to confirm • `Esc` to cancel • `Ctrl+↑`/`Ctrl+↓` to navigate"
+        } else {
+            "Press `Ctrl-C` or `q` to quit • `Esc`/`←`/`h` to go back • `r`/`F5` to refresh • `↑`/`↓` or `k`/`j` to navigate • `→`/`l`/`Enter` to enter folder • `/` to search • `i` for info • `d` to download • `Backspace` for container selection"
+        };
+        let footer_height = self.calculate_footer_height(instructions, area.width);
+
         // Create a vertical layout with main content, search (if active), error/loading, and footer
         let mut constraints = vec![
             Constraint::Min(0), // Main content area
@@ -201,7 +235,7 @@ impl App {
             constraints.push(Constraint::Length(error_height)); // Error/loading area
         }
 
-        constraints.push(Constraint::Length(3)); // Footer for instructions
+        constraints.push(Constraint::Length(footer_height)); // Footer for instructions
 
         let chunks = Layout::default()
             .direction(Direction::Vertical)
@@ -250,11 +284,18 @@ impl App {
 
         let title = if self.search_mode {
             format!(
-                " Container: {} - {} [SEARCH] ",
-                container_name, current_path_display
+                " Container: {} - {} [SEARCH] ({} shown) ",
+                container_name,
+                current_path_display,
+                self.files.len()
             )
         } else {
-            format!(" Container: {} - {} ", container_name, current_path_display)
+            format!(
+                " Container: {} - {} ({} items) ",
+                container_name,
+                current_path_display,
+                self.files.len()
+            )
         };
 
         let main_block = List::new(file_items)
@@ -308,16 +349,12 @@ impl App {
             chunk_index += 1;
         }
 
-        // Footer with instructions
-        let instructions = if self.search_mode {
-            "Search Mode: Type to filter • `Enter` to confirm • `Esc` to cancel • `Ctrl+↑`/`Ctrl+↓` to navigate"
-        } else {
-            "Press `Ctrl-C` or `q` to quit • `Esc`/`←`/`h` to go back • `r`/`F5` to refresh • `↑`/`↓` or `k`/`j` to navigate • `→`/`l`/`Enter` to enter folder • `/` to search • `i` for info • `d` to download • `Backspace` to change container"
-        };
+        // Footer with instructions (using pre-calculated text)
         let footer = Paragraph::new(instructions)
             .block(Block::bordered().border_type(BorderType::Rounded))
             .fg(Color::Cyan)
-            .alignment(Alignment::Center);
+            .alignment(Alignment::Center)
+            .wrap(Wrap { trim: true });
 
         footer.render(chunks[chunk_index], buf);
     }
