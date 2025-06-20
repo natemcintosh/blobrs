@@ -56,12 +56,11 @@ impl App {
     pub fn handle_events(&mut self) -> color_eyre::Result<()> {
         match self.events.next()? {
             Event::Tick => self.tick(),
-            Event::Crossterm(event) => match event {
-                ratatui::crossterm::event::Event::Key(key_event) => {
+            Event::Crossterm(event) => {
+                if let ratatui::crossterm::event::Event::Key(key_event) = event {
                     self.handle_key_event(key_event)?
                 }
-                _ => {}
-            },
+            }
             Event::App(app_event) => match app_event {
                 AppEvent::Quit => self.quit(),
             },
@@ -149,8 +148,7 @@ impl App {
 
         let selected_file = &self.files[self.selected_index];
         // Check if the selected item is a directory (starts with folder emoji)
-        if selected_file.starts_with("📁 ") {
-            let dir_name = &selected_file[5..]; // Remove "📁 " prefix
+        if let Some(dir_name) = selected_file.strip_prefix("📁 ") {
             let new_path = if self.current_dir.ends_with('/') {
                 format!("{}{}", self.current_dir, dir_name)
             } else {
