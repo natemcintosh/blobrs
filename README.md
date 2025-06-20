@@ -1,25 +1,14 @@
-# Bl## Features
+# Blobrs - Azure Blob Storage TUI Browser
+
+A terminal user interface (TUI) application for browsing Azure Blob Storage containers built with Rust and Ratatui.
+
+## Features
 
 - 📦 **Container Selection** - Select from a list of available containers in your storage account
 - 🔍 Browse Azure Blob Storage containers and blobs
 - 📁 Navigate through blob prefixes (virtual directories)
 - ℹ️ **Blob Information** - View detailed metadata about blobs and folder statistics
 - ⬇️ **Download Files and Folders** - Download individual files or entire folders with progress tracking
-- ⚡ Async operations with loading indicators
-- 🎨 Clean, intuitive terminal interface
-- ⌨️ Vim-style navigation keys
-- 🔍 Search/filter blobs by name (press `/`)
-- 🎭 Adaptive icons based on terminal capabilities
-- 🌍 Cross-platform support (Windows, macOS, Linux) Blob Storage TUI Browser
-
-A terminal user interface (TUI) application for browsing Azure Blob Storage containers built with Rust and Ratatui.
-
-## Features
-
-- �️ **Container Selection** - Select from a list of available containers in your storage account
-- �🔍 Browse Azure Blob Storage containers and blobs
-- 📁 Navigate through blob prefixes (virtual directories)
-- ℹ️ **Blob Information** - View detailed metadata about blobs and folder statistics
 - ⚡ Async operations with loading indicators
 - 🎨 Clean, intuitive terminal interface
 - ⌨️ Vim-style navigation keys
