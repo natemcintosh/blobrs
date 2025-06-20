@@ -12,7 +12,14 @@ impl Widget for &App {
     fn render(self, area: Rect, buf: &mut Buffer) {
         match self.state {
             AppState::ContainerSelection => self.render_container_selection(area, buf),
-            AppState::BlobBrowsing => self.render_blob_browsing(area, buf),
+            AppState::BlobBrowsing => {
+                self.render_blob_browsing(area, buf);
+
+                // Render popup over the blob browsing view if needed
+                if self.show_blob_info_popup {
+                    self.render_blob_info_popup(area, buf);
+                }
+            }
         }
     }
 }
@@ -301,7 +308,7 @@ impl App {
         let instructions = if self.search_mode {
             "Search Mode: Type to filter • `Enter` to confirm • `Esc` to cancel • `Ctrl+↑`/`Ctrl+↓` to navigate"
         } else {
-            "Press `Esc`, `Ctrl-C` or `q` to quit • `r`/`F5` to refresh • `↑`/`↓` or `k`/`j` to navigate • `→`/`l`/`Enter` to enter folder • `←`/`h` to go up • `/` to search • `Backspace` to change container"
+            "Press `Esc`, `Ctrl-C` or `q` to quit • `r`/`F5` to refresh • `↑`/`↓` or `k`/`j` to navigate • `→`/`l`/`Enter` to enter folder • `←`/`h` to go up • `/` to search • `i` for info • `Backspace` to change container"
         };
         let footer = Paragraph::new(instructions)
             .block(Block::bordered().border_type(BorderType::Rounded))
@@ -309,5 +316,144 @@ impl App {
             .alignment(Alignment::Center);
 
         footer.render(chunks[chunk_index], buf);
+    }
+
+    fn render_blob_info_popup(&self, area: Rect, buf: &mut Buffer) {
+        // Calculate popup size and position
+        let popup_width = area.width.min(60).max(40); // Between 40 and 60 characters wide
+        let popup_height = area.height.min(20).max(10); // Between 10 and 20 lines tall
+
+        // Center the popup
+        let popup_x = (area.width.saturating_sub(popup_width)) / 2;
+        let popup_y = (area.height.saturating_sub(popup_height)) / 2;
+
+        let popup_area = Rect {
+            x: area.x + popup_x,
+            y: area.y + popup_y,
+            width: popup_width,
+            height: popup_height,
+        };
+
+        // Clear the popup area (make it semi-transparent effect by using a background)
+        let clear_block = Block::bordered()
+            .border_type(BorderType::Rounded)
+            .style(Style::default().bg(Color::Black));
+        clear_block.render(popup_area, buf);
+
+        if let Some(ref blob_info) = self.current_blob_info {
+            // Create layout for popup content
+            let inner_area = Rect {
+                x: popup_area.x + 1,
+                y: popup_area.y + 1,
+                width: popup_area.width.saturating_sub(2),
+                height: popup_area.height.saturating_sub(2),
+            };
+
+            let _chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Min(0),    // Main info area
+                    Constraint::Length(1), // Footer
+                ])
+                .split(inner_area);
+
+            let mut info_lines = Vec::new();
+
+            // Title
+            if blob_info.is_folder {
+                info_lines.push(format!("{} Folder Information", self.icons.folder));
+            } else {
+                info_lines.push(format!("{} Blob Information", self.icons.file));
+            }
+            info_lines.push(String::new()); // Empty line
+
+            // Name
+            let name_display = if blob_info.name.len() > (popup_width as usize).saturating_sub(8) {
+                format!(
+                    "{}...",
+                    &blob_info.name[0..(popup_width as usize).saturating_sub(11)]
+                )
+            } else {
+                blob_info.name.clone()
+            };
+            info_lines.push(format!("Name: {}", name_display));
+            info_lines.push(String::new()); // Empty line
+
+            if blob_info.is_folder {
+                // Folder-specific information
+                if let Some(blob_count) = blob_info.blob_count {
+                    info_lines.push(format!("Blobs: {}", blob_count));
+                }
+                if let Some(total_size) = blob_info.total_size {
+                    info_lines.push(format!("Total size: {}", format_bytes(total_size)));
+                }
+            } else {
+                // Blob-specific information
+                if let Some(size) = blob_info.size {
+                    info_lines.push(format!("Size: {}", format_bytes(size)));
+                }
+                if let Some(ref last_modified) = blob_info.last_modified {
+                    info_lines.push(format!("Modified: {}", last_modified));
+                }
+                if let Some(ref etag) = blob_info.etag {
+                    let etag_display = if etag.len() > (popup_width as usize).saturating_sub(8) {
+                        format!("{}...", &etag[0..(popup_width as usize).saturating_sub(11)])
+                    } else {
+                        etag.clone()
+                    };
+                    info_lines.push(format!("ETag: {}", etag_display));
+                }
+            }
+
+            let info_text = info_lines.join("\n");
+            let info_paragraph = Paragraph::new(info_text)
+                .block(
+                    Block::bordered()
+                        .border_type(BorderType::Rounded)
+                        .title(" Information ")
+                        .style(Style::default().fg(Color::Cyan).bg(Color::Black)),
+                )
+                .style(Style::default().bg(Color::Black))
+                .wrap(ratatui::widgets::Wrap { trim: true });
+
+            info_paragraph.render(popup_area, buf);
+
+            // Footer with instructions (overlaid at bottom of popup)
+            let footer_area = Rect {
+                x: popup_area.x + 2,
+                y: popup_area.y + popup_area.height.saturating_sub(2),
+                width: popup_area.width.saturating_sub(4),
+                height: 1,
+            };
+
+            let instructions = "Press Esc, ← or h to close";
+            let footer_text = Paragraph::new(instructions)
+                .style(Style::default().fg(Color::Yellow).bg(Color::Black))
+                .alignment(Alignment::Center);
+
+            footer_text.render(footer_area, buf);
+        }
+    }
+}
+
+/// Format bytes in human-readable format
+fn format_bytes(bytes: u64) -> String {
+    const UNITS: &[&str] = &["B", "KB", "MB", "GB", "TB"];
+    const THRESHOLD: f64 = 1024.0;
+
+    if bytes == 0 {
+        return "0 B".to_string();
+    }
+
+    let bytes_f = bytes as f64;
+    let unit_index = (bytes_f.log10() / THRESHOLD.log10()).floor() as usize;
+    let unit_index = unit_index.min(UNITS.len() - 1);
+
+    let size = bytes_f / THRESHOLD.powi(unit_index as i32);
+
+    if unit_index == 0 {
+        format!("{} {}", bytes, UNITS[unit_index])
+    } else {
+        format!("{:.1} {}", size, UNITS[unit_index])
     }
 }

@@ -7,6 +7,7 @@ A terminal user interface (TUI) application for browsing Azure Blob Storage cont
 - �️ **Container Selection** - Select from a list of available containers in your storage account
 - �🔍 Browse Azure Blob Storage containers and blobs
 - 📁 Navigate through blob prefixes (virtual directories)
+- ℹ️ **Blob Information** - View detailed metadata about blobs and folder statistics
 - ⚡ Async operations with loading indicators
 - 🎨 Clean, intuitive terminal interface
 - ⌨️ Vim-style navigation keys
@@ -131,6 +132,7 @@ After selecting a container, you can browse blobs:
 | `→` / `l` / `Enter` | Enter selected folder |
 | `←` / `h` | Go up one level |
 | `/` | Search/filter blobs |
+| `i` | Show blob/folder information |
 | `r` / `F5` | Refresh current view |
 | `Backspace` | Return to container selection |
 | `q` / `Esc` / `Ctrl+C` | Quit application |
@@ -143,6 +145,18 @@ After selecting a container, you can browse blobs:
 | `Enter` | Confirm search (keep filtered results) |
 | `Esc` | Cancel search (restore full list) |
 | `Ctrl+↑` / `Ctrl+↓` | Navigate while searching |
+
+### Blob Information Mode
+
+When viewing blob or folder information (press `i` in blob browsing mode):
+
+| Key | Action |
+|-----|--------|
+| `Esc` / `←` / `h` | Close information popup |
+
+The information is displayed in a popup window that overlays the blob list, showing:
+- **For individual blobs**: Name, size, last modified date, and ETag
+- **For folders**: Name, number of contained blobs, and total storage size
 
 ## Terminal Compatibility
 

@@ -4,6 +4,7 @@ use crate::{
 };
 use base64::{Engine as _, engine::general_purpose};
 use chrono::Utc;
+use futures::stream::StreamExt;
 use hmac::{Hmac, Mac};
 use object_store::{ObjectStore, azure::MicrosoftAzureBuilder, path::Path as ObjectPath};
 use ratatui::{
@@ -13,7 +14,7 @@ use ratatui::{
 use regex::Regex;
 use reqwest;
 use sha2::Sha256;
-use std::sync::Arc;
+use std::sync::Arc; // Add this import for collect() on streams
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum AppState {
@@ -24,6 +25,17 @@ pub enum AppState {
 #[derive(Debug, Clone)]
 pub struct ContainerInfo {
     pub name: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct BlobInfo {
+    pub name: String,
+    pub size: Option<u64>, // Changed from usize to u64
+    pub last_modified: Option<String>,
+    pub etag: Option<String>,
+    pub is_folder: bool,
+    pub blob_count: Option<usize>, // For folders: number of blobs
+    pub total_size: Option<u64>, // For folders: total size of all blobs (changed from usize to u64)
 }
 
 /// Application.
@@ -68,6 +80,10 @@ pub struct App {
     pub search_query: String,
     /// Icon set based on terminal capabilities.
     pub icons: IconSet,
+    /// Current blob information being displayed.
+    pub current_blob_info: Option<BlobInfo>,
+    /// Whether to show the blob info popup.
+    pub show_blob_info_popup: bool,
 }
 
 impl std::fmt::Debug for App {
@@ -90,6 +106,8 @@ impl std::fmt::Debug for App {
             .field("search_mode", &self.search_mode)
             .field("search_query", &self.search_query)
             .field("icons", &self.icons)
+            .field("current_blob_info", &self.current_blob_info)
+            .field("show_blob_info_popup", &self.show_blob_info_popup)
             .finish()
     }
 }
@@ -118,6 +136,8 @@ impl App {
             search_mode: false,
             search_query: String::new(),
             icons: detect_terminal_icons(),
+            current_blob_info: None,
+            show_blob_info_popup: false,
         };
 
         // Load container list
@@ -203,37 +223,78 @@ impl App {
             AppState::BlobBrowsing => {
                 match key_event.code {
                     KeyCode::Char('/') => {
-                        self.enter_search_mode();
-                    }
-                    KeyCode::Char('r') | KeyCode::F(5) => {
-                        if let Err(e) = self.refresh_files().await {
-                            self.error_message = Some(format!("Refresh failed: {}", e));
+                        if !self.show_blob_info_popup {
+                            self.enter_search_mode();
                         }
                     }
-                    KeyCode::Up | KeyCode::Char('k') => self.move_up(),
-                    KeyCode::Down | KeyCode::Char('j') => self.move_down(),
+                    KeyCode::Char('r') | KeyCode::F(5) => {
+                        if !self.show_blob_info_popup {
+                            if let Err(e) = self.refresh_files().await {
+                                self.error_message = Some(format!("Refresh failed: {}", e));
+                            }
+                        }
+                    }
+                    KeyCode::Char('i') => {
+                        if !self.show_blob_info_popup {
+                            if let Err(e) = self.show_blob_info().await {
+                                self.error_message =
+                                    Some(format!("Failed to get blob info: {}", e));
+                            }
+                        }
+                    }
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        if !self.show_blob_info_popup {
+                            self.move_up();
+                        }
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        if !self.show_blob_info_popup {
+                            self.move_down();
+                        }
+                    }
                     KeyCode::Right | KeyCode::Char('l') | KeyCode::Enter => {
-                        if let Err(e) = self.enter_directory().await {
-                            self.error_message = Some(format!("Enter directory failed: {}", e));
+                        if !self.show_blob_info_popup {
+                            if let Err(e) = self.enter_directory().await {
+                                self.error_message = Some(format!("Enter directory failed: {}", e));
+                            }
                         }
                     }
                     KeyCode::Left | KeyCode::Char('h') => {
-                        if let Err(e) = self.go_up_directory().await {
-                            self.error_message = Some(format!("Go up failed: {}", e));
+                        if self.show_blob_info_popup {
+                            // Close popup
+                            self.show_blob_info_popup = false;
+                            self.current_blob_info = None;
+                        } else {
+                            if let Err(e) = self.go_up_directory().await {
+                                self.error_message = Some(format!("Go up failed: {}", e));
+                            }
+                        }
+                    }
+                    KeyCode::Esc => {
+                        if self.show_blob_info_popup {
+                            // Close popup
+                            self.show_blob_info_popup = false;
+                            self.current_blob_info = None;
                         }
                     }
                     KeyCode::Backspace => {
-                        // Go back to container selection
-                        self.state = AppState::ContainerSelection;
-                        self.object_store = None;
-                        self.current_path.clear();
-                        self.files.clear();
-                        self.all_files.clear();
-                        self.selected_index = 0;
-                        self.search_mode = false;
-                        self.search_query.clear();
-                        self.container_search_mode = false;
-                        self.container_search_query.clear();
+                        if self.show_blob_info_popup {
+                            // Close popup
+                            self.show_blob_info_popup = false;
+                            self.current_blob_info = None;
+                        } else {
+                            // Go back to container selection
+                            self.state = AppState::ContainerSelection;
+                            self.object_store = None;
+                            self.current_path.clear();
+                            self.files.clear();
+                            self.all_files.clear();
+                            self.selected_index = 0;
+                            self.search_mode = false;
+                            self.search_query.clear();
+                            self.container_search_mode = false;
+                            self.container_search_query.clear();
+                        }
                     }
                     _ => {
                         self.error_message = None;
@@ -672,5 +733,121 @@ impl App {
                 .collect();
         }
         self.selected_container_index = 0;
+    }
+
+    /// Show information about the currently selected blob or folder.
+    pub async fn show_blob_info(&mut self) -> color_eyre::Result<()> {
+        if self.files.is_empty() {
+            return Ok(());
+        }
+
+        let selected_file = &self.files[self.selected_index];
+        let folder_prefix = format!("{} ", self.icons.folder);
+        let file_prefix = format!("{} ", self.icons.file);
+
+        let is_folder = selected_file.starts_with(&folder_prefix);
+        let name = if is_folder {
+            selected_file
+                .strip_prefix(&folder_prefix)
+                .unwrap_or(selected_file)
+        } else {
+            selected_file
+                .strip_prefix(&file_prefix)
+                .unwrap_or(selected_file)
+        };
+
+        if is_folder {
+            // Get folder information (blob count and total size)
+            self.current_blob_info = Some(self.get_folder_info(name).await?);
+        } else {
+            // Get individual blob information
+            self.current_blob_info = Some(self.get_blob_info(name).await?);
+        }
+
+        self.show_blob_info_popup = true;
+        Ok(())
+    }
+
+    /// Get information about a folder (blob count and total size).
+    async fn get_folder_info(&self, folder_name: &str) -> color_eyre::Result<BlobInfo> {
+        let object_store = self
+            .object_store
+            .as_ref()
+            .ok_or_else(|| color_eyre::eyre::eyre!("No container selected"))?;
+
+        let folder_path = if self.current_path.is_empty() {
+            format!("{}/", folder_name)
+        } else if self.current_path.ends_with('/') {
+            format!("{}{}/", self.current_path, folder_name)
+        } else {
+            format!("{}/{}/", self.current_path, folder_name)
+        };
+
+        let object_path = ObjectPath::from(folder_path.as_str());
+
+        // List all objects in this folder (recursively)
+        let mut blob_count = 0;
+        let mut total_size: u64 = 0; // Explicitly type as u64
+
+        let stream = object_store.list(Some(&object_path));
+        let objects: Vec<_> = stream.collect().await;
+
+        for result in objects {
+            match result {
+                Ok(meta) => {
+                    blob_count += 1;
+                    total_size += meta.size;
+                }
+                Err(_) => continue, // Skip errors and continue counting
+            }
+        }
+
+        Ok(BlobInfo {
+            name: folder_name.to_string(),
+            size: None,
+            last_modified: None,
+            etag: None,
+            is_folder: true,
+            blob_count: Some(blob_count),
+            total_size: Some(total_size),
+        })
+    }
+
+    /// Get information about a specific blob.
+    async fn get_blob_info(&self, blob_name: &str) -> color_eyre::Result<BlobInfo> {
+        let object_store = self
+            .object_store
+            .as_ref()
+            .ok_or_else(|| color_eyre::eyre::eyre!("No container selected"))?;
+
+        let blob_path = if self.current_path.is_empty() {
+            blob_name.to_string()
+        } else if self.current_path.ends_with('/') {
+            format!("{}{}", self.current_path, blob_name)
+        } else {
+            format!("{}/{}", self.current_path, blob_name)
+        };
+
+        let object_path = ObjectPath::from(blob_path.as_str());
+
+        match object_store.head(&object_path).await {
+            Ok(meta) => Ok(BlobInfo {
+                name: blob_name.to_string(),
+                size: Some(meta.size),
+                last_modified: Some(
+                    meta.last_modified
+                        .format("%Y-%m-%d %H:%M:%S UTC")
+                        .to_string(),
+                ),
+                etag: meta.e_tag.clone(),
+                is_folder: false,
+                blob_count: None,
+                total_size: None,
+            }),
+            Err(e) => Err(color_eyre::eyre::eyre!(
+                "Failed to get blob metadata: {}",
+                e
+            )),
+        }
     }
 }
