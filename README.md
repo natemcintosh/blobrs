@@ -30,7 +30,14 @@ You'll need an Azure Storage Account with one or more containers. If you don't h
 
 1. Create an Azure Storage Account in the [Azure Portal](https://portal.azure.com)
 2. Create one or more containers in your storage account
-3. Get your storage account access key from the "Access keys" section
+3. Get your storage account access key:
+   - Navigate to your Storage Account in the Azure Portal
+   - In the left sidebar, under "Security + networking", click **"Access keys"**
+   - You'll see two keys (key1 and key2) - you can use either one
+   - Click **"Show"** next to the key you want to use
+   - Copy the **"Key"** value (not the connection string)
+
+> **Note:** Keep your access key secure and never commit it to version control. The access key provides full access to your storage account.
 
 ### 2. Environment Variables
 
@@ -49,6 +56,21 @@ AZURE_STORAGE_ACCESS_KEY=your_access_key
 ```
 
 **Note:** You no longer need to specify `AZURE_CONTAINER_NAME` as the application will present you with a list of containers to select from.
+
+### 3. Quick Setup (Optional)
+
+If you have [just](https://github.com/casey/just) installed, you can use the provided justfile for easy setup:
+
+```bash
+# Get detailed project information and setup instructions
+just info
+
+# Setup development environment (creates .env template)
+just setup
+
+# Check environment status
+just env-status
+```
 
 ## Installation
 
