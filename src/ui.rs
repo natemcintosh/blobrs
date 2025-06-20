@@ -42,9 +42,15 @@ impl Widget for &App {
             vec![ListItem::new(format!("{} Loading...", self.icons.loading))]
         } else if self.files.is_empty() {
             if self.search_mode && !self.search_query.is_empty() {
-                vec![ListItem::new(format!("{} No results found", self.icons.search))]
+                vec![ListItem::new(format!(
+                    "{} No results found",
+                    self.icons.search
+                ))]
             } else {
-                vec![ListItem::new(format!("{} No items found", self.icons.empty))]
+                vec![ListItem::new(format!(
+                    "{} No items found",
+                    self.icons.empty
+                ))]
             }
         } else {
             self.files
@@ -92,7 +98,7 @@ impl Widget for &App {
                 .block(
                     Block::bordered()
                         .title(" Search (Press Enter to confirm, Esc to cancel) ")
-                        .border_type(BorderType::Rounded)
+                        .border_type(BorderType::Rounded),
                 )
                 .fg(Color::Cyan)
                 .alignment(Alignment::Left);
@@ -109,10 +115,13 @@ impl Widget for &App {
             error_widget.render(chunks[chunk_index], buf);
             chunk_index += 1;
         } else if self.is_loading {
-            let loading_widget = Paragraph::new(format!("{} Loading Azure Blob Storage...", self.icons.loading))
-                .block(Block::bordered().border_type(BorderType::Rounded))
-                .fg(Color::Yellow)
-                .alignment(Alignment::Center);
+            let loading_widget = Paragraph::new(format!(
+                "{} Loading Azure Blob Storage...",
+                self.icons.loading
+            ))
+            .block(Block::bordered().border_type(BorderType::Rounded))
+            .fg(Color::Yellow)
+            .alignment(Alignment::Center);
             loading_widget.render(chunks[chunk_index], buf);
             chunk_index += 1;
         }

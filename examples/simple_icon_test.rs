@@ -3,7 +3,7 @@ use std::env;
 fn main() {
     println!("🔍 Terminal Icon Detection Test");
     println!("==============================");
-    
+
     // Show current environment
     println!("\n📋 Environment Variables:");
     println!("TERM: {:?}", env::var("TERM"));
@@ -12,7 +12,7 @@ fn main() {
     println!("LC_CTYPE: {:?}", env::var("LC_CTYPE"));
     println!("LANG: {:?}", env::var("LANG"));
     println!("BLOBRS_ICONS: {:?}", env::var("BLOBRS_ICONS"));
-    
+
     // Simple icon detection logic
     let icons = if env::var("BLOBRS_ICONS").unwrap_or_default() == "ascii" {
         "[DIR] [FILE] [LOADING] [ERROR] [OK]"
@@ -23,7 +23,7 @@ fn main() {
     } else {
         "[DIR] [FILE] [LOADING] [ERROR] [OK]"
     };
-    
+
     println!("\n🎭 Detected Icons: {}", icons);
 }
 

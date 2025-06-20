@@ -1,4 +1,7 @@
-use crate::{event::{AppEvent, Event, EventHandler}, terminal_icons::{detect_terminal_icons, IconSet}};
+use crate::{
+    event::{AppEvent, Event, EventHandler},
+    terminal_icons::{IconSet, detect_terminal_icons},
+};
 use object_store::{ObjectStore, path::Path as ObjectPath};
 use ratatui::{
     DefaultTerminal,
@@ -327,10 +330,12 @@ impl App {
         if self.search_query.is_empty() {
             self.files = self.all_files.clone();
         } else {
-            self.files = self.all_files
+            self.files = self
+                .all_files
                 .iter()
                 .filter(|file| {
-                    file.to_lowercase().contains(&self.search_query.to_lowercase())
+                    file.to_lowercase()
+                        .contains(&self.search_query.to_lowercase())
                 })
                 .cloned()
                 .collect();
