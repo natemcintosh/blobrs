@@ -583,13 +583,6 @@ impl App {
         // Create authorization header
         let authorization = format!("SharedKey {}:{}", account_name, signature);
 
-        // Debug: Log the request details
-        let debug_request = format!(
-            "Request URL: {}\nAuthorization: {}\nDate: {}\nString to sign:\n{}",
-            url, authorization, date, string_to_sign
-        );
-        std::fs::write("debug_request.log", debug_request).ok();
-
         // Make the HTTP request
         let client = reqwest::Client::new();
         let response = client
@@ -616,17 +609,10 @@ impl App {
             ));
         }
 
-        // Debug: Write the XML response to a log file for troubleshooting
-        std::fs::write("debug_azure_response.xml", &response_text).ok();
-
         // Parse XML response
         let containers = self
             .parse_containers_xml(&response_text)
             .map_err(|e| format!("Failed to parse XML response: {}", e))?;
-
-        // Debug: Write container info to log file
-        let debug_info = format!("Parsed {} containers:\n{:#?}", containers.len(), containers);
-        std::fs::write("debug_containers.log", debug_info).ok();
 
         Ok(containers)
     }
