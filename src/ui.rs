@@ -39,12 +39,12 @@ impl Widget for &App {
 
         // Main block with file list
         let file_items: Vec<ListItem> = if self.is_loading {
-            vec![ListItem::new("🔄 Loading...")]
+            vec![ListItem::new(format!("{} Loading...", self.icons.loading))]
         } else if self.files.is_empty() {
             if self.search_mode && !self.search_query.is_empty() {
-                vec![ListItem::new("� No results found")]
+                vec![ListItem::new(format!("{} No results found", self.icons.search))]
             } else {
-                vec![ListItem::new("�📭 No items found")]
+                vec![ListItem::new(format!("{} No items found", self.icons.empty))]
             }
         } else {
             self.files
@@ -102,14 +102,14 @@ impl Widget for &App {
 
         // Error/Loading message if present
         if let Some(error) = &self.error_message {
-            let error_widget = Paragraph::new(format!("❌ {}", error))
+            let error_widget = Paragraph::new(format!("{} {}", self.icons.error, error))
                 .block(Block::bordered().border_type(BorderType::Rounded))
                 .fg(Color::Red)
                 .alignment(Alignment::Center);
             error_widget.render(chunks[chunk_index], buf);
             chunk_index += 1;
         } else if self.is_loading {
-            let loading_widget = Paragraph::new("🔄 Loading Azure Blob Storage...")
+            let loading_widget = Paragraph::new(format!("{} Loading Azure Blob Storage...", self.icons.loading))
                 .block(Block::bordered().border_type(BorderType::Rounded))
                 .fg(Color::Yellow)
                 .alignment(Alignment::Center);

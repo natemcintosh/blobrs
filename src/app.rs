@@ -1,4 +1,4 @@
-use crate::event::{AppEvent, Event, EventHandler};
+use crate::{event::{AppEvent, Event, EventHandler}, terminal_icons::{detect_terminal_icons, IconSet}};
 use object_store::{ObjectStore, path::Path as ObjectPath};
 use ratatui::{
     DefaultTerminal,
@@ -30,6 +30,8 @@ pub struct App {
     pub search_mode: bool,
     /// Current search query.
     pub search_query: String,
+    /// Icon set based on terminal capabilities.
+    pub icons: IconSet,
 }
 
 impl std::fmt::Debug for App {
@@ -44,6 +46,7 @@ impl std::fmt::Debug for App {
             .field("error_message", &self.error_message)
             .field("search_mode", &self.search_mode)
             .field("search_query", &self.search_query)
+            .field("icons", &self.icons)
             .finish()
     }
 }
@@ -63,6 +66,7 @@ impl App {
             error_message: None,
             search_mode: false,
             search_query: String::new(),
+            icons: detect_terminal_icons(),
         };
 
         // Load initial file list
@@ -168,7 +172,7 @@ impl App {
         for prefix in result.common_prefixes {
             let name = prefix.as_ref().trim_end_matches('/');
             if let Some(last_part) = name.split('/').next_back() {
-                items.push(format!("📁 {}", last_part));
+                items.push(format!("{} {}", self.icons.folder, last_part));
             }
         }
 
@@ -176,7 +180,7 @@ impl App {
         for meta in result.objects {
             let name = meta.location.as_ref();
             if let Some(last_part) = name.split('/').next_back() {
-                items.push(format!("📄 {}", last_part));
+                items.push(format!("{} {}", self.icons.file, last_part));
             }
         }
 
@@ -229,8 +233,9 @@ impl App {
         }
 
         let selected_file = &self.files[self.selected_index];
-        // Check if the selected item is a directory (starts with folder emoji)
-        if let Some(dir_name) = selected_file.strip_prefix("📁 ") {
+        // Check if the selected item is a directory (starts with folder icon)
+        let folder_prefix = format!("{} ", self.icons.folder);
+        if let Some(dir_name) = selected_file.strip_prefix(&folder_prefix) {
             let new_path = if self.current_path.is_empty() {
                 format!("{}/", dir_name)
             } else if self.current_path.ends_with('/') {

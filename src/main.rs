@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 pub mod app;
 pub mod event;
+pub mod terminal_icons;
 pub mod ui;
 
 #[tokio::main]

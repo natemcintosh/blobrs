@@ -9,6 +9,9 @@ A terminal user interface (TUI) application for browsing Azure Blob Storage cont
 - ⚡ Async operations with loading indicators
 - 🎨 Clean, intuitive terminal interface
 - ⌨️ Vim-style navigation keys
+- 🔍 Search/filter blobs by name (press `/`)
+- 🎭 Adaptive icons based on terminal capabilities
+- 🌍 Cross-platform support (Windows, macOS, Linux)
 
 ## Prerequisites
 
@@ -110,15 +113,67 @@ just run-release
 | `↓` / `j` | Move selection down |
 | `→` / `l` / `Enter` | Enter selected folder |
 | `←` / `h` | Go up one level |
+| `/` | Search/filter blobs |
 | `r` / `F5` | Refresh current view |
 | `q` / `Esc` / `Ctrl+C` | Quit application |
 
+### Search Mode
+
+| Key | Action |
+|-----|--------|
+| `Type` | Filter results in real-time |
+| `Enter` | Confirm search (keep filtered results) |
+| `Esc` | Cancel search (restore full list) |
+| `Ctrl+↑` / `Ctrl+↓` | Navigate while searching |
+
+## Terminal Compatibility
+
+Blobrs automatically detects your terminal's capabilities and adapts its icons accordingly:
+
+### Unicode/Emoji Icons (Modern Terminals)
+- **Folders**: 📁 
+- **Files**: 📄
+- **Loading**: 🔄
+- **Errors**: ❌
+- **Empty**: 📭
+- **Search**: 🔍
+
+**Supported terminals**: Kitty, Alacritty, WezTerm, iTerm2, VS Code, Windows Terminal, and most modern terminals with UTF-8 support.
+
+### ASCII Icons (Basic Terminals)
+- **Folders**: [DIR]
+- **Files**: [FILE]
+- **Loading**: [LOADING]
+- **Errors**: [ERROR]
+- **Empty**: [EMPTY]
+- **Search**: [SEARCH]
+
+### Minimal Icons (Legacy Terminals)
+- **Folders**: D
+- **Files**: F
+- **Loading**: *
+- **Errors**: !
+- **Empty**: -
+- **Search**: ?
+
+### Manual Override
+
+You can force a specific icon set using the `BLOBRS_ICONS` environment variable:
+
+```bash
+export BLOBRS_ICONS=unicode  # Force Unicode/emoji icons
+export BLOBRS_ICONS=ascii    # Force ASCII icons
+export BLOBRS_ICONS=minimal  # Force minimal icons
+```
+
 ## How It Works
 
-- **Blobs**: Individual files in your container appear with a 📄 icon
-- **Prefixes**: Virtual directories (blob name prefixes ending with `/`) appear with a 📁 icon
+- **Blobs**: Individual files in your container appear with a file icon (📄, [FILE], or F depending on terminal)
+- **Prefixes**: Virtual directories (blob name prefixes ending with `/`) appear with a folder icon (📁, [DIR], or D depending on terminal)
 - **Navigation**: Uses Azure Blob Storage's hierarchical namespace simulation through prefixes
 - **Async Operations**: All Azure API calls are asynchronous with loading indicators
+- **Terminal Detection**: Automatically detects terminal capabilities for optimal icon display
+- **Search**: Real-time filtering of blobs and directories by name
 
 ## Troubleshooting
 
