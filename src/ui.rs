@@ -24,6 +24,11 @@ impl App {
             Constraint::Min(0), // Main content area
         ];
 
+        // Add space for search input if in container search mode
+        if self.container_search_mode {
+            constraints.push(Constraint::Length(3)); // Search input area
+        }
+
         // Add space for error message if present
         if self.error_message.is_some() || self.is_loading {
             // Calculate height based on error message length and terminal width
@@ -57,10 +62,17 @@ impl App {
                 self.icons.loading
             ))]
         } else if self.containers.is_empty() {
-            vec![ListItem::new(format!(
-                "{} No containers found",
-                self.icons.empty
-            ))]
+            if self.container_search_mode && !self.container_search_query.is_empty() {
+                vec![ListItem::new(format!(
+                    "{} No containers found matching search",
+                    self.icons.search
+                ))]
+            } else {
+                vec![ListItem::new(format!(
+                    "{} No containers found",
+                    self.icons.empty
+                ))]
+            }
         } else {
             self.containers
                 .iter()
@@ -73,10 +85,17 @@ impl App {
             list_state.select(Some(self.selected_container_index));
         }
 
-        let title = format!(
-            " Azure Storage Account: {} - Select Container ",
-            self.storage_account
-        );
+        let title = if self.container_search_mode {
+            format!(
+                " Azure Storage Account: {} - Select Container [SEARCH] ",
+                self.storage_account
+            )
+        } else {
+            format!(
+                " Azure Storage Account: {} - Select Container ",
+                self.storage_account
+            )
+        };
 
         let main_block = List::new(container_items)
             .block(
@@ -92,6 +111,21 @@ impl App {
         ratatui::widgets::StatefulWidget::render(main_block, chunks[0], buf, &mut list_state);
 
         let mut chunk_index = 1;
+
+        // Search input if in container search mode
+        if self.container_search_mode {
+            let search_text = format!("Search: {}", self.container_search_query);
+            let search_widget = Paragraph::new(search_text)
+                .block(
+                    Block::bordered()
+                        .title(" Search Containers (Press Enter to confirm, Esc to cancel) ")
+                        .border_type(BorderType::Rounded),
+                )
+                .fg(Color::Cyan)
+                .alignment(Alignment::Left);
+            search_widget.render(chunks[chunk_index], buf);
+            chunk_index += 1;
+        }
 
         // Error/Loading message if present
         if let Some(error) = &self.error_message {
@@ -113,7 +147,11 @@ impl App {
         }
 
         // Footer with instructions
-        let instructions = "Press `Esc`, `Ctrl-C` or `q` to quit • `r`/`F5` to refresh • `↑`/`↓` or `k`/`j` to navigate • `→`/`l`/`Enter` to select container";
+        let instructions = if self.container_search_mode {
+            "Search Mode: Type to filter containers • `Enter` to confirm • `Esc` to cancel • `Ctrl+↑`/`Ctrl+↓` to navigate"
+        } else {
+            "Press `Esc`, `Ctrl-C` or `q` to quit • `r`/`F5` to refresh • `↑`/`↓` or `k`/`j` to navigate • `→`/`l`/`Enter` to select container • `/` to search"
+        };
         let footer = Paragraph::new(instructions)
             .block(Block::bordered().border_type(BorderType::Rounded))
             .fg(Color::Cyan)

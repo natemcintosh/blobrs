@@ -40,6 +40,8 @@ pub struct App {
     pub access_key: String,
     /// List of available containers.
     pub containers: Vec<ContainerInfo>,
+    /// All containers (unfiltered) for search functionality.
+    pub all_containers: Vec<ContainerInfo>,
     /// Currently selected container index.
     pub selected_container_index: usize,
     /// Azure Blob Storage client (only available after container selection).
@@ -56,6 +58,10 @@ pub struct App {
     pub is_loading: bool,
     /// Error message to display.
     pub error_message: Option<String>,
+    /// Search mode state for containers.
+    pub container_search_mode: bool,
+    /// Current container search query.
+    pub container_search_query: String,
     /// Search mode state.
     pub search_mode: bool,
     /// Current search query.
@@ -71,6 +77,7 @@ impl std::fmt::Debug for App {
             .field("state", &self.state)
             .field("storage_account", &self.storage_account)
             .field("containers", &self.containers)
+            .field("all_containers", &self.all_containers)
             .field("selected_container_index", &self.selected_container_index)
             .field("current_path", &self.current_path)
             .field("files", &self.files)
@@ -78,6 +85,8 @@ impl std::fmt::Debug for App {
             .field("selected_index", &self.selected_index)
             .field("is_loading", &self.is_loading)
             .field("error_message", &self.error_message)
+            .field("container_search_mode", &self.container_search_mode)
+            .field("container_search_query", &self.container_search_query)
             .field("search_mode", &self.search_mode)
             .field("search_query", &self.search_query)
             .field("icons", &self.icons)
@@ -95,6 +104,7 @@ impl App {
             storage_account,
             access_key,
             containers: Vec::new(),
+            all_containers: Vec::new(),
             selected_container_index: 0,
             object_store: None,
             current_path: String::new(),
@@ -103,6 +113,8 @@ impl App {
             selected_index: 0,
             is_loading: false,
             error_message: None,
+            container_search_mode: false,
+            container_search_query: String::new(),
             search_mode: false,
             search_query: String::new(),
             icons: detect_terminal_icons(),
@@ -139,7 +151,11 @@ impl App {
 
     /// Handles the key events and updates the state of [`App`].
     pub async fn handle_key_event(&mut self, key_event: KeyEvent) -> color_eyre::Result<()> {
-        // Handle search mode separately (only in blob browsing mode)
+        // Handle search mode separately
+        if self.container_search_mode && self.state == AppState::ContainerSelection {
+            return self.handle_container_search_key_event(key_event).await;
+        }
+
         if self.search_mode && self.state == AppState::BlobBrowsing {
             return self.handle_search_key_event(key_event).await;
         }
@@ -165,6 +181,9 @@ impl App {
         // State-specific key handling
         match self.state {
             AppState::ContainerSelection => match key_event.code {
+                KeyCode::Char('/') => {
+                    self.enter_container_search_mode();
+                }
                 KeyCode::Up | KeyCode::Char('k') => self.move_container_up(),
                 KeyCode::Down | KeyCode::Char('j') => self.move_container_down(),
                 KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
@@ -213,6 +232,8 @@ impl App {
                         self.selected_index = 0;
                         self.search_mode = false;
                         self.search_query.clear();
+                        self.container_search_mode = false;
+                        self.container_search_query.clear();
                     }
                     _ => {
                         self.error_message = None;
@@ -428,8 +449,13 @@ impl App {
 
         match self.list_containers().await {
             Ok(containers) => {
-                self.containers = containers;
-                self.selected_container_index = 0;
+                self.all_containers = containers.clone();
+                if self.container_search_mode && !self.container_search_query.is_empty() {
+                    self.filter_containers();
+                } else {
+                    self.containers = containers;
+                    self.selected_container_index = 0;
+                }
             }
             Err(e) => {
                 self.error_message = Some(format!("Failed to list containers: {}", e));
@@ -579,5 +605,72 @@ impl App {
         {
             self.selected_container_index += 1;
         }
+    }
+
+    /// Enter container search mode.
+    pub fn enter_container_search_mode(&mut self) {
+        self.container_search_mode = true;
+        self.container_search_query.clear();
+        self.error_message = None;
+    }
+
+    /// Exit container search mode and restore original container list.
+    pub fn exit_container_search_mode(&mut self) {
+        self.container_search_mode = false;
+        self.container_search_query.clear();
+        self.containers = self.all_containers.clone();
+        self.selected_container_index = 0;
+    }
+
+    /// Handle key events when in container search mode.
+    pub async fn handle_container_search_key_event(
+        &mut self,
+        key_event: KeyEvent,
+    ) -> color_eyre::Result<()> {
+        match key_event.code {
+            KeyCode::Esc => {
+                self.exit_container_search_mode();
+            }
+            KeyCode::Enter => {
+                // Exit search mode but keep the filtered results
+                self.container_search_mode = false;
+            }
+            KeyCode::Backspace => {
+                self.container_search_query.pop();
+                self.filter_containers();
+            }
+            KeyCode::Up if key_event.modifiers == KeyModifiers::CONTROL => {
+                self.move_container_up();
+            }
+            KeyCode::Down if key_event.modifiers == KeyModifiers::CONTROL => {
+                self.move_container_down();
+            }
+            KeyCode::Char(c) => {
+                self.container_search_query.push(c);
+                self.filter_containers();
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// Filter containers based on search query.
+    pub fn filter_containers(&mut self) {
+        if self.container_search_query.is_empty() {
+            self.containers = self.all_containers.clone();
+        } else {
+            self.containers = self
+                .all_containers
+                .iter()
+                .filter(|container| {
+                    container
+                        .name
+                        .to_lowercase()
+                        .contains(&self.container_search_query.to_lowercase())
+                })
+                .cloned()
+                .collect();
+        }
+        self.selected_container_index = 0;
     }
 }
