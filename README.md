@@ -1,4 +1,16 @@
-# Blobrs - Azure Blob Storage TUI Browser
+# Bl## Features
+
+- 📦 **Container Selection** - Select from a list of available containers in your storage account
+- 🔍 Browse Azure Blob Storage containers and blobs
+- 📁 Navigate through blob prefixes (virtual directories)
+- ℹ️ **Blob Information** - View detailed metadata about blobs and folder statistics
+- ⬇️ **Download Files and Folders** - Download individual files or entire folders with progress tracking
+- ⚡ Async operations with loading indicators
+- 🎨 Clean, intuitive terminal interface
+- ⌨️ Vim-style navigation keys
+- 🔍 Search/filter blobs by name (press `/`)
+- 🎭 Adaptive icons based on terminal capabilities
+- 🌍 Cross-platform support (Windows, macOS, Linux) Blob Storage TUI Browser
 
 A terminal user interface (TUI) application for browsing Azure Blob Storage containers built with Rust and Ratatui.
 
@@ -133,6 +145,7 @@ After selecting a container, you can browse blobs:
 | `←` / `h` / `Esc` | Go up one level (or to container list if at root) |
 | `/` | Search/filter blobs |
 | `i` | Show blob/folder information |
+| `d` | Download selected file or folder |
 | `r` / `F5` | Refresh current view |
 | `Backspace` | Return to container selection |
 | `q` / `Ctrl+C` | Quit application |
@@ -169,6 +182,26 @@ When viewing blob or folder information (press `i` in blob browsing mode):
 The information is displayed in a popup window that overlays the blob list, showing:
 - **For individual blobs**: Name, size, last modified date, and ETag
 - **For folders**: Name, number of contained blobs, and total storage size
+
+### Download Mode
+
+When downloading files or folders (press `d` in blob browsing mode):
+
+| Key | Action |
+|-----|--------|
+| `Enter` | Select download destination folder |
+| `Esc` | Cancel download |
+
+The download process works as follows:
+1. Press `d` to start downloading the selected file or folder
+2. A file picker will open allowing you to choose the destination folder
+3. For single files: The file will be downloaded to the selected destination
+4. For folders: All files in the folder will be downloaded, preserving the folder structure
+5. A progress popup shows download status including:
+   - Current file being downloaded
+   - Number of files completed vs total files
+   - Total bytes downloaded
+   - Any error messages
 
 ## Terminal Compatibility
 

@@ -18,6 +18,10 @@ impl Widget for &App {
                 // Render popup over the blob browsing view if needed
                 if self.show_blob_info_popup {
                     self.render_blob_info_popup(area, buf);
+                } else if self.show_download_picker {
+                    self.render_download_picker_popup(area, buf);
+                } else if self.is_downloading {
+                    self.render_download_progress_popup(area, buf);
                 }
             }
         }
@@ -308,7 +312,7 @@ impl App {
         let instructions = if self.search_mode {
             "Search Mode: Type to filter • `Enter` to confirm • `Esc` to cancel • `Ctrl+↑`/`Ctrl+↓` to navigate"
         } else {
-            "Press `Ctrl-C` or `q` to quit • `Esc`/`←`/`h` to go back • `r`/`F5` to refresh • `↑`/`↓` or `k`/`j` to navigate • `→`/`l`/`Enter` to enter folder • `/` to search • `i` for info • `Backspace` to change container"
+            "Press `Ctrl-C` or `q` to quit • `Esc`/`←`/`h` to go back • `r`/`F5` to refresh • `↑`/`↓` or `k`/`j` to navigate • `→`/`l`/`Enter` to enter folder • `/` to search • `i` for info • `d` to download • `Backspace` to change container"
         };
         let footer = Paragraph::new(instructions)
             .block(Block::bordered().border_type(BorderType::Rounded))
@@ -432,6 +436,140 @@ impl App {
                 .alignment(Alignment::Center);
 
             footer_text.render(footer_area, buf);
+        }
+    }
+
+    /// Render the download destination picker popup.
+    fn render_download_picker_popup(&self, area: Rect, buf: &mut Buffer) {
+        // Calculate popup size
+        let popup_width = (area.width * 3 / 4).min(60);
+        let popup_height = 8;
+
+        // Center the popup
+        let popup_area = Rect {
+            x: (area.width.saturating_sub(popup_width)) / 2,
+            y: (area.height.saturating_sub(popup_height)) / 2,
+            width: popup_width,
+            height: popup_height,
+        };
+
+        // Clear the popup area with a background
+        for y in popup_area.y..popup_area.y + popup_area.height {
+            for x in popup_area.x..popup_area.x + popup_area.width {
+                buf[(x, y)].set_style(Style::default().bg(Color::Black));
+            }
+        }
+
+        let selected_file = if !self.files.is_empty() {
+            &self.files[self.selected_index]
+        } else {
+            "No file selected"
+        };
+
+        // Extract the name without the icon prefix
+        let folder_prefix = format!("{} ", self.icons.folder);
+        let file_prefix = format!("{} ", self.icons.file);
+        let name = if selected_file.starts_with(&folder_prefix) {
+            selected_file
+                .strip_prefix(&folder_prefix)
+                .unwrap_or(selected_file)
+        } else if selected_file.starts_with(&file_prefix) {
+            selected_file
+                .strip_prefix(&file_prefix)
+                .unwrap_or(selected_file)
+        } else {
+            selected_file
+        };
+
+        let download_text = vec![
+            format!("Ready to download: {}", name),
+            String::new(),
+            "Press Enter to select download destination".to_string(),
+            "Press Esc to cancel".to_string(),
+        ];
+
+        let info_text = download_text.join("\n");
+        let info_paragraph = Paragraph::new(info_text)
+            .block(
+                Block::bordered()
+                    .border_type(BorderType::Rounded)
+                    .title(" Download ")
+                    .style(Style::default().fg(Color::Green).bg(Color::Black)),
+            )
+            .style(Style::default().bg(Color::Black))
+            .alignment(Alignment::Center);
+
+        info_paragraph.render(popup_area, buf);
+    }
+
+    /// Render the download progress popup.
+    fn render_download_progress_popup(&self, area: Rect, buf: &mut Buffer) {
+        if let Some(progress) = &self.download_progress {
+            // Calculate popup size
+            let popup_width = (area.width * 3 / 4).min(70);
+            let popup_height = 12;
+
+            // Center the popup
+            let popup_area = Rect {
+                x: (area.width.saturating_sub(popup_width)) / 2,
+                y: (area.height.saturating_sub(popup_height)) / 2,
+                width: popup_width,
+                height: popup_height,
+            };
+
+            // Clear the popup area with a background
+            for y in popup_area.y..popup_area.y + popup_area.height {
+                for x in popup_area.x..popup_area.x + popup_area.width {
+                    buf[(x, y)].set_style(Style::default().bg(Color::Black));
+                }
+            }
+
+            let mut progress_lines = vec![
+                format!("Downloading: {}", progress.current_file),
+                String::new(),
+                format!(
+                    "Files: {} / {}",
+                    progress.files_completed, progress.total_files
+                ),
+            ];
+
+            // Add bytes downloaded if available
+            if let Some(total_bytes) = progress.total_bytes {
+                let percentage = if total_bytes > 0 {
+                    (progress.bytes_downloaded as f64 / total_bytes as f64 * 100.0) as u8
+                } else {
+                    100
+                };
+                progress_lines.push(format!(
+                    "Size: {} / {} ({}%)",
+                    format_bytes(progress.bytes_downloaded),
+                    format_bytes(total_bytes),
+                    percentage
+                ));
+            } else {
+                progress_lines.push(format!(
+                    "Downloaded: {}",
+                    format_bytes(progress.bytes_downloaded)
+                ));
+            }
+
+            // Add error message if present
+            if let Some(error) = &progress.error_message {
+                progress_lines.push(String::new());
+                progress_lines.push(format!("Error: {}", error));
+            }
+
+            let info_text = progress_lines.join("\n");
+            let info_paragraph = Paragraph::new(info_text)
+                .block(
+                    Block::bordered()
+                        .border_type(BorderType::Rounded)
+                        .title(" Download Progress ")
+                        .style(Style::default().fg(Color::Yellow).bg(Color::Black)),
+                )
+                .style(Style::default().bg(Color::Black));
+
+            info_paragraph.render(popup_area, buf);
         }
     }
 }

@@ -14,7 +14,9 @@ use ratatui::{
 use regex::Regex;
 use reqwest;
 use sha2::Sha256;
-use std::sync::Arc; // Add this import for collect() on streams
+use std::fs;
+use std::path::PathBuf;
+use std::sync::Arc;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum AppState {
@@ -84,6 +86,24 @@ pub struct App {
     pub current_blob_info: Option<BlobInfo>,
     /// Whether to show the blob info popup.
     pub show_blob_info_popup: bool,
+    /// Whether to show the download destination picker popup.
+    pub show_download_picker: bool,
+    /// Current download destination path.
+    pub download_destination: Option<PathBuf>,
+    /// Download progress information.
+    pub download_progress: Option<DownloadProgress>,
+    /// Whether a download is currently in progress.
+    pub is_downloading: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct DownloadProgress {
+    pub current_file: String,
+    pub files_completed: usize,
+    pub total_files: usize,
+    pub bytes_downloaded: u64,
+    pub total_bytes: Option<u64>,
+    pub error_message: Option<String>,
 }
 
 impl std::fmt::Debug for App {
@@ -108,6 +128,10 @@ impl std::fmt::Debug for App {
             .field("icons", &self.icons)
             .field("current_blob_info", &self.current_blob_info)
             .field("show_blob_info_popup", &self.show_blob_info_popup)
+            .field("show_download_picker", &self.show_download_picker)
+            .field("download_destination", &self.download_destination)
+            .field("download_progress", &self.download_progress)
+            .field("is_downloading", &self.is_downloading)
             .finish()
     }
 }
@@ -138,6 +162,10 @@ impl App {
             icons: detect_terminal_icons(),
             current_blob_info: None,
             show_blob_info_popup: false,
+            show_download_picker: false,
+            download_destination: None,
+            download_progress: None,
+            is_downloading: false,
         };
 
         // Load container list
@@ -247,6 +275,14 @@ impl App {
                             }
                         }
                     }
+                    KeyCode::Char('d') => {
+                        if !self.show_blob_info_popup
+                            && !self.show_download_picker
+                            && !self.is_downloading
+                        {
+                            self.show_download_picker().await;
+                        }
+                    }
                     KeyCode::Up | KeyCode::Char('k') => {
                         if !self.show_blob_info_popup {
                             self.move_up();
@@ -258,14 +294,22 @@ impl App {
                         }
                     }
                     KeyCode::Right | KeyCode::Char('l') | KeyCode::Enter => {
-                        if !self.show_blob_info_popup {
+                        if self.show_download_picker {
+                            if let Err(e) = self.confirm_download().await {
+                                self.error_message = Some(format!("Download failed: {}", e));
+                            }
+                        } else if !self.show_blob_info_popup {
                             if let Err(e) = self.enter_directory().await {
                                 self.error_message = Some(format!("Enter directory failed: {}", e));
                             }
                         }
                     }
                     KeyCode::Left | KeyCode::Char('h') => {
-                        if self.show_blob_info_popup {
+                        if self.show_download_picker {
+                            // Close download picker
+                            self.show_download_picker = false;
+                            self.download_destination = None;
+                        } else if self.show_blob_info_popup {
                             // Close popup
                             self.show_blob_info_popup = false;
                             self.current_blob_info = None;
@@ -274,7 +318,11 @@ impl App {
                         }
                     }
                     KeyCode::Esc => {
-                        if self.show_blob_info_popup {
+                        if self.show_download_picker {
+                            // Close download picker
+                            self.show_download_picker = false;
+                            self.download_destination = None;
+                        } else if self.show_blob_info_popup {
                             // Close popup
                             self.show_blob_info_popup = false;
                             self.current_blob_info = None;
@@ -298,7 +346,11 @@ impl App {
                         }
                     }
                     KeyCode::Backspace => {
-                        if self.show_blob_info_popup {
+                        if self.show_download_picker {
+                            // Close download picker
+                            self.show_download_picker = false;
+                            self.download_destination = None;
+                        } else if self.show_blob_info_popup {
                             // Close popup
                             self.show_blob_info_popup = false;
                             self.current_blob_info = None;
@@ -855,5 +907,248 @@ impl App {
                 e
             )),
         }
+    }
+
+    /// Show the download destination picker.
+    pub async fn show_download_picker(&mut self) {
+        if self.files.is_empty() {
+            return;
+        }
+
+        self.show_download_picker = true;
+    }
+
+    /// Start the download process for the selected file or folder.
+    pub async fn start_download(&mut self) -> color_eyre::Result<()> {
+        if self.files.is_empty() || self.download_destination.is_none() {
+            return Ok(());
+        }
+
+        let selected_file = self.files[self.selected_index].clone();
+        let folder_prefix = format!("{} ", self.icons.folder);
+        let file_prefix = format!("{} ", self.icons.file);
+
+        let is_folder = selected_file.starts_with(&folder_prefix);
+        let name = if is_folder {
+            selected_file
+                .strip_prefix(&folder_prefix)
+                .unwrap_or(&selected_file)
+                .to_string()
+        } else {
+            selected_file
+                .strip_prefix(&file_prefix)
+                .unwrap_or(&selected_file)
+                .to_string()
+        };
+
+        self.is_downloading = true;
+        self.show_download_picker = false;
+
+        if is_folder {
+            self.download_folder(&name).await?;
+        } else {
+            self.download_file(&name).await?;
+        }
+
+        self.is_downloading = false;
+        self.download_progress = None;
+        Ok(())
+    }
+
+    /// Download a single file.
+    async fn download_file(&mut self, file_name: &str) -> color_eyre::Result<()> {
+        let object_store = self
+            .object_store
+            .as_ref()
+            .ok_or_else(|| color_eyre::eyre::eyre!("No container selected"))?;
+
+        let destination = self
+            .download_destination
+            .as_ref()
+            .ok_or_else(|| color_eyre::eyre::eyre!("No download destination selected"))?;
+
+        let blob_path = if self.current_path.is_empty() {
+            file_name.to_string()
+        } else if self.current_path.ends_with('/') {
+            format!("{}{}", self.current_path, file_name)
+        } else {
+            format!("{}/{}", self.current_path, file_name)
+        };
+
+        let object_path = ObjectPath::from(blob_path.as_str());
+
+        // Initialize progress
+        self.download_progress = Some(DownloadProgress {
+            current_file: file_name.to_string(),
+            files_completed: 0,
+            total_files: 1,
+            bytes_downloaded: 0,
+            total_bytes: None,
+            error_message: None,
+        });
+
+        // Get file metadata for total size
+        if let Ok(meta) = object_store.head(&object_path).await {
+            if let Some(progress) = &mut self.download_progress {
+                progress.total_bytes = Some(meta.size);
+            }
+        }
+
+        // Create destination file path
+        let file_destination = destination.join(file_name);
+
+        // Ensure parent directory exists
+        if let Some(parent) = file_destination.parent() {
+            fs::create_dir_all(parent)?;
+        }
+
+        // Download the file
+        match object_store.get(&object_path).await {
+            Ok(get_result) => {
+                let bytes = get_result.bytes().await?;
+                fs::write(&file_destination, &bytes)?;
+
+                if let Some(progress) = &mut self.download_progress {
+                    progress.bytes_downloaded = bytes.len() as u64;
+                    progress.files_completed = 1;
+                }
+            }
+            Err(e) => {
+                if let Some(progress) = &mut self.download_progress {
+                    progress.error_message =
+                        Some(format!("Failed to download {}: {}", file_name, e));
+                }
+                return Err(color_eyre::eyre::eyre!("Download failed: {}", e));
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Download all files in a folder.
+    async fn download_folder(&mut self, folder_name: &str) -> color_eyre::Result<()> {
+        let object_store = self
+            .object_store
+            .as_ref()
+            .ok_or_else(|| color_eyre::eyre::eyre!("No container selected"))?;
+
+        let destination = self
+            .download_destination
+            .as_ref()
+            .ok_or_else(|| color_eyre::eyre::eyre!("No download destination selected"))?;
+
+        let folder_path = if self.current_path.is_empty() {
+            format!("{}/", folder_name)
+        } else if self.current_path.ends_with('/') {
+            format!("{}{}/", self.current_path, folder_name)
+        } else {
+            format!("{}/{}/", self.current_path, folder_name)
+        };
+
+        let object_path = ObjectPath::from(folder_path.as_str());
+
+        // Create destination folder
+        let folder_destination = destination.join(folder_name);
+        fs::create_dir_all(&folder_destination)?;
+
+        // List all files in the folder
+        let stream = object_store.list(Some(&object_path));
+        let objects: Vec<_> = stream.collect().await;
+
+        let total_files = objects.len();
+        let mut files_completed = 0;
+        let mut total_bytes_downloaded = 0u64;
+
+        // Initialize progress
+        self.download_progress = Some(DownloadProgress {
+            current_file: String::new(),
+            files_completed: 0,
+            total_files,
+            bytes_downloaded: 0,
+            total_bytes: None,
+            error_message: None,
+        });
+
+        for result in objects {
+            match result {
+                Ok(meta) => {
+                    let file_path = meta.location.as_ref();
+                    let relative_path = file_path.strip_prefix(&folder_path).unwrap_or(file_path);
+
+                    // Update progress
+                    if let Some(progress) = &mut self.download_progress {
+                        progress.current_file = relative_path.to_string();
+                    }
+
+                    // Create full destination path
+                    let file_destination = folder_destination.join(relative_path);
+
+                    // Ensure parent directory exists
+                    if let Some(parent) = file_destination.parent() {
+                        fs::create_dir_all(parent)?;
+                    }
+
+                    // Download the file
+                    match object_store.get(&meta.location).await {
+                        Ok(get_result) => {
+                            let bytes = get_result.bytes().await?;
+                            fs::write(&file_destination, &bytes)?;
+
+                            files_completed += 1;
+                            total_bytes_downloaded += bytes.len() as u64;
+
+                            // Update progress
+                            if let Some(progress) = &mut self.download_progress {
+                                progress.files_completed = files_completed;
+                                progress.bytes_downloaded = total_bytes_downloaded;
+                            }
+                        }
+                        Err(e) => {
+                            if let Some(progress) = &mut self.download_progress {
+                                progress.error_message =
+                                    Some(format!("Failed to download {}: {}", relative_path, e));
+                            }
+                            // Continue with other files even if one fails
+                            continue;
+                        }
+                    }
+                }
+                Err(e) => {
+                    if let Some(progress) = &mut self.download_progress {
+                        progress.error_message = Some(format!("Failed to list file: {}", e));
+                    }
+                    continue;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Handle Enter key when download picker is shown.
+    pub async fn confirm_download(&mut self) -> color_eyre::Result<()> {
+        if self.show_download_picker {
+            // Use the file dialog to pick a destination folder
+            let file_dialog = rfd::FileDialog::new();
+
+            // Run the file dialog in a spawn_blocking since it's blocking
+            let path_result = tokio::task::spawn_blocking(move || file_dialog.pick_folder()).await;
+
+            match path_result {
+                Ok(Some(path)) => {
+                    self.download_destination = Some(path);
+                    self.start_download().await?;
+                }
+                Ok(None) => {
+                    // User cancelled the dialog
+                    self.show_download_picker = false;
+                }
+                Err(e) => {
+                    self.show_download_picker = false;
+                    self.error_message = Some(format!("Failed to open file dialog: {}", e));
+                }
+            }
+        }
+        Ok(())
     }
 }
