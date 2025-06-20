@@ -163,10 +163,37 @@ info:
 # Create a new release
 release VERSION:
     @echo "🏷️  Creating release {{VERSION}}..."
+    @echo "� Checking git status..."
+    @if [ -n "$(git status --porcelain --ignore-submodules)" ]; then \
+        echo "❌ Working directory is not clean. Please commit or stash changes first."; \
+        exit 1; \
+    fi
+    @echo "✅ Working directory is clean"
+    @echo "�📝 Updating version in Cargo.toml..."
+    sed -i 's/^version = ".*"/version = "{{VERSION}}"/' Cargo.toml
+    @echo "✅ Updated Cargo.toml to version {{VERSION}}"
     @just test-all
+    @echo "📦 Committing version update..."
+    git add Cargo.toml Cargo.lock
+    git commit -m "Bump version to {{VERSION}}"
+    @echo "🏷️  Creating git tag..."
     git tag -a "v{{VERSION}}" -m "Release v{{VERSION}}"
     @echo "✅ Tagged release v{{VERSION}}"
-    @echo "Push with: git push origin v{{VERSION}}"
+    @echo "🚀 Next steps:"
+    @echo "   git push origin main"
+    @echo "   git push origin v{{VERSION}}"
+
+# Test release process without making changes
+release-dry-run VERSION:
+    @echo "🧪 Dry run: Creating release {{VERSION}}..."
+    @echo " Would update version in Cargo.toml to {{VERSION}}"
+    @echo "Preview of Cargo.toml change:"
+    @sed 's/^version = ".*"/version = "{{VERSION}}"/' Cargo.toml | head -10
+    @echo ""
+    @echo "🧪 Would run: just test-all"
+    @echo "📦 Would commit version update"
+    @echo "🏷️  Would create git tag v{{VERSION}}"
+    @echo "✅ Dry run complete - no changes made"
 
 # Test icon detection in current terminal
 test-icons:
