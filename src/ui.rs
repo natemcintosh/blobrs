@@ -1,8 +1,8 @@
 use ratatui::{
     buffer::Buffer,
     layout::{Alignment, Constraint, Direction, Layout, Rect},
-    style::{Color, Stylize},
-    widgets::{Block, BorderType, List, ListItem, Widget},
+    style::{Color, Style, Stylize},
+    widgets::{Block, BorderType, List, ListItem, ListState, Widget},
 };
 
 use crate::app::App;
@@ -31,6 +31,9 @@ impl Widget for &App {
             .map(|file| ListItem::new(file.as_str()))
             .collect();
 
+        let mut list_state = ListState::default();
+        list_state.select(Some(self.selected_index));
+
         let main_block = List::new(file_items)
             .block(
                 Block::bordered()
@@ -38,12 +41,14 @@ impl Widget for &App {
                     .title_alignment(Alignment::Center)
                     .border_type(BorderType::Rounded),
             )
-            .fg(Color::Green);
+            .fg(Color::Green)
+            .highlight_style(Style::default().bg(Color::DarkGray).fg(Color::Yellow))
+            .highlight_symbol("▶ ");
 
-        main_block.render(chunks[0], buf);
+        ratatui::widgets::StatefulWidget::render(main_block, chunks[0], buf, &mut list_state);
 
         // Footer with instructions
-        let instructions = "Press `Esc`, `Ctrl-C` or `q` to quit • Press `r` or `F5` to refresh";
+        let instructions = "Press `Esc`, `Ctrl-C` or `q` to quit • `r`/`F5` to refresh • `↑`/`↓` or `k`/`j` to navigate • `→`/`l`/`Enter` to enter folder • `←`/`h` to go up";
         let footer = ratatui::widgets::Paragraph::new(instructions)
             .block(Block::bordered().border_type(BorderType::Rounded))
             .fg(Color::Cyan)

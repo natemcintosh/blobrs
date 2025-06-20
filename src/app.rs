@@ -16,6 +16,8 @@ pub struct App {
     pub current_dir: String,
     /// List of files in the current directory.
     pub files: Vec<String>,
+    /// Currently selected file index.
+    pub selected_index: usize,
 }
 
 impl Default for App {
@@ -31,6 +33,7 @@ impl Default for App {
             events: EventHandler::new(),
             current_dir,
             files,
+            selected_index: 0,
         }
     }
 }
@@ -75,6 +78,10 @@ impl App {
             }
 
             KeyCode::Char('r') | KeyCode::F(5) => self.refresh_files(),
+            KeyCode::Up | KeyCode::Char('k') => self.move_up(),
+            KeyCode::Down | KeyCode::Char('j') => self.move_down(),
+            KeyCode::Right | KeyCode::Char('l') | KeyCode::Enter => self.enter_directory(),
+            KeyCode::Left | KeyCode::Char('h') => self.go_up_directory(),
             // Other handlers you could add here.
             _ => {}
         }
@@ -117,5 +124,59 @@ impl App {
     /// Refresh the file list for the current directory.
     pub fn refresh_files(&mut self) {
         self.files = Self::read_directory(&self.current_dir);
+        self.selected_index = 0; // Reset selection to top
+    }
+
+    /// Move the selection up.
+    pub fn move_up(&mut self) {
+        if self.selected_index > 0 {
+            self.selected_index -= 1;
+        }
+    }
+
+    /// Move the selection down.
+    pub fn move_down(&mut self) {
+        if self.selected_index < self.files.len().saturating_sub(1) {
+            self.selected_index += 1;
+        }
+    }
+
+    /// Enter a directory if the selected item is a folder.
+    pub fn enter_directory(&mut self) {
+        if self.files.is_empty() {
+            return;
+        }
+
+        let selected_file = &self.files[self.selected_index];
+        // Check if the selected item is a directory (starts with folder emoji)
+        if selected_file.starts_with("📁 ") {
+            let dir_name = &selected_file[5..]; // Remove "📁 " prefix
+            let new_path = if self.current_dir.ends_with('/') {
+                format!("{}{}", self.current_dir, dir_name)
+            } else {
+                format!("{}/{}", self.current_dir, dir_name)
+            };
+
+            // Try to change to the new directory
+            if let Ok(canonical_path) = fs::canonicalize(&new_path) {
+                if let Some(path_str) = canonical_path.to_str() {
+                    self.current_dir = path_str.to_string();
+                    self.files = Self::read_directory(&self.current_dir);
+                    self.selected_index = 0; // Reset selection to top
+                }
+            }
+        }
+    }
+
+    /// Go up one directory level.
+    pub fn go_up_directory(&mut self) {
+        let current_path = std::path::Path::new(&self.current_dir);
+        if let Some(parent) = current_path.parent() {
+            if let Some(parent_str) = parent.to_str() {
+                self.current_dir = parent_str.to_string();
+                self.files = Self::read_directory(&self.current_dir);
+                self.selected_index = 0; // Reset selection to top
+            }
+        }
     }
 }
