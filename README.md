@@ -130,12 +130,12 @@ After selecting a container, you can browse blobs:
 | `↑` / `k` | Move selection up |
 | `↓` / `j` | Move selection down |
 | `→` / `l` / `Enter` | Enter selected folder |
-| `←` / `h` | Go up one level |
+| `←` / `h` / `Esc` | Go up one level (or to container list if at root) |
 | `/` | Search/filter blobs |
 | `i` | Show blob/folder information |
 | `r` / `F5` | Refresh current view |
 | `Backspace` | Return to container selection |
-| `q` / `Esc` / `Ctrl+C` | Quit application |
+| `q` / `Ctrl+C` | Quit application |
 
 ### Search Mode
 
@@ -145,6 +145,18 @@ After selecting a container, you can browse blobs:
 | `Enter` | Confirm search (keep filtered results) |
 | `Esc` | Cancel search (restore full list) |
 | `Ctrl+↑` / `Ctrl+↓` | Navigate while searching |
+
+### Navigation Hierarchy
+
+The application uses a hierarchical navigation system with the `Esc` key:
+
+- **Container Selection**: `Esc` quits the application
+- **Blob Browsing (at container root)**: `Esc` returns to container selection  
+- **Blob Browsing (inside folders)**: `Esc` goes up one directory level
+- **Search Mode**: `Esc` exits search and returns to normal browsing
+- **Information Popup**: `Esc` closes the popup
+
+This provides intuitive "back" behavior - `Esc` always takes you one level up in the navigation hierarchy.
 
 ### Blob Information Mode
 

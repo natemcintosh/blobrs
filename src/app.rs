@@ -187,7 +187,7 @@ impl App {
 
         // Global keys
         match key_event.code {
-            KeyCode::Esc | KeyCode::Char('q') => {
+            KeyCode::Char('q') => {
                 self.events.send(AppEvent::Quit);
                 return Ok(());
             }
@@ -201,6 +201,11 @@ impl App {
         // State-specific key handling
         match self.state {
             AppState::ContainerSelection => match key_event.code {
+                KeyCode::Esc => {
+                    // Only quit at the top level (container selection)
+                    self.events.send(AppEvent::Quit);
+                    return Ok(());
+                }
                 KeyCode::Char('/') => {
                     self.enter_container_search_mode();
                 }
@@ -264,10 +269,8 @@ impl App {
                             // Close popup
                             self.show_blob_info_popup = false;
                             self.current_blob_info = None;
-                        } else {
-                            if let Err(e) = self.go_up_directory().await {
-                                self.error_message = Some(format!("Go up failed: {}", e));
-                            }
+                        } else if let Err(e) = self.go_up_directory().await {
+                            self.error_message = Some(format!("Go up failed: {}", e));
                         }
                     }
                     KeyCode::Esc => {
@@ -275,6 +278,23 @@ impl App {
                             // Close popup
                             self.show_blob_info_popup = false;
                             self.current_blob_info = None;
+                        } else if !self.current_path.is_empty() {
+                            // Go up one directory level if not at container root
+                            if let Err(e) = self.go_up_directory().await {
+                                self.error_message = Some(format!("Go up failed: {}", e));
+                            }
+                        } else {
+                            // At container root, go back to container selection
+                            self.state = AppState::ContainerSelection;
+                            self.object_store = None;
+                            self.current_path.clear();
+                            self.files.clear();
+                            self.all_files.clear();
+                            self.selected_index = 0;
+                            self.search_mode = false;
+                            self.search_query.clear();
+                            self.container_search_mode = false;
+                            self.container_search_query.clear();
                         }
                     }
                     KeyCode::Backspace => {

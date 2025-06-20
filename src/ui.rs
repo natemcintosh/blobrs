@@ -157,7 +157,7 @@ impl App {
         let instructions = if self.container_search_mode {
             "Search Mode: Type to filter containers • `Enter` to confirm • `Esc` to cancel • `Ctrl+↑`/`Ctrl+↓` to navigate"
         } else {
-            "Press `Esc`, `Ctrl-C` or `q` to quit • `r`/`F5` to refresh • `↑`/`↓` or `k`/`j` to navigate • `→`/`l`/`Enter` to select container • `/` to search"
+            "Press `Ctrl-C` or `q` to quit • `Esc` to quit • `r`/`F5` to refresh • `↑`/`↓` or `k`/`j` to navigate • `→`/`l`/`Enter` to select container • `/` to search"
         };
         let footer = Paragraph::new(instructions)
             .block(Block::bordered().border_type(BorderType::Rounded))
@@ -308,7 +308,7 @@ impl App {
         let instructions = if self.search_mode {
             "Search Mode: Type to filter • `Enter` to confirm • `Esc` to cancel • `Ctrl+↑`/`Ctrl+↓` to navigate"
         } else {
-            "Press `Esc`, `Ctrl-C` or `q` to quit • `r`/`F5` to refresh • `↑`/`↓` or `k`/`j` to navigate • `→`/`l`/`Enter` to enter folder • `←`/`h` to go up • `/` to search • `i` for info • `Backspace` to change container"
+            "Press `Ctrl-C` or `q` to quit • `Esc`/`←`/`h` to go back • `r`/`F5` to refresh • `↑`/`↓` or `k`/`j` to navigate • `→`/`l`/`Enter` to enter folder • `/` to search • `i` for info • `Backspace` to change container"
         };
         let footer = Paragraph::new(instructions)
             .block(Block::bordered().border_type(BorderType::Rounded))
@@ -320,8 +320,8 @@ impl App {
 
     fn render_blob_info_popup(&self, area: Rect, buf: &mut Buffer) {
         // Calculate popup size and position
-        let popup_width = area.width.min(60).max(40); // Between 40 and 60 characters wide
-        let popup_height = area.height.min(20).max(10); // Between 10 and 20 lines tall
+        let popup_width = area.width.clamp(40, 60); // Between 40 and 60 characters wide
+        let popup_height = area.height.clamp(10, 20); // Between 10 and 20 lines tall
 
         // Center the popup
         let popup_x = (area.width.saturating_sub(popup_width)) / 2;
