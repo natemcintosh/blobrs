@@ -481,7 +481,7 @@ impl App {
             selected_file
         };
 
-        let download_text = vec![
+        let download_text = [
             format!("Ready to download: {}", name),
             String::new(),
             "Press Enter to select download destination".to_string(),
