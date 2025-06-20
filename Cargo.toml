@@ -14,3 +14,10 @@ object_store = { version = "0.12", features = ["azure"] }
 tokio = { version = "1", features = ["full"] }
 url = "2.5"
 futures = "0.3"
+reqwest = { version = "0.12", features = ["json"] }
+serde = { version = "1.0", features = ["derive"] }
+chrono = { version = "0.4", features = ["serde"] }
+base64 = "0.22"
+hmac = "0.12"
+sha2 = "0.10"
+regex = "1.10"

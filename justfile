@@ -68,11 +68,6 @@ check-env:
         echo "   Please set your Azure Storage Account name"; \
         exit 1; \
     fi
-    @if [ -z "${AZURE_CONTAINER_NAME:-}" ]; then \
-        echo "❌ AZURE_CONTAINER_NAME environment variable not set"; \
-        echo "   Please set your Azure Container name"; \
-        exit 1; \
-    fi
     @if [ -z "${AZURE_STORAGE_ACCESS_KEY:-}" ]; then \
         echo "❌ AZURE_STORAGE_ACCESS_KEY environment variable not set"; \
         echo "   Please set your Azure Storage Access Key"; \
@@ -98,8 +93,9 @@ setup:
 env-status:
     @echo "🌍 Environment Status:"
     @echo -n "AZURE_STORAGE_ACCOUNT: "; if [ -n "${AZURE_STORAGE_ACCOUNT:-}" ]; then echo "✅ Set"; else echo "❌ Not set"; fi
-    @echo -n "AZURE_CONTAINER_NAME: "; if [ -n "${AZURE_CONTAINER_NAME:-}" ]; then echo "✅ Set"; else echo "❌ Not set"; fi
     @echo -n "AZURE_STORAGE_ACCESS_KEY: "; if [ -n "${AZURE_STORAGE_ACCESS_KEY:-}" ]; then echo "✅ Set (hidden)"; else echo "❌ Not set"; fi
+    @echo ""
+    @echo "ℹ️  Container selection is now done within the application"
 
 # Install development dependencies
 install:

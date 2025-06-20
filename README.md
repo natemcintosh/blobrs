@@ -4,7 +4,8 @@ A terminal user interface (TUI) application for browsing Azure Blob Storage cont
 
 ## Features
 
-- 🔍 Browse Azure Blob Storage containers and blobs
+- �️ **Container Selection** - Select from a list of available containers in your storage account
+- �🔍 Browse Azure Blob Storage containers and blobs
 - 📁 Navigate through blob prefixes (virtual directories)
 - ⚡ Async operations with loading indicators
 - 🎨 Clean, intuitive terminal interface
@@ -23,10 +24,10 @@ A terminal user interface (TUI) application for browsing Azure Blob Storage cont
 
 ### 1. Azure Storage Account
 
-You'll need an Azure Storage Account with a container. If you don't have one:
+You'll need an Azure Storage Account with one or more containers. If you don't have one:
 
 1. Create an Azure Storage Account in the [Azure Portal](https://portal.azure.com)
-2. Create a container in your storage account
+2. Create one or more containers in your storage account
 3. Get your storage account access key from the "Access keys" section
 
 ### 2. Environment Variables
@@ -35,7 +36,6 @@ Set the following environment variables:
 
 ```bash
 export AZURE_STORAGE_ACCOUNT="your_storage_account_name"
-export AZURE_CONTAINER_NAME="your_container_name"
 export AZURE_STORAGE_ACCESS_KEY="your_access_key"
 ```
 
@@ -43,9 +43,10 @@ Or create a `.env` file in the project root:
 
 ```env
 AZURE_STORAGE_ACCOUNT=your_storage_account_name
-AZURE_CONTAINER_NAME=your_container_name
 AZURE_STORAGE_ACCESS_KEY=your_access_key
 ```
+
+**Note:** You no longer need to specify `AZURE_CONTAINER_NAME` as the application will present you with a list of containers to select from.
 
 ## Installation
 
@@ -107,6 +108,22 @@ just run-release
 
 ## Navigation
 
+### Container Selection Mode
+
+When you first start the application, you'll be in container selection mode:
+
+| Key | Action |
+|-----|--------|
+| `↑` / `k` | Move selection up |
+| `↓` / `j` | Move selection down |
+| `→` / `l` / `Enter` | Select container and enter blob browsing mode |
+| `r` / `F5` | Refresh container list |
+| `q` / `Esc` / `Ctrl+C` | Quit application |
+
+### Blob Browsing Mode
+
+After selecting a container, you can browse blobs:
+
 | Key | Action |
 |-----|--------|
 | `↑` / `k` | Move selection up |
@@ -115,6 +132,7 @@ just run-release
 | `←` / `h` | Go up one level |
 | `/` | Search/filter blobs |
 | `r` / `F5` | Refresh current view |
+| `Backspace` | Return to container selection |
 | `q` / `Esc` / `Ctrl+C` | Quit application |
 
 ### Search Mode

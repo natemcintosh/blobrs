@@ -2,12 +2,29 @@ use crate::{
     event::{AppEvent, Event, EventHandler},
     terminal_icons::{IconSet, detect_terminal_icons},
 };
-use object_store::{ObjectStore, path::Path as ObjectPath};
+use base64::{Engine as _, engine::general_purpose};
+use chrono::Utc;
+use hmac::{Hmac, Mac};
+use object_store::{ObjectStore, azure::MicrosoftAzureBuilder, path::Path as ObjectPath};
 use ratatui::{
     DefaultTerminal,
     crossterm::event::{KeyCode, KeyEvent, KeyModifiers},
 };
+use regex::Regex;
+use reqwest;
+use sha2::Sha256;
 use std::sync::Arc;
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum AppState {
+    ContainerSelection,
+    BlobBrowsing,
+}
+
+#[derive(Debug, Clone)]
+pub struct ContainerInfo {
+    pub name: String,
+}
 
 /// Application.
 pub struct App {
@@ -15,8 +32,18 @@ pub struct App {
     pub running: bool,
     /// Event handler.
     pub events: EventHandler,
-    /// Azure Blob Storage client.
-    pub object_store: Arc<dyn ObjectStore>,
+    /// Current application state.
+    pub state: AppState,
+    /// Azure Storage Account name.
+    pub storage_account: String,
+    /// Azure Storage Access Key.
+    pub access_key: String,
+    /// List of available containers.
+    pub containers: Vec<ContainerInfo>,
+    /// Currently selected container index.
+    pub selected_container_index: usize,
+    /// Azure Blob Storage client (only available after container selection).
+    pub object_store: Option<Arc<dyn ObjectStore>>,
     /// Current path prefix in blob storage.
     pub current_path: String,
     /// List of blobs/prefixes in the current path.
@@ -41,6 +68,10 @@ impl std::fmt::Debug for App {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("App")
             .field("running", &self.running)
+            .field("state", &self.state)
+            .field("storage_account", &self.storage_account)
+            .field("containers", &self.containers)
+            .field("selected_container_index", &self.selected_container_index)
             .field("current_path", &self.current_path)
             .field("files", &self.files)
             .field("all_files", &self.all_files)
@@ -56,11 +87,16 @@ impl std::fmt::Debug for App {
 
 impl App {
     /// Constructs a new instance of [`App`].
-    pub async fn new(object_store: Arc<dyn ObjectStore>) -> color_eyre::Result<Self> {
+    pub async fn new(storage_account: String, access_key: String) -> color_eyre::Result<Self> {
         let mut app = Self {
             running: true,
             events: EventHandler::new(),
-            object_store,
+            state: AppState::ContainerSelection,
+            storage_account,
+            access_key,
+            containers: Vec::new(),
+            selected_container_index: 0,
+            object_store: None,
             current_path: String::new(),
             files: Vec::new(),
             all_files: Vec::new(),
@@ -72,8 +108,8 @@ impl App {
             icons: detect_terminal_icons(),
         };
 
-        // Load initial file list
-        app.refresh_files().await?;
+        // Load container list
+        app.load_containers().await?;
         Ok(app)
     }
 
@@ -103,8 +139,8 @@ impl App {
 
     /// Handles the key events and updates the state of [`App`].
     pub async fn handle_key_event(&mut self, key_event: KeyEvent) -> color_eyre::Result<()> {
-        // Handle search mode separately
-        if self.search_mode {
+        // Handle search mode separately (only in blob browsing mode)
+        if self.search_mode && self.state == AppState::BlobBrowsing {
             return self.handle_search_key_event(key_event).await;
         }
 
@@ -113,36 +149,75 @@ impl App {
             return Ok(());
         }
 
+        // Global keys
         match key_event.code {
-            KeyCode::Esc | KeyCode::Char('q') => self.events.send(AppEvent::Quit),
+            KeyCode::Esc | KeyCode::Char('q') => {
+                self.events.send(AppEvent::Quit);
+                return Ok(());
+            }
             KeyCode::Char('c' | 'C') if key_event.modifiers == KeyModifiers::CONTROL => {
-                self.events.send(AppEvent::Quit)
+                self.events.send(AppEvent::Quit);
+                return Ok(());
             }
+            _ => {}
+        }
 
-            KeyCode::Char('/') => {
-                self.enter_search_mode();
-            }
-
-            KeyCode::Char('r') | KeyCode::F(5) => {
-                if let Err(e) = self.refresh_files().await {
-                    self.error_message = Some(format!("Refresh failed: {}", e));
+        // State-specific key handling
+        match self.state {
+            AppState::ContainerSelection => match key_event.code {
+                KeyCode::Up | KeyCode::Char('k') => self.move_container_up(),
+                KeyCode::Down | KeyCode::Char('j') => self.move_container_down(),
+                KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
+                    if let Err(e) = self.select_container().await {
+                        self.error_message = Some(format!("Failed to select container: {}", e));
+                    }
                 }
-            }
-            KeyCode::Up | KeyCode::Char('k') => self.move_up(),
-            KeyCode::Down | KeyCode::Char('j') => self.move_down(),
-            KeyCode::Right | KeyCode::Char('l') | KeyCode::Enter => {
-                if let Err(e) = self.enter_directory().await {
-                    self.error_message = Some(format!("Enter directory failed: {}", e));
+                KeyCode::Char('r') | KeyCode::F(5) => {
+                    if let Err(e) = self.load_containers().await {
+                        self.error_message = Some(format!("Refresh failed: {}", e));
+                    }
                 }
-            }
-            KeyCode::Left | KeyCode::Char('h') => {
-                if let Err(e) = self.go_up_directory().await {
-                    self.error_message = Some(format!("Go up failed: {}", e));
+                _ => {
+                    self.error_message = None;
                 }
-            }
-            // Clear error message on any other key
-            _ => {
-                self.error_message = None;
+            },
+            AppState::BlobBrowsing => {
+                match key_event.code {
+                    KeyCode::Char('/') => {
+                        self.enter_search_mode();
+                    }
+                    KeyCode::Char('r') | KeyCode::F(5) => {
+                        if let Err(e) = self.refresh_files().await {
+                            self.error_message = Some(format!("Refresh failed: {}", e));
+                        }
+                    }
+                    KeyCode::Up | KeyCode::Char('k') => self.move_up(),
+                    KeyCode::Down | KeyCode::Char('j') => self.move_down(),
+                    KeyCode::Right | KeyCode::Char('l') | KeyCode::Enter => {
+                        if let Err(e) = self.enter_directory().await {
+                            self.error_message = Some(format!("Enter directory failed: {}", e));
+                        }
+                    }
+                    KeyCode::Left | KeyCode::Char('h') => {
+                        if let Err(e) = self.go_up_directory().await {
+                            self.error_message = Some(format!("Go up failed: {}", e));
+                        }
+                    }
+                    KeyCode::Backspace => {
+                        // Go back to container selection
+                        self.state = AppState::ContainerSelection;
+                        self.object_store = None;
+                        self.current_path.clear();
+                        self.files.clear();
+                        self.all_files.clear();
+                        self.selected_index = 0;
+                        self.search_mode = false;
+                        self.search_query.clear();
+                    }
+                    _ => {
+                        self.error_message = None;
+                    }
+                }
             }
         }
         Ok(())
@@ -161,13 +236,16 @@ impl App {
 
     /// List blobs and prefixes in the current path.
     async fn list_blobs(&self, prefix: &str) -> color_eyre::Result<Vec<String>> {
+        let object_store = self
+            .object_store
+            .as_ref()
+            .ok_or_else(|| color_eyre::eyre::eyre!("No container selected"))?;
+
         let result = if prefix.is_empty() {
-            self.object_store.list_with_delimiter(None).await?
+            object_store.list_with_delimiter(None).await?
         } else {
             let object_path = ObjectPath::from(prefix);
-            self.object_store
-                .list_with_delimiter(Some(&object_path))
-                .await?
+            object_store.list_with_delimiter(Some(&object_path)).await?
         };
         let mut items = Vec::new();
 
@@ -341,5 +419,165 @@ impl App {
                 .collect();
         }
         self.selected_index = 0;
+    }
+
+    /// Load the list of containers from Azure Storage.
+    async fn load_containers(&mut self) -> color_eyre::Result<()> {
+        self.is_loading = true;
+        self.error_message = None;
+
+        match self.list_containers().await {
+            Ok(containers) => {
+                self.containers = containers;
+                self.selected_container_index = 0;
+            }
+            Err(e) => {
+                self.error_message = Some(format!("Failed to list containers: {}", e));
+            }
+        }
+
+        self.is_loading = false;
+        Ok(())
+    }
+
+    /// List all containers in the storage account.
+    async fn list_containers(&mut self) -> Result<Vec<ContainerInfo>, String> {
+        let account_name = &self.storage_account;
+        let access_key = &self.access_key;
+
+        // Decode the base64 access key
+        let key = general_purpose::STANDARD
+            .decode(access_key)
+            .map_err(|e| format!("Failed to decode access key: {}", e))?;
+
+        // Create the request URL
+        let url = format!("https://{account_name}.blob.core.windows.net/?comp=list");
+
+        // Create timestamp in RFC 1123 format
+        let now = Utc::now();
+        let date = now.format("%a, %d %b %Y %H:%M:%S GMT").to_string();
+
+        // Construct the string to sign for Azure Storage API
+        // Format: VERB + "\n" + Content-Encoding + "\n" + Content-Language + "\n" + Content-Length + "\n" +
+        //         Content-MD5 + "\n" + Content-Type + "\n" + Date + "\n" + If-Modified-Since + "\n" +
+        //         If-Match + "\n" + If-None-Match + "\n" + If-Unmodified-Since + "\n" + Range + "\n" +
+        //         CanonicalizedHeaders + CanonicalizedResource
+        let string_to_sign = format!(
+            "GET\n\n\n\n\n\n\n\n\n\n\n\nx-ms-date:{}\nx-ms-version:2020-08-04\n/{}/\ncomp:list",
+            date, account_name
+        );
+
+        // Generate HMAC-SHA256 signature
+        let mut mac = Hmac::<Sha256>::new_from_slice(&key)
+            .map_err(|e| format!("Failed to create HMAC: {}", e))?;
+        mac.update(string_to_sign.as_bytes());
+        let signature = general_purpose::STANDARD.encode(mac.finalize().into_bytes());
+
+        // Create authorization header
+        let authorization = format!("SharedKey {}:{}", account_name, signature);
+
+        // Debug: Log the request details
+        let debug_request = format!(
+            "Request URL: {}\nAuthorization: {}\nDate: {}\nString to sign:\n{}",
+            url, authorization, date, string_to_sign
+        );
+        std::fs::write("debug_request.log", debug_request).ok();
+
+        // Make the HTTP request
+        let client = reqwest::Client::new();
+        let response = client
+            .get(&url)
+            .header("x-ms-date", &date)
+            .header("x-ms-version", "2020-08-04")
+            .header("Authorization", &authorization)
+            .send()
+            .await
+            .map_err(|e| format!("HTTP request failed: {}", e))?;
+
+        let status = response.status();
+        let response_text = response
+            .text()
+            .await
+            .map_err(|e| format!("Failed to read response: {}", e))?;
+
+        if !status.is_success() {
+            return Err(format!(
+                "HTTP {} {} - {}",
+                status.as_u16(),
+                status.canonical_reason().unwrap_or(""),
+                response_text
+            ));
+        }
+
+        // Debug: Write the XML response to a log file for troubleshooting
+        std::fs::write("debug_azure_response.xml", &response_text).ok();
+
+        // Parse XML response
+        let containers = self
+            .parse_containers_xml(&response_text)
+            .map_err(|e| format!("Failed to parse XML response: {}", e))?;
+
+        // Debug: Write container info to log file
+        let debug_info = format!("Parsed {} containers:\n{:#?}", containers.len(), containers);
+        std::fs::write("debug_containers.log", debug_info).ok();
+
+        Ok(containers)
+    }
+
+    /// Parse XML response from Azure Storage list containers API.
+    fn parse_containers_xml(&self, xml: &str) -> color_eyre::Result<Vec<ContainerInfo>> {
+        let mut containers = Vec::new();
+
+        // Use regex to find all container names
+        // Pattern: <Container>...<Name>container_name</Name>...</Container>
+        let container_regex = Regex::new(r"<Container>.*?<Name>(.*?)</Name>.*?</Container>")?;
+
+        for cap in container_regex.captures_iter(xml) {
+            if let Some(name_match) = cap.get(1) {
+                let name = name_match.as_str().to_string();
+                if !name.is_empty() {
+                    containers.push(ContainerInfo { name });
+                }
+            }
+        }
+
+        Ok(containers)
+    }
+
+    /// Select a container and initialize the object store.
+    async fn select_container(&mut self) -> color_eyre::Result<()> {
+        if self.containers.is_empty() {
+            return Ok(());
+        }
+
+        let selected_container = &self.containers[self.selected_container_index];
+
+        let azure_client = MicrosoftAzureBuilder::new()
+            .with_account(&self.storage_account)
+            .with_container_name(&selected_container.name)
+            .with_access_key(&self.access_key)
+            .build()?;
+
+        self.object_store = Some(Arc::new(azure_client));
+        self.state = AppState::BlobBrowsing;
+
+        // Load initial file list
+        self.refresh_files().await?;
+        Ok(())
+    }
+
+    /// Move container selection up.
+    fn move_container_up(&mut self) {
+        if !self.containers.is_empty() && self.selected_container_index > 0 {
+            self.selected_container_index -= 1;
+        }
+    }
+
+    /// Move container selection down.
+    fn move_container_down(&mut self) {
+        if !self.containers.is_empty() && self.selected_container_index < self.containers.len() - 1
+        {
+            self.selected_container_index += 1;
+        }
     }
 }
