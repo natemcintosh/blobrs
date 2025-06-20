@@ -18,12 +18,18 @@ pub struct App {
     pub current_path: String,
     /// List of blobs/prefixes in the current path.
     pub files: Vec<String>,
+    /// All files (unfiltered) for search functionality.
+    pub all_files: Vec<String>,
     /// Currently selected file index.
     pub selected_index: usize,
     /// Loading state for async operations.
     pub is_loading: bool,
     /// Error message to display.
     pub error_message: Option<String>,
+    /// Search mode state.
+    pub search_mode: bool,
+    /// Current search query.
+    pub search_query: String,
 }
 
 impl std::fmt::Debug for App {
@@ -32,9 +38,12 @@ impl std::fmt::Debug for App {
             .field("running", &self.running)
             .field("current_path", &self.current_path)
             .field("files", &self.files)
+            .field("all_files", &self.all_files)
             .field("selected_index", &self.selected_index)
             .field("is_loading", &self.is_loading)
             .field("error_message", &self.error_message)
+            .field("search_mode", &self.search_mode)
+            .field("search_query", &self.search_query)
             .finish()
     }
 }
@@ -48,9 +57,12 @@ impl App {
             object_store,
             current_path: String::new(),
             files: Vec::new(),
+            all_files: Vec::new(),
             selected_index: 0,
             is_loading: false,
             error_message: None,
+            search_mode: false,
+            search_query: String::new(),
         };
 
         // Load initial file list
@@ -84,6 +96,11 @@ impl App {
 
     /// Handles the key events and updates the state of [`App`].
     pub async fn handle_key_event(&mut self, key_event: KeyEvent) -> color_eyre::Result<()> {
+        // Handle search mode separately
+        if self.search_mode {
+            return self.handle_search_key_event(key_event).await;
+        }
+
         // Don't process keys while loading
         if self.is_loading {
             return Ok(());
@@ -93,6 +110,10 @@ impl App {
             KeyCode::Esc | KeyCode::Char('q') => self.events.send(AppEvent::Quit),
             KeyCode::Char('c' | 'C') if key_event.modifiers == KeyModifiers::CONTROL => {
                 self.events.send(AppEvent::Quit)
+            }
+
+            KeyCode::Char('/') => {
+                self.enter_search_mode();
             }
 
             KeyCode::Char('r') | KeyCode::F(5) => {
@@ -170,8 +191,13 @@ impl App {
 
         match self.list_blobs(&self.current_path).await {
             Ok(files) => {
-                self.files = files;
-                self.selected_index = 0;
+                self.all_files = files.clone();
+                if self.search_mode && !self.search_query.is_empty() {
+                    self.filter_files();
+                } else {
+                    self.files = files;
+                    self.selected_index = 0;
+                }
             }
             Err(e) => {
                 self.error_message = Some(format!("Failed to list blobs: {}", e));
@@ -214,6 +240,11 @@ impl App {
             };
 
             self.current_path = new_path;
+            // Exit search mode when navigating
+            if self.search_mode {
+                self.search_mode = false;
+                self.search_query.clear();
+            }
             self.refresh_files().await?;
         }
         Ok(())
@@ -233,7 +264,72 @@ impl App {
             self.current_path = String::new(); // Go to root
         }
 
+        // Exit search mode when navigating
+        if self.search_mode {
+            self.search_mode = false;
+            self.search_query.clear();
+        }
         self.refresh_files().await?;
         Ok(())
+    }
+
+    /// Enter search mode.
+    pub fn enter_search_mode(&mut self) {
+        self.search_mode = true;
+        self.search_query.clear();
+        self.error_message = None;
+    }
+
+    /// Exit search mode and restore original file list.
+    pub fn exit_search_mode(&mut self) {
+        self.search_mode = false;
+        self.search_query.clear();
+        self.files = self.all_files.clone();
+        self.selected_index = 0;
+    }
+
+    /// Handle key events when in search mode.
+    pub async fn handle_search_key_event(&mut self, key_event: KeyEvent) -> color_eyre::Result<()> {
+        match key_event.code {
+            KeyCode::Esc => {
+                self.exit_search_mode();
+            }
+            KeyCode::Enter => {
+                // Exit search mode but keep the filtered results
+                self.search_mode = false;
+            }
+            KeyCode::Backspace => {
+                self.search_query.pop();
+                self.filter_files();
+            }
+            KeyCode::Up if key_event.modifiers == KeyModifiers::CONTROL => {
+                self.move_up();
+            }
+            KeyCode::Down if key_event.modifiers == KeyModifiers::CONTROL => {
+                self.move_down();
+            }
+            KeyCode::Char(c) => {
+                self.search_query.push(c);
+                self.filter_files();
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// Filter files based on search query.
+    pub fn filter_files(&mut self) {
+        if self.search_query.is_empty() {
+            self.files = self.all_files.clone();
+        } else {
+            self.files = self.all_files
+                .iter()
+                .filter(|file| {
+                    file.to_lowercase().contains(&self.search_query.to_lowercase())
+                })
+                .cloned()
+                .collect();
+        }
+        self.selected_index = 0;
     }
 }

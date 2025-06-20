@@ -1,4 +1,5 @@
 # justfile for blobrs - Azure Blob Storage TUI Browser
+set dotenv-required := true
 
 # Default recipe to list available commands
 default:
@@ -143,7 +144,14 @@ info:
     @echo "  - →/l/Enter: Enter folder"
     @echo "  - ←/h: Go up one level"
     @echo "  - r/F5: Refresh"
+    @echo "  - /: Search/filter blobs"
     @echo "  - q/Esc/Ctrl+C: Quit"
+    @echo ""
+    @echo "🔍 Search Mode:"
+    @echo "  - Type to filter results"
+    @echo "  - Enter: Confirm search and exit search mode"
+    @echo "  - Esc: Cancel search and restore full list"
+    @echo "  - Ctrl+↑/↓: Navigate while searching"
 
 # Create a new release
 release VERSION:
