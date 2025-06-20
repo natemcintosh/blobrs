@@ -1,64 +1,78 @@
 use crate::event::{AppEvent, Event, EventHandler};
+use object_store::{ObjectStore, path::Path as ObjectPath};
 use ratatui::{
     DefaultTerminal,
     crossterm::event::{KeyCode, KeyEvent, KeyModifiers},
 };
-use std::{env, fs};
+use std::sync::Arc;
 
 /// Application.
-#[derive(Debug)]
 pub struct App {
     /// Is the application running?
     pub running: bool,
     /// Event handler.
     pub events: EventHandler,
-    /// Current working directory.
-    pub current_dir: String,
-    /// List of files in the current directory.
+    /// Azure Blob Storage client.
+    pub object_store: Arc<dyn ObjectStore>,
+    /// Current path prefix in blob storage.
+    pub current_path: String,
+    /// List of blobs/prefixes in the current path.
     pub files: Vec<String>,
     /// Currently selected file index.
     pub selected_index: usize,
+    /// Loading state for async operations.
+    pub is_loading: bool,
+    /// Error message to display.
+    pub error_message: Option<String>,
 }
 
-impl Default for App {
-    fn default() -> Self {
-        let current_dir = env::current_dir()
-            .unwrap_or_else(|_| std::path::PathBuf::from("."))
-            .to_string_lossy()
-            .to_string();
-        let files = Self::read_directory(&current_dir);
-
-        Self {
-            running: true,
-            events: EventHandler::new(),
-            current_dir,
-            files,
-            selected_index: 0,
-        }
+impl std::fmt::Debug for App {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("App")
+            .field("running", &self.running)
+            .field("current_path", &self.current_path)
+            .field("files", &self.files)
+            .field("selected_index", &self.selected_index)
+            .field("is_loading", &self.is_loading)
+            .field("error_message", &self.error_message)
+            .finish()
     }
 }
 
 impl App {
     /// Constructs a new instance of [`App`].
-    pub fn new() -> Self {
-        Self::default()
+    pub async fn new(object_store: Arc<dyn ObjectStore>) -> color_eyre::Result<Self> {
+        let mut app = Self {
+            running: true,
+            events: EventHandler::new(),
+            object_store,
+            current_path: String::new(),
+            files: Vec::new(),
+            selected_index: 0,
+            is_loading: false,
+            error_message: None,
+        };
+
+        // Load initial file list
+        app.refresh_files().await?;
+        Ok(app)
     }
 
     /// Run the application's main loop.
-    pub fn run(mut self, mut terminal: DefaultTerminal) -> color_eyre::Result<()> {
+    pub async fn run(mut self, mut terminal: DefaultTerminal) -> color_eyre::Result<()> {
         while self.running {
             terminal.draw(|frame| frame.render_widget(&self, frame.area()))?;
-            self.handle_events()?;
+            self.handle_events().await?;
         }
         Ok(())
     }
 
-    pub fn handle_events(&mut self) -> color_eyre::Result<()> {
+    pub async fn handle_events(&mut self) -> color_eyre::Result<()> {
         match self.events.next()? {
             Event::Tick => self.tick(),
             Event::Crossterm(event) => {
                 if let ratatui::crossterm::event::Event::Key(key_event) = event {
-                    self.handle_key_event(key_event)?
+                    self.handle_key_event(key_event).await?
                 }
             }
             Event::App(app_event) => match app_event {
@@ -69,20 +83,39 @@ impl App {
     }
 
     /// Handles the key events and updates the state of [`App`].
-    pub fn handle_key_event(&mut self, key_event: KeyEvent) -> color_eyre::Result<()> {
+    pub async fn handle_key_event(&mut self, key_event: KeyEvent) -> color_eyre::Result<()> {
+        // Don't process keys while loading
+        if self.is_loading {
+            return Ok(());
+        }
+
         match key_event.code {
             KeyCode::Esc | KeyCode::Char('q') => self.events.send(AppEvent::Quit),
             KeyCode::Char('c' | 'C') if key_event.modifiers == KeyModifiers::CONTROL => {
                 self.events.send(AppEvent::Quit)
             }
 
-            KeyCode::Char('r') | KeyCode::F(5) => self.refresh_files(),
+            KeyCode::Char('r') | KeyCode::F(5) => {
+                if let Err(e) = self.refresh_files().await {
+                    self.error_message = Some(format!("Refresh failed: {}", e));
+                }
+            }
             KeyCode::Up | KeyCode::Char('k') => self.move_up(),
             KeyCode::Down | KeyCode::Char('j') => self.move_down(),
-            KeyCode::Right | KeyCode::Char('l') | KeyCode::Enter => self.enter_directory(),
-            KeyCode::Left | KeyCode::Char('h') => self.go_up_directory(),
-            // Other handlers you could add here.
-            _ => {}
+            KeyCode::Right | KeyCode::Char('l') | KeyCode::Enter => {
+                if let Err(e) = self.enter_directory().await {
+                    self.error_message = Some(format!("Enter directory failed: {}", e));
+                }
+            }
+            KeyCode::Left | KeyCode::Char('h') => {
+                if let Err(e) = self.go_up_directory().await {
+                    self.error_message = Some(format!("Go up failed: {}", e));
+                }
+            }
+            // Clear error message on any other key
+            _ => {
+                self.error_message = None;
+            }
         }
         Ok(())
     }
@@ -98,32 +131,55 @@ impl App {
         self.running = false;
     }
 
-    /// Read the contents of a directory and return a sorted list of file names.
-    fn read_directory(path: &str) -> Vec<String> {
-        match fs::read_dir(path) {
-            Ok(entries) => {
-                let mut files = Vec::new();
-                for entry in entries.flatten() {
-                    if let Some(name) = entry.file_name().to_str() {
-                        let prefix = if entry.path().is_dir() {
-                            "📁 "
-                        } else {
-                            "📄 "
-                        };
-                        files.push(format!("{}{}", prefix, name));
-                    }
-                }
-                files.sort();
-                files
+    /// List blobs and prefixes in the current path.
+    async fn list_blobs(&self, prefix: &str) -> color_eyre::Result<Vec<String>> {
+        let result = if prefix.is_empty() {
+            self.object_store.list_with_delimiter(None).await?
+        } else {
+            let object_path = ObjectPath::from(prefix);
+            self.object_store
+                .list_with_delimiter(Some(&object_path))
+                .await?
+        };
+        let mut items = Vec::new();
+
+        // Add "directories" (common prefixes)
+        for prefix in result.common_prefixes {
+            let name = prefix.as_ref().trim_end_matches('/');
+            if let Some(last_part) = name.split('/').next_back() {
+                items.push(format!("📁 {}", last_part));
             }
-            Err(_) => vec!["Failed to read directory".to_string()],
         }
+
+        // Add files (objects)
+        for meta in result.objects {
+            let name = meta.location.as_ref();
+            if let Some(last_part) = name.split('/').next_back() {
+                items.push(format!("📄 {}", last_part));
+            }
+        }
+
+        items.sort();
+        Ok(items)
     }
 
-    /// Refresh the file list for the current directory.
-    pub fn refresh_files(&mut self) {
-        self.files = Self::read_directory(&self.current_dir);
-        self.selected_index = 0; // Reset selection to top
+    /// Refresh the file list for the current path.
+    pub async fn refresh_files(&mut self) -> color_eyre::Result<()> {
+        self.is_loading = true;
+        self.error_message = None;
+
+        match self.list_blobs(&self.current_path).await {
+            Ok(files) => {
+                self.files = files;
+                self.selected_index = 0;
+            }
+            Err(e) => {
+                self.error_message = Some(format!("Failed to list blobs: {}", e));
+            }
+        }
+
+        self.is_loading = false;
+        Ok(())
     }
 
     /// Move the selection up.
@@ -141,40 +197,43 @@ impl App {
     }
 
     /// Enter a directory if the selected item is a folder.
-    pub fn enter_directory(&mut self) {
+    pub async fn enter_directory(&mut self) -> color_eyre::Result<()> {
         if self.files.is_empty() {
-            return;
+            return Ok(());
         }
 
         let selected_file = &self.files[self.selected_index];
         // Check if the selected item is a directory (starts with folder emoji)
         if let Some(dir_name) = selected_file.strip_prefix("📁 ") {
-            let new_path = if self.current_dir.ends_with('/') {
-                format!("{}{}", self.current_dir, dir_name)
+            let new_path = if self.current_path.is_empty() {
+                format!("{}/", dir_name)
+            } else if self.current_path.ends_with('/') {
+                format!("{}{}/", self.current_path, dir_name)
             } else {
-                format!("{}/{}", self.current_dir, dir_name)
+                format!("{}/{}/", self.current_path, dir_name)
             };
 
-            // Try to change to the new directory
-            if let Ok(canonical_path) = fs::canonicalize(&new_path) {
-                if let Some(path_str) = canonical_path.to_str() {
-                    self.current_dir = path_str.to_string();
-                    self.files = Self::read_directory(&self.current_dir);
-                    self.selected_index = 0; // Reset selection to top
-                }
-            }
+            self.current_path = new_path;
+            self.refresh_files().await?;
         }
+        Ok(())
     }
 
     /// Go up one directory level.
-    pub fn go_up_directory(&mut self) {
-        let current_path = std::path::Path::new(&self.current_dir);
-        if let Some(parent) = current_path.parent() {
-            if let Some(parent_str) = parent.to_str() {
-                self.current_dir = parent_str.to_string();
-                self.files = Self::read_directory(&self.current_dir);
-                self.selected_index = 0; // Reset selection to top
-            }
+    pub async fn go_up_directory(&mut self) -> color_eyre::Result<()> {
+        if self.current_path.is_empty() {
+            return Ok(()); // Already at root
         }
+
+        // Remove trailing slash and go up one level
+        let trimmed = self.current_path.trim_end_matches('/');
+        if let Some(last_slash) = trimmed.rfind('/') {
+            self.current_path = format!("{}/", &trimmed[..last_slash]);
+        } else {
+            self.current_path = String::new(); // Go to root
+        }
+
+        self.refresh_files().await?;
+        Ok(())
     }
 }
