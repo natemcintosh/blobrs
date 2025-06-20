@@ -94,8 +94,6 @@ env-status:
     @echo "🌍 Environment Status:"
     @echo -n "AZURE_STORAGE_ACCOUNT: "; if [ -n "${AZURE_STORAGE_ACCOUNT:-}" ]; then echo "✅ Set"; else echo "❌ Not set"; fi
     @echo -n "AZURE_STORAGE_ACCESS_KEY: "; if [ -n "${AZURE_STORAGE_ACCESS_KEY:-}" ]; then echo "✅ Set (hidden)"; else echo "❌ Not set"; fi
-    @echo ""
-    @echo "ℹ️  Container selection is now done within the application"
 
 # Install development dependencies
 install:
