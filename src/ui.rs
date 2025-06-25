@@ -20,6 +20,8 @@ impl Widget for &App {
                     self.render_blob_info_popup(area, buf);
                 } else if self.show_download_picker {
                     self.render_download_picker_popup(area, buf);
+                } else if self.show_sort_popup {
+                    self.render_sort_popup(area, buf);
                 } else if self.is_downloading {
                     self.render_download_progress_popup(area, buf);
                 }
@@ -68,10 +70,10 @@ impl App {
             constraints.push(Constraint::Length(3)); // Search input area
         }
 
-        // Add space for error message if present
-        if self.error_message.is_some() || self.is_loading {
-            // Calculate height based on error message length and terminal width
-            let error_height = if let Some(error) = &self.error_message {
+        // Add space for error or success message if present
+        if self.error_message.is_some() || self.success_message.is_some() || self.is_loading {
+            // Calculate height based on message length and terminal width
+            let message_height = if let Some(error) = &self.error_message {
                 // Estimate lines needed: error length / (width - padding), min 3, max 8
                 let available_width = area.width.saturating_sub(4); // Account for borders and padding
                 if available_width > 0 {
@@ -81,10 +83,20 @@ impl App {
                 } else {
                     3
                 }
+            } else if let Some(success) = &self.success_message {
+                // Estimate lines needed: success length / (width - padding), min 3, max 8
+                let available_width = area.width.saturating_sub(4); // Account for borders and padding
+                if available_width > 0 {
+                    ((success.len() + format!("{} ", self.icons.success).len()) as u16)
+                        .div_ceil(available_width)
+                        .clamp(3, 8)
+                } else {
+                    3
+                }
             } else {
                 3
             };
-            constraints.push(Constraint::Length(error_height)); // Error/loading area
+            constraints.push(Constraint::Length(message_height)); // Message/loading area
         }
 
         constraints.push(Constraint::Length(footer_height)); // Footer for instructions
@@ -168,7 +180,7 @@ impl App {
             chunk_index += 1;
         }
 
-        // Error/Loading message if present
+        // Error/Success/Loading message if present
         if let Some(error) = &self.error_message {
             let error_widget = Paragraph::new(format!("{} {}", self.icons.error, error))
                 .block(Block::bordered().border_type(BorderType::Rounded))
@@ -176,6 +188,14 @@ impl App {
                 .wrap(ratatui::widgets::Wrap { trim: true })
                 .alignment(Alignment::Left);
             error_widget.render(chunks[chunk_index], buf);
+            chunk_index += 1;
+        } else if let Some(success) = &self.success_message {
+            let success_widget = Paragraph::new(format!("{} {}", self.icons.success, success))
+                .block(Block::bordered().border_type(BorderType::Rounded))
+                .fg(Color::Green)
+                .wrap(ratatui::widgets::Wrap { trim: true })
+                .alignment(Alignment::Left);
+            success_widget.render(chunks[chunk_index], buf);
             chunk_index += 1;
         } else if self.is_loading {
             let loading_widget =
@@ -202,7 +222,7 @@ impl App {
         let instructions = if self.search_mode {
             "Search Mode: Type to filter • `Enter` to confirm • `Esc` to cancel • `Ctrl+↑`/`Ctrl+↓` to navigate"
         } else {
-            "Press `Ctrl-C` or `q` to quit • `Esc`/`←`/`h` to go back • `r`/`F5` to refresh • `↑`/`↓` or `k`/`j` to navigate • `→`/`l`/`Enter` to enter folder • `/` to search • `i` for info • `d` to download • `Backspace` for container selection"
+            "Press `Ctrl-C` or `q` to quit • `Esc`/`←`/`h` to go back • `r`/`F5` to refresh • `↑`/`↓` or `k`/`j` to navigate • `→`/`l`/`Enter` to enter folder • `/` to search • `s` to sort • `i` for info • `c` to copy path • `d` to download • `Backspace` for container selection"
         };
         let footer_height = self.calculate_footer_height(instructions, area.width);
 
@@ -216,10 +236,10 @@ impl App {
             constraints.push(Constraint::Length(3)); // Search input area
         }
 
-        // Add space for error message if present
-        if self.error_message.is_some() || self.is_loading {
-            // Calculate height based on error message length and terminal width
-            let error_height = if let Some(error) = &self.error_message {
+        // Add space for error or success message if present
+        if self.error_message.is_some() || self.success_message.is_some() || self.is_loading {
+            // Calculate height based on message length and terminal width
+            let message_height = if let Some(error) = &self.error_message {
                 // Estimate lines needed: error length / (width - padding), min 3, max 8
                 let available_width = area.width.saturating_sub(4); // Account for borders and padding
                 if available_width > 0 {
@@ -229,10 +249,20 @@ impl App {
                 } else {
                     3
                 }
+            } else if let Some(success) = &self.success_message {
+                // Estimate lines needed: success length / (width - padding), min 3, max 8
+                let available_width = area.width.saturating_sub(4); // Account for borders and padding
+                if available_width > 0 {
+                    ((success.len() + format!("{} ", self.icons.success).len()) as u16)
+                        .div_ceil(available_width)
+                        .clamp(3, 8)
+                } else {
+                    3
+                }
             } else {
                 3
             };
-            constraints.push(Constraint::Length(error_height)); // Error/loading area
+            constraints.push(Constraint::Length(message_height)); // Message/loading area
         }
 
         constraints.push(Constraint::Length(footer_height)); // Footer for instructions
@@ -328,7 +358,7 @@ impl App {
             chunk_index += 1;
         }
 
-        // Error/Loading message if present
+        // Error/Success/Loading message if present
         if let Some(error) = &self.error_message {
             let error_widget = Paragraph::new(format!("{} {}", self.icons.error, error))
                 .block(Block::bordered().border_type(BorderType::Rounded))
@@ -336,6 +366,14 @@ impl App {
                 .wrap(ratatui::widgets::Wrap { trim: true })
                 .alignment(Alignment::Left);
             error_widget.render(chunks[chunk_index], buf);
+            chunk_index += 1;
+        } else if let Some(success) = &self.success_message {
+            let success_widget = Paragraph::new(format!("{} {}", self.icons.success, success))
+                .block(Block::bordered().border_type(BorderType::Rounded))
+                .fg(Color::Green)
+                .wrap(ratatui::widgets::Wrap { trim: true })
+                .alignment(Alignment::Left);
+            success_widget.render(chunks[chunk_index], buf);
             chunk_index += 1;
         } else if self.is_loading {
             let loading_widget = Paragraph::new(format!(
@@ -608,6 +646,52 @@ impl App {
 
             info_paragraph.render(popup_area, buf);
         }
+    }
+
+    /// Render the sort selection popup.
+    fn render_sort_popup(&self, area: Rect, buf: &mut Buffer) {
+        // Calculate popup size
+        let popup_width = 50;
+        let popup_height = 10;
+
+        // Center the popup
+        let popup_area = Rect {
+            x: (area.width.saturating_sub(popup_width)) / 2,
+            y: (area.height.saturating_sub(popup_height)) / 2,
+            width: popup_width,
+            height: popup_height,
+        };
+
+        // Clear the popup area with a background
+        for y in popup_area.y..popup_area.y + popup_area.height {
+            for x in popup_area.x..popup_area.x + popup_area.width {
+                buf[(x, y)].set_style(Style::default().bg(Color::Black));
+            }
+        }
+
+        let sort_text = [
+            "Select sorting criteria:".to_string(),
+            String::new(),
+            "n - Sort by Name".to_string(),
+            "m - Sort by Date Modified".to_string(),
+            "c - Sort by Date Created".to_string(),
+            "s - Sort by Size".to_string(),
+            String::new(),
+            "Press Esc to cancel".to_string(),
+        ];
+
+        let info_text = sort_text.join("\n");
+        let info_paragraph = Paragraph::new(info_text)
+            .block(
+                Block::bordered()
+                    .border_type(BorderType::Rounded)
+                    .title(" Sort Files ")
+                    .style(Style::default().fg(Color::Cyan).bg(Color::Black)),
+            )
+            .style(Style::default().bg(Color::Black))
+            .alignment(Alignment::Left);
+
+        info_paragraph.render(popup_area, buf);
     }
 }
 

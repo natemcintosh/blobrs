@@ -2,6 +2,7 @@ use crate::{
     event::{AppEvent, Event, EventHandler},
     terminal_icons::{IconSet, detect_terminal_icons},
 };
+use arboard::Clipboard;
 use base64::{Engine as _, engine::general_purpose};
 use chrono::Utc;
 use futures::stream::StreamExt;
@@ -17,6 +18,14 @@ use sha2::Sha256;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum SortCriteria {
+    Name,
+    DateModified,
+    DateCreated,
+    Size,
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum AppState {
@@ -38,6 +47,16 @@ pub struct BlobInfo {
     pub is_folder: bool,
     pub blob_count: Option<usize>, // For folders: number of blobs
     pub total_size: Option<u64>, // For folders: total size of all blobs (changed from usize to u64)
+}
+
+#[derive(Debug, Clone)]
+pub struct FileItem {
+    pub display_name: String, // What to show in the UI (with icon)
+    pub actual_name: String,  // The actual file/folder name
+    pub is_folder: bool,
+    pub size: Option<u64>,
+    pub last_modified: Option<chrono::DateTime<chrono::Utc>>,
+    pub created: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 /// Application.
@@ -64,14 +83,20 @@ pub struct App {
     pub current_path: String,
     /// List of blobs/prefixes in the current path.
     pub files: Vec<String>,
+    /// List of file items with metadata for sorting.
+    pub file_items: Vec<FileItem>,
     /// All files (unfiltered) for search functionality.
     pub all_files: Vec<String>,
+    /// All file items (unfiltered) for search functionality.
+    pub all_file_items: Vec<FileItem>,
     /// Currently selected file index.
     pub selected_index: usize,
     /// Loading state for async operations.
     pub is_loading: bool,
     /// Error message to display.
     pub error_message: Option<String>,
+    /// Success message to display.
+    pub success_message: Option<String>,
     /// Search mode state for containers.
     pub container_search_mode: bool,
     /// Current container search query.
@@ -94,6 +119,10 @@ pub struct App {
     pub download_progress: Option<DownloadProgress>,
     /// Whether a download is currently in progress.
     pub is_downloading: bool,
+    /// Current sort criteria for blobs.
+    pub sort_criteria: SortCriteria,
+    /// Whether to show the sort selection popup.
+    pub show_sort_popup: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -117,10 +146,13 @@ impl std::fmt::Debug for App {
             .field("selected_container_index", &self.selected_container_index)
             .field("current_path", &self.current_path)
             .field("files", &self.files)
+            .field("file_items", &self.file_items)
             .field("all_files", &self.all_files)
+            .field("all_file_items", &self.all_file_items)
             .field("selected_index", &self.selected_index)
             .field("is_loading", &self.is_loading)
             .field("error_message", &self.error_message)
+            .field("success_message", &self.success_message)
             .field("container_search_mode", &self.container_search_mode)
             .field("container_search_query", &self.container_search_query)
             .field("search_mode", &self.search_mode)
@@ -132,6 +164,8 @@ impl std::fmt::Debug for App {
             .field("download_destination", &self.download_destination)
             .field("download_progress", &self.download_progress)
             .field("is_downloading", &self.is_downloading)
+            .field("sort_criteria", &self.sort_criteria)
+            .field("show_sort_popup", &self.show_sort_popup)
             .finish()
     }
 }
@@ -151,10 +185,13 @@ impl App {
             object_store: None,
             current_path: String::new(),
             files: Vec::new(),
+            file_items: Vec::new(),
             all_files: Vec::new(),
+            all_file_items: Vec::new(),
             selected_index: 0,
             is_loading: false,
             error_message: None,
+            success_message: None,
             container_search_mode: false,
             container_search_query: String::new(),
             search_mode: false,
@@ -166,6 +203,8 @@ impl App {
             download_destination: None,
             download_progress: None,
             is_downloading: false,
+            sort_criteria: SortCriteria::Name,
+            show_sort_popup: false,
         };
 
         // Load container list
@@ -251,6 +290,7 @@ impl App {
                 }
                 _ => {
                     self.error_message = None;
+                    self.success_message = None;
                 }
             },
             AppState::BlobBrowsing => {
@@ -279,17 +319,69 @@ impl App {
                         if !self.show_blob_info_popup
                             && !self.show_download_picker
                             && !self.is_downloading
+                            && !self.show_sort_popup
                         {
                             self.show_download_picker().await;
                         }
                     }
+                    KeyCode::Char('s') => {
+                        if !self.show_blob_info_popup
+                            && !self.show_download_picker
+                            && !self.is_downloading
+                            && !self.show_sort_popup
+                        {
+                            self.show_sort_popup = true;
+                        } else if self.show_sort_popup {
+                            // Handle sort selection
+                            if let Err(e) = self.apply_sort(SortCriteria::Size).await {
+                                self.error_message = Some(format!("Failed to sort: {}", e));
+                            }
+                            self.show_sort_popup = false;
+                        }
+                    }
+                    KeyCode::Char('n') => {
+                        if self.show_sort_popup {
+                            if let Err(e) = self.apply_sort(SortCriteria::Name).await {
+                                self.error_message = Some(format!("Failed to sort: {}", e));
+                            }
+                            self.show_sort_popup = false;
+                        }
+                    }
+                    KeyCode::Char('m') => {
+                        if self.show_sort_popup {
+                            if let Err(e) = self.apply_sort(SortCriteria::DateModified).await {
+                                self.error_message = Some(format!("Failed to sort: {}", e));
+                            }
+                            self.show_sort_popup = false;
+                        }
+                    }
+                    KeyCode::Char('c') => {
+                        if self.show_sort_popup {
+                            if let Err(e) = self.apply_sort(SortCriteria::DateCreated).await {
+                                self.error_message = Some(format!("Failed to sort: {}", e));
+                            }
+                            self.show_sort_popup = false;
+                        } else if !self.show_blob_info_popup
+                            && !self.show_download_picker
+                            && !self.is_downloading
+                        {
+                            // Copy blob path to clipboard
+                            if let Err(e) = self.copy_blob_path_to_clipboard() {
+                                self.error_message =
+                                    Some(format!("Failed to copy to clipboard: {}", e));
+                            }
+                        } else {
+                            self.error_message =
+                                Some("Cannot copy while popup is open".to_string());
+                        }
+                    }
                     KeyCode::Up | KeyCode::Char('k') => {
-                        if !self.show_blob_info_popup {
+                        if !self.show_blob_info_popup && !self.show_sort_popup {
                             self.move_up();
                         }
                     }
                     KeyCode::Down | KeyCode::Char('j') => {
-                        if !self.show_blob_info_popup {
+                        if !self.show_blob_info_popup && !self.show_sort_popup {
                             self.move_down();
                         }
                     }
@@ -298,7 +390,7 @@ impl App {
                             if let Err(e) = self.confirm_download().await {
                                 self.error_message = Some(format!("Download failed: {}", e));
                             }
-                        } else if !self.show_blob_info_popup {
+                        } else if !self.show_blob_info_popup && !self.show_sort_popup {
                             if let Err(e) = self.enter_directory().await {
                                 self.error_message = Some(format!("Enter directory failed: {}", e));
                             }
@@ -313,6 +405,9 @@ impl App {
                             // Close popup
                             self.show_blob_info_popup = false;
                             self.current_blob_info = None;
+                        } else if self.show_sort_popup {
+                            // Close sort popup
+                            self.show_sort_popup = false;
                         } else if let Err(e) = self.go_up_directory().await {
                             self.error_message = Some(format!("Go up failed: {}", e));
                         }
@@ -326,6 +421,9 @@ impl App {
                             // Close popup
                             self.show_blob_info_popup = false;
                             self.current_blob_info = None;
+                        } else if self.show_sort_popup {
+                            // Close sort popup
+                            self.show_sort_popup = false;
                         } else if !self.current_path.is_empty() {
                             // Go up one directory level if not at container root
                             if let Err(e) = self.go_up_directory().await {
@@ -337,7 +435,9 @@ impl App {
                             self.object_store = None;
                             self.current_path.clear();
                             self.files.clear();
+                            self.file_items.clear();
                             self.all_files.clear();
+                            self.all_file_items.clear();
                             self.selected_index = 0;
                             self.search_mode = false;
                             self.search_query.clear();
@@ -354,13 +454,18 @@ impl App {
                             // Close popup
                             self.show_blob_info_popup = false;
                             self.current_blob_info = None;
+                        } else if self.show_sort_popup {
+                            // Close sort popup
+                            self.show_sort_popup = false;
                         } else {
                             // Go back to container selection
                             self.state = AppState::ContainerSelection;
                             self.object_store = None;
                             self.current_path.clear();
                             self.files.clear();
+                            self.file_items.clear();
                             self.all_files.clear();
+                            self.all_file_items.clear();
                             self.selected_index = 0;
                             self.search_mode = false;
                             self.search_query.clear();
@@ -370,6 +475,7 @@ impl App {
                     }
                     _ => {
                         self.error_message = None;
+                        self.success_message = None;
                     }
                 }
             }
@@ -388,8 +494,8 @@ impl App {
         self.running = false;
     }
 
-    /// List blobs and prefixes in the current path.
-    async fn list_blobs(&self, prefix: &str) -> color_eyre::Result<Vec<String>> {
+    /// List blobs and prefixes with metadata for sorting.
+    async fn list_file_items(&self, prefix: &str) -> color_eyre::Result<Vec<FileItem>> {
         let object_store = self
             .object_store
             .as_ref()
@@ -407,33 +513,129 @@ impl App {
         for prefix in result.common_prefixes {
             let name = prefix.as_ref().trim_end_matches('/');
             if let Some(last_part) = name.split('/').next_back() {
-                items.push(format!("{} {}", self.icons.folder, last_part));
+                items.push(FileItem {
+                    display_name: format!("{} {}", self.icons.folder, last_part),
+                    actual_name: last_part.to_string(),
+                    is_folder: true,
+                    size: None,
+                    last_modified: None,
+                    created: None,
+                });
             }
         }
 
-        // Add files (objects)
+        // Add files (objects) with metadata
         for meta in result.objects {
             let name = meta.location.as_ref();
             if let Some(last_part) = name.split('/').next_back() {
-                items.push(format!("{} {}", self.icons.file, last_part));
+                items.push(FileItem {
+                    display_name: format!("{} {}", self.icons.file, last_part),
+                    actual_name: last_part.to_string(),
+                    is_folder: false,
+                    size: Some(meta.size),
+                    last_modified: Some(meta.last_modified),
+                    created: None, // Azure Blob Storage doesn't provide creation time in list operation
+                });
             }
         }
 
-        items.sort();
         Ok(items)
+    }
+
+    /// Apply sorting to the current file list.
+    pub async fn apply_sort(&mut self, criteria: SortCriteria) -> color_eyre::Result<()> {
+        self.sort_criteria = criteria.clone();
+
+        if !self.file_items.is_empty() {
+            Self::sort_file_items_static(&mut self.file_items, &criteria);
+            // Update the display list
+            self.files = self
+                .file_items
+                .iter()
+                .map(|item| item.display_name.clone())
+                .collect();
+        }
+
+        // Also sort the unfiltered list
+        if !self.all_file_items.is_empty() {
+            Self::sort_file_items_static(&mut self.all_file_items, &criteria);
+            self.all_files = self
+                .all_file_items
+                .iter()
+                .map(|item| item.display_name.clone())
+                .collect();
+        }
+
+        Ok(())
+    }
+
+    /// Sort file items based on the given criteria.
+    fn sort_file_items_static(items: &mut [FileItem], criteria: &SortCriteria) {
+        items.sort_by(|a, b| {
+            // Always put folders first
+            match (a.is_folder, b.is_folder) {
+                (true, false) => std::cmp::Ordering::Less,
+                (false, true) => std::cmp::Ordering::Greater,
+                _ => {
+                    // Both are folders or both are files, sort by criteria
+                    match criteria {
+                        SortCriteria::Name => a.actual_name.cmp(&b.actual_name),
+                        SortCriteria::DateModified => {
+                            match (a.last_modified, b.last_modified) {
+                                (Some(a_time), Some(b_time)) => b_time.cmp(&a_time), // Newest first
+                                (Some(_), None) => std::cmp::Ordering::Less,
+                                (None, Some(_)) => std::cmp::Ordering::Greater,
+                                (None, None) => a.actual_name.cmp(&b.actual_name), // Fallback to name
+                            }
+                        }
+                        SortCriteria::DateCreated => {
+                            // Since Azure Blob Storage doesn't provide creation time in list operations,
+                            // fall back to last_modified
+                            match (a.last_modified, b.last_modified) {
+                                (Some(a_time), Some(b_time)) => b_time.cmp(&a_time), // Newest first
+                                (Some(_), None) => std::cmp::Ordering::Less,
+                                (None, Some(_)) => std::cmp::Ordering::Greater,
+                                (None, None) => a.actual_name.cmp(&b.actual_name), // Fallback to name
+                            }
+                        }
+                        SortCriteria::Size => {
+                            match (a.size, b.size) {
+                                (Some(a_size), Some(b_size)) => b_size.cmp(&a_size), // Largest first
+                                (Some(_), None) => std::cmp::Ordering::Less,
+                                (None, Some(_)) => std::cmp::Ordering::Greater,
+                                (None, None) => a.actual_name.cmp(&b.actual_name), // Fallback to name
+                            }
+                        }
+                    }
+                }
+            }
+        });
     }
 
     /// Refresh the file list for the current path.
     pub async fn refresh_files(&mut self) -> color_eyre::Result<()> {
         self.is_loading = true;
         self.error_message = None;
+        self.success_message = None;
 
-        match self.list_blobs(&self.current_path).await {
-            Ok(files) => {
+        match self.list_file_items(&self.current_path).await {
+            Ok(mut file_items) => {
+                // Apply current sorting
+                Self::sort_file_items_static(&mut file_items, &self.sort_criteria);
+
+                // Create display strings
+                let files: Vec<String> = file_items
+                    .iter()
+                    .map(|item| item.display_name.clone())
+                    .collect();
+
+                self.all_file_items = file_items.clone();
                 self.all_files = files.clone();
+
                 if self.search_mode && !self.search_query.is_empty() {
                     self.filter_files();
                 } else {
+                    self.file_items = file_items;
                     self.files = files;
                     self.selected_index = 0;
                 }
@@ -518,6 +720,7 @@ impl App {
         self.search_mode = true;
         self.search_query.clear();
         self.error_message = None;
+        self.success_message = None;
     }
 
     /// Exit search mode and restore original file list.
@@ -561,15 +764,23 @@ impl App {
     pub fn filter_files(&mut self) {
         if self.search_query.is_empty() {
             self.files = self.all_files.clone();
+            self.file_items = self.all_file_items.clone();
         } else {
-            self.files = self
-                .all_files
+            let filtered_items: Vec<FileItem> = self
+                .all_file_items
                 .iter()
-                .filter(|file| {
-                    file.to_lowercase()
+                .filter(|item| {
+                    item.actual_name
+                        .to_lowercase()
                         .contains(&self.search_query.to_lowercase())
                 })
                 .cloned()
+                .collect();
+
+            self.file_items = filtered_items.clone();
+            self.files = filtered_items
+                .iter()
+                .map(|item| item.display_name.clone())
                 .collect();
         }
         self.selected_index = 0;
@@ -579,6 +790,7 @@ impl App {
     async fn load_containers(&mut self) -> color_eyre::Result<()> {
         self.is_loading = true;
         self.error_message = None;
+        self.success_message = None;
 
         match self.list_containers().await {
             Ok(containers) => {
@@ -731,6 +943,7 @@ impl App {
         self.container_search_mode = true;
         self.container_search_query.clear();
         self.error_message = None;
+        self.success_message = None;
     }
 
     /// Exit container search mode and restore original container list.
@@ -907,6 +1120,68 @@ impl App {
                 e
             )),
         }
+    }
+
+    /// Copy the full blob path to clipboard.
+    pub fn copy_blob_path_to_clipboard(&mut self) -> color_eyre::Result<()> {
+        if self.files.is_empty() {
+            return Ok(());
+        }
+
+        let selected_file = &self.files[self.selected_index];
+        let folder_prefix = format!("{} ", self.icons.folder);
+        let file_prefix = format!("{} ", self.icons.file);
+
+        let (item_name, is_folder) = if selected_file.starts_with(&folder_prefix) {
+            // It's a folder
+            let folder_name = if let Some(name) = selected_file.strip_prefix(&folder_prefix) {
+                name
+            } else {
+                selected_file
+            };
+            (folder_name, true)
+        } else {
+            // It's a file
+            let file_name = if let Some(name) = selected_file.strip_prefix(&file_prefix) {
+                name
+            } else {
+                selected_file
+            };
+            (file_name, false)
+        };
+
+        // Construct the full path
+        let full_path = if self.current_path.is_empty() {
+            if is_folder {
+                format!("{}/", item_name)
+            } else {
+                item_name.to_string()
+            }
+        } else if self.current_path.ends_with('/') {
+            if is_folder {
+                format!("{}{}/", self.current_path, item_name)
+            } else {
+                format!("{}{}", self.current_path, item_name)
+            }
+        } else if is_folder {
+            format!("{}/{}/", self.current_path, item_name)
+        } else {
+            format!("{}/{}", self.current_path, item_name)
+        };
+
+        // Copy to clipboard
+        let mut clipboard = Clipboard::new()?;
+        clipboard.set_text(full_path.clone())?;
+
+        // Set success message
+        let item_type = if is_folder { "folder" } else { "file" };
+        self.success_message = Some(format!(
+            "Copied {} path to clipboard: {}",
+            item_type, full_path
+        ));
+        self.error_message = None; // Clear any existing error message
+
+        Ok(())
     }
 
     /// Show the download destination picker.
