@@ -1,6 +1,6 @@
 [package]
 name = "blobrs"
-version = "0.2.1"
+version = "0.3.0"
 description = "TUI for interacting with blob storage"
 authors = ["Nate McIntosh <natemcintosh@gmail.com>"]
 license = "MIT"
