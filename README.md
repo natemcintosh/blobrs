@@ -347,8 +347,9 @@ This project is licensed under the MIT License - see the LICENSE file for detail
 ## Roadmap
 
 - [ ] Support for other cloud providers (AWS S3, Google Cloud Storage)
-- [ ] File upload/download functionality  
-- [ ] Blob metadata display
-- [ ] Search functionality
+- [ ] File upload functionality
+- [X] File download functionality  
+- [X] Blob metadata display
+- [X] Search functionality
 - [ ] Configuration file support
 - [ ] Multiple container support
