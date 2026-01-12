@@ -811,7 +811,7 @@ impl App {
         Ok(())
     }
 
-    /// List all containers in the storage account.
+    /// List all containers in the storage account with pagination support.
     async fn list_containers(&mut self) -> Result<Vec<ContainerInfo>, String> {
         let account_name = &self.storage_account;
         let access_key = &self.access_key;
@@ -821,68 +821,101 @@ impl App {
             .decode(access_key)
             .map_err(|e| format!("Failed to decode access key: {}", e))?;
 
-        // Create the request URL
-        let url = format!("https://{account_name}.blob.core.windows.net/?comp=list");
+        let mut all_containers = Vec::new();
+        let mut next_marker: Option<String> = None;
 
-        // Create timestamp in RFC 1123 format
-        let now = Utc::now();
-        let date = now.format("%a, %d %b %Y %H:%M:%S GMT").to_string();
+        // Continue fetching pages until no more results
+        loop {
+            // Create the request URL with pagination support
+            let mut url =
+                format!("https://{account_name}.blob.core.windows.net/?comp=list&maxresults=5000");
+            if let Some(ref marker) = next_marker {
+                url.push_str(&format!("&marker={}", urlencoding::encode(marker)));
+            }
 
-        // Construct the string to sign for Azure Storage API
-        // Format: VERB + "\n" + Content-Encoding + "\n" + Content-Language + "\n" + Content-Length + "\n" +
-        //         Content-MD5 + "\n" + Content-Type + "\n" + Date + "\n" + If-Modified-Since + "\n" +
-        //         If-Match + "\n" + If-None-Match + "\n" + If-Unmodified-Since + "\n" + Range + "\n" +
-        //         CanonicalizedHeaders + CanonicalizedResource
-        let string_to_sign = format!(
-            "GET\n\n\n\n\n\n\n\n\n\n\n\nx-ms-date:{}\nx-ms-version:2020-08-04\n/{}/\ncomp:list",
-            date, account_name
-        );
+            // Create timestamp in RFC 1123 format
+            let now = Utc::now();
+            let date = now.format("%a, %d %b %Y %H:%M:%S GMT").to_string();
 
-        // Generate HMAC-SHA256 signature
-        let mut mac = Hmac::<Sha256>::new_from_slice(&key)
-            .map_err(|e| format!("Failed to create HMAC: {}", e))?;
-        mac.update(string_to_sign.as_bytes());
-        let signature = general_purpose::STANDARD.encode(mac.finalize().into_bytes());
+            // Construct the string to sign for Azure Storage API
+            // Format: VERB + "\n" + Content-Encoding + "\n" + Content-Language + "\n" + Content-Length + "\n" +
+            //         Content-MD5 + "\n" + Content-Type + "\n" + Date + "\n" + If-Modified-Since + "\n" +
+            //         If-Match + "\n" + If-None-Match + "\n" + If-Unmodified-Since + "\n" + Range + "\n" +
+            //         CanonicalizedHeaders + CanonicalizedResource
+            let canonicalized_resource = if let Some(ref marker) = next_marker {
+                format!(
+                    "/{}/\ncomp:list\nmarker:{}\nmaxresults:5000",
+                    account_name, marker
+                )
+            } else {
+                format!("/{}/\ncomp:list\nmaxresults:5000", account_name)
+            };
 
-        // Create authorization header
-        let authorization = format!("SharedKey {}:{}", account_name, signature);
+            let string_to_sign = format!(
+                "GET\n\n\n\n\n\n\n\n\n\n\n\nx-ms-date:{}\nx-ms-version:2020-08-04\n{}",
+                date, canonicalized_resource
+            );
 
-        // Make the HTTP request
-        let client = reqwest::Client::new();
-        let response = client
-            .get(&url)
-            .header("x-ms-date", &date)
-            .header("x-ms-version", "2020-08-04")
-            .header("Authorization", &authorization)
-            .send()
-            .await
-            .map_err(|e| format!("HTTP request failed: {}", e))?;
+            // Generate HMAC-SHA256 signature
+            let mut mac = Hmac::<Sha256>::new_from_slice(&key)
+                .map_err(|e| format!("Failed to create HMAC: {}", e))?;
+            mac.update(string_to_sign.as_bytes());
+            let signature = general_purpose::STANDARD.encode(mac.finalize().into_bytes());
 
-        let status = response.status();
-        let response_text = response
-            .text()
-            .await
-            .map_err(|e| format!("Failed to read response: {}", e))?;
+            // Create authorization header
+            let authorization = format!("SharedKey {}:{}", account_name, signature);
 
-        if !status.is_success() {
-            return Err(format!(
-                "HTTP {} {} - {}",
-                status.as_u16(),
-                status.canonical_reason().unwrap_or(""),
-                response_text
-            ));
+            // Make the HTTP request
+            let client = reqwest::Client::new();
+            let response = client
+                .get(&url)
+                .header("x-ms-date", &date)
+                .header("x-ms-version", "2020-08-04")
+                .header("Authorization", &authorization)
+                .send()
+                .await
+                .map_err(|e| format!("HTTP request failed: {}", e))?;
+
+            let status = response.status();
+            let response_text = response
+                .text()
+                .await
+                .map_err(|e| format!("Failed to read response: {}", e))?;
+
+            if !status.is_success() {
+                return Err(format!(
+                    "HTTP {} {} - {}",
+                    status.as_u16(),
+                    status.canonical_reason().unwrap_or(""),
+                    response_text
+                ));
+            }
+
+            // Parse XML response and extract containers and next marker
+            let (mut containers, next_marker_option) = self
+                .parse_containers_xml_with_marker(&response_text)
+                .map_err(|e| format!("Failed to parse XML response: {}", e))?;
+
+            // Add containers from this page to our collection
+            all_containers.append(&mut containers);
+
+            // Check if there are more pages
+            if let Some(marker) = next_marker_option {
+                next_marker = Some(marker);
+            } else {
+                // No more pages, break the loop
+                break;
+            }
         }
 
-        // Parse XML response
-        let containers = self
-            .parse_containers_xml(&response_text)
-            .map_err(|e| format!("Failed to parse XML response: {}", e))?;
-
-        Ok(containers)
+        Ok(all_containers)
     }
 
-    /// Parse XML response from Azure Storage list containers API.
-    fn parse_containers_xml(&self, xml: &str) -> color_eyre::Result<Vec<ContainerInfo>> {
+    /// Parse XML response from Azure Storage list containers API with pagination marker support.
+    fn parse_containers_xml_with_marker(
+        &self,
+        xml: &str,
+    ) -> color_eyre::Result<(Vec<ContainerInfo>, Option<String>)> {
         let mut containers = Vec::new();
 
         // Use regex to find all container names
@@ -898,7 +931,16 @@ impl App {
             }
         }
 
-        Ok(containers)
+        // Look for NextMarker to determine if there are more pages
+        // Pattern: <NextMarker>marker_value</NextMarker>
+        let next_marker_regex = Regex::new(r"<NextMarker>(.*?)</NextMarker>")?;
+        let next_marker = next_marker_regex
+            .captures(xml)
+            .and_then(|cap| cap.get(1))
+            .map(|m| m.as_str().to_string())
+            .filter(|s| !s.is_empty());
+
+        Ok((containers, next_marker))
     }
 
     /// Select a container and initialize the object store.
