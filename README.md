@@ -352,10 +352,12 @@ This project is licensed under the MIT License - see the LICENSE file for detail
 
 - [ ] Support for other cloud providers (AWS S3, Google Cloud Storage)
 - [ ] File upload functionality
+- [ ] Configuration file support
+- [ ] CSV, JSON, TSV, parquet preview
+- [ ] `cargo install` ability
 - [X] File download functionality  
 - [X] Blob metadata display
 - [X] Search functionality
-- [ ] Configuration file support
 - [X] Multiple container support
 - [X] File/Folder delete functionality
 - [X] File/Folder clone functionality
