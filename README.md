@@ -18,7 +18,7 @@ A terminal user interface (TUI) application for browsing Azure Blob Storage cont
 
 ## Prerequisites
 
-- Rust 1.70+ (with Cargo)
+- Rust toolchain that supports the 2024 edition (Cargo + rustc)
 - Azure Storage Account with Blob Storage enabled
 - Storage Account Access Key
 
@@ -110,7 +110,6 @@ just test-all
 ```bash
 # Set environment variables first
 export AZURE_STORAGE_ACCOUNT="mystorageaccount"
-export AZURE_CONTAINER_NAME="mycontainer"
 export AZURE_STORAGE_ACCESS_KEY="your_access_key_here"
 
 # Run the application
@@ -141,6 +140,7 @@ When you first start the application, you'll be in container selection mode:
 | `↑` / `k` | Move selection up |
 | `↓` / `j` | Move selection down |
 | `→` / `l` / `Enter` | Select container and enter blob browsing mode |
+| `/` | Search/filter containers |
 | `r` / `F5` | Refresh container list |
 | `q` / `Esc` / `Ctrl+C` | Quit application |
 
@@ -155,7 +155,12 @@ After selecting a container, you can browse blobs:
 | `→` / `l` / `Enter` | Enter selected folder |
 | `←` / `h` / `Esc` | Go up one level (or to container list if at root) |
 | `/` | Search/filter blobs |
+| `s` | Open sort popup |
+| `n` / `m` / `t` | Sort by Name / Modified / Created (when sort popup is open) |
 | `i` | Show blob/folder information |
+| `y` | Copy selected blob path to clipboard |
+| `c` | Clone (copy) selected item |
+| `x` / `Delete` | Delete selected item |
 | `d` | Download selected file or folder |
 | `r` / `F5` | Refresh current view |
 | `Backspace` | Return to container selection |
@@ -281,7 +286,6 @@ export BLOBRS_ICONS=minimal  # Force minimal icons
 
 The application will panic if required environment variables are missing:
 - `AZURE_STORAGE_ACCOUNT`
-- `AZURE_CONTAINER_NAME`  
 - `AZURE_STORAGE_ACCESS_KEY`
 
 ## Development
@@ -352,4 +356,6 @@ This project is licensed under the MIT License - see the LICENSE file for detail
 - [X] Blob metadata display
 - [X] Search functionality
 - [ ] Configuration file support
-- [ ] Multiple container support
+- [X] Multiple container support
+- [X] File/Folder delete functionality
+- [X] File/Folder clone functionality
