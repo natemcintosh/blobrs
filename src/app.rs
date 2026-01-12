@@ -123,6 +123,48 @@ pub struct App {
     pub sort_criteria: SortCriteria,
     /// Whether to show the sort selection popup.
     pub show_sort_popup: bool,
+    /// Whether to show the clone dialog.
+    pub show_clone_dialog: bool,
+    /// Clone dialog input (new path).
+    pub clone_input: String,
+    /// Original path being cloned (to compare against).
+    pub clone_original_path: String,
+    /// Whether the item being cloned is a folder.
+    pub clone_is_folder: bool,
+    /// Whether a clone operation is in progress.
+    pub is_cloning: bool,
+    /// Clone progress information.
+    pub clone_progress: Option<CloneProgress>,
+    /// Whether to show the delete confirmation dialog.
+    pub show_delete_dialog: bool,
+    /// Delete dialog input (user must type the name to confirm).
+    pub delete_input: String,
+    /// Target path being deleted.
+    pub delete_target_path: String,
+    /// Display name of item being deleted (for confirmation).
+    pub delete_target_name: String,
+    /// Whether the item being deleted is a folder.
+    pub delete_is_folder: bool,
+    /// Whether a delete operation is in progress.
+    pub is_deleting: bool,
+    /// Delete progress information.
+    pub delete_progress: Option<DeleteProgress>,
+}
+
+#[derive(Debug, Clone)]
+pub struct DeleteProgress {
+    pub current_file: String,
+    pub files_completed: usize,
+    pub total_files: usize,
+    pub error_message: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CloneProgress {
+    pub current_file: String,
+    pub files_completed: usize,
+    pub total_files: usize,
+    pub error_message: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -166,12 +208,29 @@ impl std::fmt::Debug for App {
             .field("is_downloading", &self.is_downloading)
             .field("sort_criteria", &self.sort_criteria)
             .field("show_sort_popup", &self.show_sort_popup)
+            .field("show_clone_dialog", &self.show_clone_dialog)
+            .field("clone_input", &self.clone_input)
+            .field("clone_original_path", &self.clone_original_path)
+            .field("clone_is_folder", &self.clone_is_folder)
+            .field("is_cloning", &self.is_cloning)
+            .field("clone_progress", &self.clone_progress)
+            .field("show_delete_dialog", &self.show_delete_dialog)
+            .field("delete_input", &self.delete_input)
+            .field("delete_target_path", &self.delete_target_path)
+            .field("delete_target_name", &self.delete_target_name)
+            .field("delete_is_folder", &self.delete_is_folder)
+            .field("is_deleting", &self.is_deleting)
+            .field("delete_progress", &self.delete_progress)
             .finish()
     }
 }
 
 impl App {
     /// Constructs a new instance of [`App`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if loading containers from Azure Storage fails.
     pub async fn new(storage_account: String, access_key: String) -> color_eyre::Result<Self> {
         let mut app = Self {
             running: true,
@@ -205,6 +264,19 @@ impl App {
             is_downloading: false,
             sort_criteria: SortCriteria::Name,
             show_sort_popup: false,
+            show_clone_dialog: false,
+            clone_input: String::new(),
+            clone_original_path: String::new(),
+            clone_is_folder: false,
+            is_cloning: false,
+            clone_progress: None,
+            show_delete_dialog: false,
+            delete_input: String::new(),
+            delete_target_path: String::new(),
+            delete_target_name: String::new(),
+            delete_is_folder: false,
+            is_deleting: false,
+            delete_progress: None,
         };
 
         // Load container list
@@ -213,6 +285,10 @@ impl App {
     }
 
     /// Run the application's main loop.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if terminal drawing or event handling fails.
     pub async fn run(mut self, mut terminal: DefaultTerminal) -> color_eyre::Result<()> {
         while self.running {
             terminal.draw(|frame| frame.render_widget(&self, frame.area()))?;
@@ -221,12 +297,17 @@ impl App {
         Ok(())
     }
 
+    /// Handle incoming events from the terminal.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if event reception or key handling fails.
     pub async fn handle_events(&mut self) -> color_eyre::Result<()> {
         match self.events.next()? {
             Event::Tick => self.tick(),
             Event::Crossterm(event) => {
                 if let ratatui::crossterm::event::Event::Key(key_event) = event {
-                    self.handle_key_event(key_event).await?
+                    self.handle_key_event(key_event).await?;
                 }
             }
             Event::App(app_event) => match app_event {
@@ -237,7 +318,21 @@ impl App {
     }
 
     /// Handles the key events and updates the state of [`App`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if an async operation triggered by a key event fails.
     pub async fn handle_key_event(&mut self, key_event: KeyEvent) -> color_eyre::Result<()> {
+        // Handle delete dialog separately
+        if self.show_delete_dialog {
+            return self.handle_delete_dialog_key_event(key_event).await;
+        }
+
+        // Handle clone dialog separately
+        if self.show_clone_dialog {
+            return self.handle_clone_dialog_key_event(key_event).await;
+        }
+
         // Handle search mode separately
         if self.container_search_mode && self.state == AppState::ContainerSelection {
             return self.handle_container_search_key_event(key_event).await;
@@ -247,8 +342,8 @@ impl App {
             return self.handle_search_key_event(key_event).await;
         }
 
-        // Don't process keys while loading
-        if self.is_loading {
+        // Don't process keys while loading, cloning, or deleting
+        if self.is_loading || self.is_cloning || self.is_deleting {
             return Ok(());
         }
 
@@ -280,12 +375,12 @@ impl App {
                 KeyCode::Down | KeyCode::Char('j') => self.move_container_down(),
                 KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
                     if let Err(e) = self.select_container().await {
-                        self.error_message = Some(format!("Failed to select container: {}", e));
+                        self.error_message = Some(format!("Failed to select container: {e}"));
                     }
                 }
                 KeyCode::Char('r') | KeyCode::F(5) => {
                     if let Err(e) = self.load_containers().await {
-                        self.error_message = Some(format!("Refresh failed: {}", e));
+                        self.error_message = Some(format!("Refresh failed: {e}"));
                     }
                 }
                 _ => {
@@ -301,18 +396,17 @@ impl App {
                         }
                     }
                     KeyCode::Char('r') | KeyCode::F(5) => {
-                        if !self.show_blob_info_popup {
-                            if let Err(e) = self.refresh_files().await {
-                                self.error_message = Some(format!("Refresh failed: {}", e));
-                            }
+                        if !self.show_blob_info_popup
+                            && let Err(e) = self.refresh_files().await
+                        {
+                            self.error_message = Some(format!("Refresh failed: {e}"));
                         }
                     }
                     KeyCode::Char('i') => {
-                        if !self.show_blob_info_popup {
-                            if let Err(e) = self.show_blob_info().await {
-                                self.error_message =
-                                    Some(format!("Failed to get blob info: {}", e));
-                            }
+                        if !self.show_blob_info_popup
+                            && let Err(e) = self.show_blob_info().await
+                        {
+                            self.error_message = Some(format!("Failed to get blob info: {e}"));
                         }
                     }
                     KeyCode::Char('d') => {
@@ -334,7 +428,7 @@ impl App {
                         } else if self.show_sort_popup {
                             // Handle sort selection
                             if let Err(e) = self.apply_sort(SortCriteria::Size).await {
-                                self.error_message = Some(format!("Failed to sort: {}", e));
+                                self.error_message = Some(format!("Failed to sort: {e}"));
                             }
                             self.show_sort_popup = false;
                         }
@@ -342,7 +436,7 @@ impl App {
                     KeyCode::Char('n') => {
                         if self.show_sort_popup {
                             if let Err(e) = self.apply_sort(SortCriteria::Name).await {
-                                self.error_message = Some(format!("Failed to sort: {}", e));
+                                self.error_message = Some(format!("Failed to sort: {e}"));
                             }
                             self.show_sort_popup = false;
                         }
@@ -350,29 +444,60 @@ impl App {
                     KeyCode::Char('m') => {
                         if self.show_sort_popup {
                             if let Err(e) = self.apply_sort(SortCriteria::DateModified).await {
-                                self.error_message = Some(format!("Failed to sort: {}", e));
+                                self.error_message = Some(format!("Failed to sort: {e}"));
                             }
                             self.show_sort_popup = false;
                         }
                     }
-                    KeyCode::Char('c') => {
+                    KeyCode::Char('t') => {
                         if self.show_sort_popup {
                             if let Err(e) = self.apply_sort(SortCriteria::DateCreated).await {
-                                self.error_message = Some(format!("Failed to sort: {}", e));
+                                self.error_message = Some(format!("Failed to sort: {e}"));
                             }
                             self.show_sort_popup = false;
-                        } else if !self.show_blob_info_popup
+                        }
+                    }
+                    KeyCode::Char('y') => {
+                        if !self.show_blob_info_popup
                             && !self.show_download_picker
                             && !self.is_downloading
+                            && !self.show_sort_popup
+                            && !self.show_clone_dialog
+                            && !self.is_cloning
                         {
                             // Copy blob path to clipboard
                             if let Err(e) = self.copy_blob_path_to_clipboard() {
                                 self.error_message =
-                                    Some(format!("Failed to copy to clipboard: {}", e));
+                                    Some(format!("Failed to copy to clipboard: {e}"));
                             }
-                        } else {
-                            self.error_message =
-                                Some("Cannot copy while popup is open".to_string());
+                        }
+                    }
+                    KeyCode::Char('c') => {
+                        if !self.show_blob_info_popup
+                            && !self.show_download_picker
+                            && !self.is_downloading
+                            && !self.show_sort_popup
+                            && !self.show_clone_dialog
+                            && !self.is_cloning
+                            && !self.show_delete_dialog
+                            && !self.is_deleting
+                        {
+                            // Open clone dialog
+                            self.open_clone_dialog();
+                        }
+                    }
+                    KeyCode::Char('x') | KeyCode::Delete => {
+                        if !self.show_blob_info_popup
+                            && !self.show_download_picker
+                            && !self.is_downloading
+                            && !self.show_sort_popup
+                            && !self.show_clone_dialog
+                            && !self.is_cloning
+                            && !self.show_delete_dialog
+                            && !self.is_deleting
+                        {
+                            // Open delete dialog
+                            self.open_delete_dialog();
                         }
                     }
                     KeyCode::Up | KeyCode::Char('k') => {
@@ -388,12 +513,13 @@ impl App {
                     KeyCode::Right | KeyCode::Char('l') | KeyCode::Enter => {
                         if self.show_download_picker {
                             if let Err(e) = self.confirm_download().await {
-                                self.error_message = Some(format!("Download failed: {}", e));
+                                self.error_message = Some(format!("Download failed: {e}"));
                             }
-                        } else if !self.show_blob_info_popup && !self.show_sort_popup {
-                            if let Err(e) = self.enter_directory().await {
-                                self.error_message = Some(format!("Enter directory failed: {}", e));
-                            }
+                        } else if !self.show_blob_info_popup
+                            && !self.show_sort_popup
+                            && let Err(e) = self.enter_directory().await
+                        {
+                            self.error_message = Some(format!("Enter directory failed: {e}"));
                         }
                     }
                     KeyCode::Left | KeyCode::Char('h') => {
@@ -409,7 +535,7 @@ impl App {
                             // Close sort popup
                             self.show_sort_popup = false;
                         } else if let Err(e) = self.go_up_directory().await {
-                            self.error_message = Some(format!("Go up failed: {}", e));
+                            self.error_message = Some(format!("Go up failed: {e}"));
                         }
                     }
                     KeyCode::Esc => {
@@ -427,7 +553,7 @@ impl App {
                         } else if !self.current_path.is_empty() {
                             // Go up one directory level if not at container root
                             if let Err(e) = self.go_up_directory().await {
-                                self.error_message = Some(format!("Go up failed: {}", e));
+                                self.error_message = Some(format!("Go up failed: {e}"));
                             }
                         } else {
                             // At container root, go back to container selection
@@ -543,6 +669,10 @@ impl App {
     }
 
     /// Apply sorting to the current file list.
+    ///
+    /// # Errors
+    ///
+    /// This function currently does not return errors but uses `Result` for API consistency.
     pub async fn apply_sort(&mut self, criteria: SortCriteria) -> color_eyre::Result<()> {
         self.sort_criteria = criteria.clone();
 
@@ -613,6 +743,10 @@ impl App {
     }
 
     /// Refresh the file list for the current path.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if listing blobs from Azure Storage fails.
     pub async fn refresh_files(&mut self) -> color_eyre::Result<()> {
         self.is_loading = true;
         self.error_message = None;
@@ -629,8 +763,8 @@ impl App {
                     .map(|item| item.display_name.clone())
                     .collect();
 
-                self.all_file_items = file_items.clone();
-                self.all_files = files.clone();
+                self.all_file_items.clone_from(&file_items);
+                self.all_files.clone_from(&files);
 
                 if self.search_mode && !self.search_query.is_empty() {
                     self.filter_files();
@@ -641,7 +775,7 @@ impl App {
                 }
             }
             Err(e) => {
-                self.error_message = Some(format!("Failed to list blobs: {}", e));
+                self.error_message = Some(format!("Failed to list blobs: {e}"));
             }
         }
 
@@ -664,6 +798,10 @@ impl App {
     }
 
     /// Enter a directory if the selected item is a folder.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if refreshing the file list fails.
     pub async fn enter_directory(&mut self) -> color_eyre::Result<()> {
         if self.files.is_empty() {
             return Ok(());
@@ -674,7 +812,7 @@ impl App {
         let folder_prefix = format!("{} ", self.icons.folder);
         if let Some(dir_name) = selected_file.strip_prefix(&folder_prefix) {
             let new_path = if self.current_path.is_empty() {
-                format!("{}/", dir_name)
+                format!("{dir_name}/")
             } else if self.current_path.ends_with('/') {
                 format!("{}{}/", self.current_path, dir_name)
             } else {
@@ -693,6 +831,10 @@ impl App {
     }
 
     /// Go up one directory level.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if refreshing the file list fails.
     pub async fn go_up_directory(&mut self) -> color_eyre::Result<()> {
         if self.current_path.is_empty() {
             return Ok(()); // Already at root
@@ -732,6 +874,10 @@ impl App {
     }
 
     /// Handle key events when in search mode.
+    ///
+    /// # Errors
+    ///
+    /// This function currently does not return errors but uses `Result` for API consistency.
     pub async fn handle_search_key_event(&mut self, key_event: KeyEvent) -> color_eyre::Result<()> {
         match key_event.code {
             KeyCode::Esc => {
@@ -760,6 +906,444 @@ impl App {
         Ok(())
     }
 
+    /// Handle key events when in clone dialog mode.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the clone operation fails.
+    pub async fn handle_clone_dialog_key_event(
+        &mut self,
+        key_event: KeyEvent,
+    ) -> color_eyre::Result<()> {
+        match key_event.code {
+            KeyCode::Esc => {
+                self.close_clone_dialog();
+            }
+            KeyCode::Enter => {
+                // Only allow confirm if name is different from original
+                if self.clone_input != self.clone_original_path && !self.clone_input.is_empty() {
+                    if let Err(e) = self.execute_clone().await {
+                        self.error_message = Some(format!("Clone failed: {e}"));
+                    }
+                    self.close_clone_dialog();
+                }
+            }
+            KeyCode::Backspace => {
+                self.clone_input.pop();
+            }
+            KeyCode::Char(c) => {
+                self.clone_input.push(c);
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// Open the clone dialog for the selected item.
+    pub fn open_clone_dialog(&mut self) {
+        if self.files.is_empty() {
+            return;
+        }
+
+        let selected_file = &self.files[self.selected_index];
+        let folder_prefix = format!("{} ", self.icons.folder);
+        let file_prefix = format!("{} ", self.icons.file);
+
+        let (item_name, is_folder) = if selected_file.starts_with(&folder_prefix) {
+            let name = selected_file
+                .strip_prefix(&folder_prefix)
+                .unwrap_or(selected_file);
+            (name.to_string(), true)
+        } else {
+            let name = selected_file
+                .strip_prefix(&file_prefix)
+                .unwrap_or(selected_file);
+            (name.to_string(), false)
+        };
+
+        // Construct the full path
+        let full_path = if self.current_path.is_empty() {
+            if is_folder {
+                format!("{item_name}/")
+            } else {
+                item_name
+            }
+        } else if self.current_path.ends_with('/') {
+            if is_folder {
+                format!("{}{}/", self.current_path, item_name)
+            } else {
+                format!("{}{}", self.current_path, item_name)
+            }
+        } else if is_folder {
+            format!("{}/{}/", self.current_path, item_name)
+        } else {
+            format!("{}/{}", self.current_path, item_name)
+        };
+
+        self.clone_original_path.clone_from(&full_path);
+        self.clone_input = full_path;
+        self.clone_is_folder = is_folder;
+        self.show_clone_dialog = true;
+    }
+
+    /// Close the clone dialog.
+    pub fn close_clone_dialog(&mut self) {
+        self.show_clone_dialog = false;
+        self.clone_input.clear();
+        self.clone_original_path.clear();
+        self.clone_is_folder = false;
+    }
+
+    /// Execute the clone operation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the clone or subsequent file refresh fails.
+    pub async fn execute_clone(&mut self) -> color_eyre::Result<()> {
+        let mut new_path = self.clone_input.clone();
+        let original_path = self.clone_original_path.clone();
+        let is_folder = self.clone_is_folder;
+
+        // Ensure folder paths end with /
+        if is_folder && !new_path.ends_with('/') {
+            new_path.push('/');
+        }
+
+        self.is_cloning = true;
+        self.clone_progress = Some(CloneProgress {
+            current_file: String::new(),
+            files_completed: 0,
+            total_files: 0,
+            error_message: None,
+        });
+
+        let result = if is_folder {
+            self.clone_folder(&original_path, &new_path).await
+        } else {
+            self.clone_blob(&original_path, &new_path).await
+        };
+
+        self.is_cloning = false;
+        self.clone_progress = None;
+
+        if result.is_ok() {
+            let orig = original_path.trim_end_matches('/');
+            let new = new_path.trim_end_matches('/');
+            self.success_message = Some(format!("Successfully cloned {orig} to {new}"));
+            // Refresh the file list
+            if let Err(e) = self.refresh_files().await {
+                self.error_message = Some(format!("Refresh failed after clone: {e}"));
+            }
+        }
+
+        result
+    }
+
+    /// Clone a single blob.
+    async fn clone_blob(&mut self, source: &str, destination: &str) -> color_eyre::Result<()> {
+        let object_store = self
+            .object_store
+            .as_ref()
+            .ok_or_else(|| color_eyre::eyre::eyre!("No container selected"))?;
+
+        let source_path = ObjectPath::from(source);
+        let dest_path = ObjectPath::from(destination);
+
+        // Update progress
+        if let Some(progress) = &mut self.clone_progress {
+            progress.current_file = source.to_string();
+            progress.total_files = 1;
+        }
+
+        // Use copy operation (server-side copy)
+        object_store.copy(&source_path, &dest_path).await?;
+
+        // Update progress
+        if let Some(progress) = &mut self.clone_progress {
+            progress.files_completed = 1;
+        }
+
+        Ok(())
+    }
+
+    /// Clone all blobs in a folder (prefix).
+    async fn clone_folder(&mut self, source: &str, destination: &str) -> color_eyre::Result<()> {
+        let object_store = self
+            .object_store
+            .as_ref()
+            .ok_or_else(|| color_eyre::eyre::eyre!("No container selected"))?;
+
+        let source_path = ObjectPath::from(source);
+
+        // List all files in the source folder
+        let stream = object_store.list(Some(&source_path));
+        let objects: Vec<_> = stream.collect().await;
+
+        let total_files = objects.len();
+
+        // Update progress
+        if let Some(progress) = &mut self.clone_progress {
+            progress.total_files = total_files;
+        }
+
+        let mut files_completed = 0;
+
+        for result in objects {
+            match result {
+                Ok(meta) => {
+                    let file_path = meta.location.as_ref();
+
+                    // Calculate relative path from source
+                    let relative_path = file_path.strip_prefix(source).unwrap_or(file_path);
+
+                    // Construct destination path
+                    let dest_file_path = format!("{destination}{relative_path}");
+
+                    // Update progress
+                    if let Some(progress) = &mut self.clone_progress {
+                        progress.current_file = file_path.to_string();
+                    }
+
+                    // Copy the file
+                    let dest_object_path = ObjectPath::from(dest_file_path.as_str());
+                    if let Err(e) = object_store.copy(&meta.location, &dest_object_path).await {
+                        if let Some(progress) = &mut self.clone_progress {
+                            progress.error_message =
+                                Some(format!("Failed to clone {file_path}: {e}"));
+                        }
+                        // Continue with other files even if one fails
+                    } else {
+                        files_completed += 1;
+
+                        // Update progress
+                        if let Some(progress) = &mut self.clone_progress {
+                            progress.files_completed = files_completed;
+                        }
+                    }
+                }
+                Err(e) => {
+                    if let Some(progress) = &mut self.clone_progress {
+                        progress.error_message = Some(format!("Failed to list file: {e}"));
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Handle key events when in delete dialog mode.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the delete operation fails.
+    pub async fn handle_delete_dialog_key_event(
+        &mut self,
+        key_event: KeyEvent,
+    ) -> color_eyre::Result<()> {
+        match key_event.code {
+            KeyCode::Esc => {
+                self.close_delete_dialog();
+            }
+            KeyCode::Enter => {
+                // Only allow confirm if the typed name matches the target name
+                if self.delete_input == self.delete_target_name {
+                    if let Err(e) = self.execute_delete().await {
+                        self.error_message = Some(format!("Delete failed: {e}"));
+                    }
+                    self.close_delete_dialog();
+                }
+            }
+            KeyCode::Backspace => {
+                self.delete_input.pop();
+            }
+            KeyCode::Char(c) => {
+                self.delete_input.push(c);
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// Open the delete confirmation dialog for the selected item.
+    pub fn open_delete_dialog(&mut self) {
+        if self.files.is_empty() {
+            return;
+        }
+
+        let selected_file = &self.files[self.selected_index];
+        let folder_prefix = format!("{} ", self.icons.folder);
+        let file_prefix = format!("{} ", self.icons.file);
+
+        let (item_name, is_folder) = if selected_file.starts_with(&folder_prefix) {
+            let name = selected_file
+                .strip_prefix(&folder_prefix)
+                .unwrap_or(selected_file);
+            (name.to_string(), true)
+        } else {
+            let name = selected_file
+                .strip_prefix(&file_prefix)
+                .unwrap_or(selected_file);
+            (name.to_string(), false)
+        };
+
+        // Construct the full path
+        let full_path = if self.current_path.is_empty() {
+            if is_folder {
+                format!("{item_name}/")
+            } else {
+                item_name.clone()
+            }
+        } else if self.current_path.ends_with('/') {
+            if is_folder {
+                format!("{}{}/", self.current_path, item_name)
+            } else {
+                format!("{}{}", self.current_path, item_name)
+            }
+        } else if is_folder {
+            format!("{}/{}/", self.current_path, item_name)
+        } else {
+            format!("{}/{}", self.current_path, item_name)
+        };
+
+        self.delete_target_path = full_path;
+        self.delete_target_name = item_name;
+        self.delete_is_folder = is_folder;
+        self.delete_input.clear();
+        self.show_delete_dialog = true;
+    }
+
+    /// Close the delete dialog.
+    pub fn close_delete_dialog(&mut self) {
+        self.show_delete_dialog = false;
+        self.delete_input.clear();
+        self.delete_target_path.clear();
+        self.delete_target_name.clear();
+        self.delete_is_folder = false;
+    }
+
+    /// Execute the delete operation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the delete or subsequent file refresh fails.
+    pub async fn execute_delete(&mut self) -> color_eyre::Result<()> {
+        let target_path = self.delete_target_path.clone();
+        let is_folder = self.delete_is_folder;
+
+        self.is_deleting = true;
+        self.delete_progress = Some(DeleteProgress {
+            current_file: String::new(),
+            files_completed: 0,
+            total_files: 0,
+            error_message: None,
+        });
+
+        let result = if is_folder {
+            self.delete_folder(&target_path).await
+        } else {
+            self.delete_blob(&target_path).await
+        };
+
+        self.is_deleting = false;
+        self.delete_progress = None;
+
+        if result.is_ok() {
+            let name = target_path.trim_end_matches('/');
+            self.success_message = Some(format!("Successfully deleted {name}"));
+            // Refresh the file list
+            if let Err(e) = self.refresh_files().await {
+                self.error_message = Some(format!("Refresh failed after delete: {e}"));
+            }
+        }
+
+        result
+    }
+
+    /// Delete a single blob.
+    async fn delete_blob(&mut self, path: &str) -> color_eyre::Result<()> {
+        let object_store = self
+            .object_store
+            .as_ref()
+            .ok_or_else(|| color_eyre::eyre::eyre!("No container selected"))?;
+
+        let object_path = ObjectPath::from(path);
+
+        // Update progress
+        if let Some(progress) = &mut self.delete_progress {
+            progress.current_file = path.to_string();
+            progress.total_files = 1;
+        }
+
+        object_store.delete(&object_path).await?;
+
+        // Update progress
+        if let Some(progress) = &mut self.delete_progress {
+            progress.files_completed = 1;
+        }
+
+        Ok(())
+    }
+
+    /// Delete all blobs in a folder (prefix).
+    async fn delete_folder(&mut self, prefix: &str) -> color_eyre::Result<()> {
+        let object_store = self
+            .object_store
+            .as_ref()
+            .ok_or_else(|| color_eyre::eyre::eyre!("No container selected"))?;
+
+        let prefix_path = ObjectPath::from(prefix);
+
+        // List all files in the folder
+        let stream = object_store.list(Some(&prefix_path));
+        let objects: Vec<_> = stream.collect().await;
+
+        let total_files = objects.len();
+
+        // Update progress
+        if let Some(progress) = &mut self.delete_progress {
+            progress.total_files = total_files;
+        }
+
+        let mut files_completed = 0;
+
+        for result in objects {
+            match result {
+                Ok(meta) => {
+                    let file_path = meta.location.as_ref();
+
+                    // Update progress
+                    if let Some(progress) = &mut self.delete_progress {
+                        progress.current_file = file_path.to_string();
+                    }
+
+                    // Delete the file
+                    if let Err(e) = object_store.delete(&meta.location).await {
+                        if let Some(progress) = &mut self.delete_progress {
+                            progress.error_message =
+                                Some(format!("Failed to delete {file_path}: {e}"));
+                        }
+                        // Continue with other files even if one fails
+                    } else {
+                        files_completed += 1;
+
+                        // Update progress
+                        if let Some(progress) = &mut self.delete_progress {
+                            progress.files_completed = files_completed;
+                        }
+                    }
+                }
+                Err(e) => {
+                    if let Some(progress) = &mut self.delete_progress {
+                        progress.error_message = Some(format!("Failed to list file: {e}"));
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     /// Filter files based on search query.
     pub fn filter_files(&mut self) {
         if self.search_query.is_empty() {
@@ -777,7 +1361,7 @@ impl App {
                 .cloned()
                 .collect();
 
-            self.file_items = filtered_items.clone();
+            self.file_items.clone_from(&filtered_items);
             self.files = filtered_items
                 .iter()
                 .map(|item| item.display_name.clone())
@@ -794,7 +1378,7 @@ impl App {
 
         match self.list_containers().await {
             Ok(containers) => {
-                self.all_containers = containers.clone();
+                self.all_containers.clone_from(&containers);
                 if self.container_search_mode && !self.container_search_query.is_empty() {
                     self.filter_containers();
                 } else {
@@ -803,7 +1387,7 @@ impl App {
                 }
             }
             Err(e) => {
-                self.error_message = Some(format!("Failed to list containers: {}", e));
+                self.error_message = Some(format!("Failed to list containers: {e}"));
             }
         }
 
@@ -819,7 +1403,7 @@ impl App {
         // Decode the base64 access key
         let key = general_purpose::STANDARD
             .decode(access_key)
-            .map_err(|e| format!("Failed to decode access key: {}", e))?;
+            .map_err(|e| format!("Failed to decode access key: {e}"))?;
 
         let mut all_containers = Vec::new();
         let mut next_marker: Option<String> = None;
@@ -843,27 +1427,23 @@ impl App {
             //         If-Match + "\n" + If-None-Match + "\n" + If-Unmodified-Since + "\n" + Range + "\n" +
             //         CanonicalizedHeaders + CanonicalizedResource
             let canonicalized_resource = if let Some(ref marker) = next_marker {
-                format!(
-                    "/{}/\ncomp:list\nmarker:{}\nmaxresults:5000",
-                    account_name, marker
-                )
+                format!("/{account_name}/\ncomp:list\nmarker:{marker}\nmaxresults:5000")
             } else {
-                format!("/{}/\ncomp:list\nmaxresults:5000", account_name)
+                format!("/{account_name}/\ncomp:list\nmaxresults:5000")
             };
 
             let string_to_sign = format!(
-                "GET\n\n\n\n\n\n\n\n\n\n\n\nx-ms-date:{}\nx-ms-version:2020-08-04\n{}",
-                date, canonicalized_resource
+                "GET\n\n\n\n\n\n\n\n\n\n\n\nx-ms-date:{date}\nx-ms-version:2020-08-04\n{canonicalized_resource}"
             );
 
             // Generate HMAC-SHA256 signature
             let mut mac = Hmac::<Sha256>::new_from_slice(&key)
-                .map_err(|e| format!("Failed to create HMAC: {}", e))?;
+                .map_err(|e| format!("Failed to create HMAC: {e}"))?;
             mac.update(string_to_sign.as_bytes());
             let signature = general_purpose::STANDARD.encode(mac.finalize().into_bytes());
 
             // Create authorization header
-            let authorization = format!("SharedKey {}:{}", account_name, signature);
+            let authorization = format!("SharedKey {account_name}:{signature}");
 
             // Make the HTTP request
             let client = reqwest::Client::new();
@@ -874,13 +1454,13 @@ impl App {
                 .header("Authorization", &authorization)
                 .send()
                 .await
-                .map_err(|e| format!("HTTP request failed: {}", e))?;
+                .map_err(|e| format!("HTTP request failed: {e}"))?;
 
             let status = response.status();
             let response_text = response
                 .text()
                 .await
-                .map_err(|e| format!("Failed to read response: {}", e))?;
+                .map_err(|e| format!("Failed to read response: {e}"))?;
 
             if !status.is_success() {
                 return Err(format!(
@@ -892,9 +1472,9 @@ impl App {
             }
 
             // Parse XML response and extract containers and next marker
-            let (mut containers, next_marker_option) = self
-                .parse_containers_xml_with_marker(&response_text)
-                .map_err(|e| format!("Failed to parse XML response: {}", e))?;
+            let (mut containers, next_marker_option) =
+                Self::parse_containers_xml_with_marker(&response_text)
+                    .map_err(|e| format!("Failed to parse XML response: {e}"))?;
 
             // Add containers from this page to our collection
             all_containers.append(&mut containers);
@@ -913,7 +1493,6 @@ impl App {
 
     /// Parse XML response from Azure Storage list containers API with pagination marker support.
     fn parse_containers_xml_with_marker(
-        &self,
         xml: &str,
     ) -> color_eyre::Result<(Vec<ContainerInfo>, Option<String>)> {
         let mut containers = Vec::new();
@@ -997,6 +1576,10 @@ impl App {
     }
 
     /// Handle key events when in container search mode.
+    ///
+    /// # Errors
+    ///
+    /// This function currently does not return errors but uses `Result` for API consistency.
     pub async fn handle_container_search_key_event(
         &mut self,
         key_event: KeyEvent,
@@ -1049,6 +1632,10 @@ impl App {
     }
 
     /// Show information about the currently selected blob or folder.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if fetching blob/folder metadata fails.
     pub async fn show_blob_info(&mut self) -> color_eyre::Result<()> {
         if self.files.is_empty() {
             return Ok(());
@@ -1089,7 +1676,7 @@ impl App {
             .ok_or_else(|| color_eyre::eyre::eyre!("No container selected"))?;
 
         let folder_path = if self.current_path.is_empty() {
-            format!("{}/", folder_name)
+            format!("{folder_name}/")
         } else if self.current_path.ends_with('/') {
             format!("{}{}/", self.current_path, folder_name)
         } else {
@@ -1105,14 +1692,9 @@ impl App {
         let stream = object_store.list(Some(&object_path));
         let objects: Vec<_> = stream.collect().await;
 
-        for result in objects {
-            match result {
-                Ok(meta) => {
-                    blob_count += 1;
-                    total_size += meta.size;
-                }
-                Err(_) => continue, // Skip errors and continue counting
-            }
+        for meta in objects.into_iter().flatten() {
+            blob_count += 1;
+            total_size += meta.size;
         }
 
         Ok(BlobInfo {
@@ -1165,6 +1747,10 @@ impl App {
     }
 
     /// Copy the full blob path to clipboard.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if clipboard access fails.
     pub fn copy_blob_path_to_clipboard(&mut self) -> color_eyre::Result<()> {
         if self.files.is_empty() {
             return Ok(());
@@ -1195,7 +1781,7 @@ impl App {
         // Construct the full path
         let full_path = if self.current_path.is_empty() {
             if is_folder {
-                format!("{}/", item_name)
+                format!("{item_name}/")
             } else {
                 item_name.to_string()
             }
@@ -1217,10 +1803,7 @@ impl App {
 
         // Set success message
         let item_type = if is_folder { "folder" } else { "file" };
-        self.success_message = Some(format!(
-            "Copied {} path to clipboard: {}",
-            item_type, full_path
-        ));
+        self.success_message = Some(format!("Copied {item_type} path to clipboard: {full_path}"));
         self.error_message = None; // Clear any existing error message
 
         Ok(())
@@ -1236,6 +1819,10 @@ impl App {
     }
 
     /// Start the download process for the selected file or folder.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the download operation fails.
     pub async fn start_download(&mut self) -> color_eyre::Result<()> {
         if self.files.is_empty() || self.download_destination.is_none() {
             return Ok(());
@@ -1305,10 +1892,10 @@ impl App {
         });
 
         // Get file metadata for total size
-        if let Ok(meta) = object_store.head(&object_path).await {
-            if let Some(progress) = &mut self.download_progress {
-                progress.total_bytes = Some(meta.size);
-            }
+        if let Ok(meta) = object_store.head(&object_path).await
+            && let Some(progress) = &mut self.download_progress
+        {
+            progress.total_bytes = Some(meta.size);
         }
 
         // Create destination file path
@@ -1332,8 +1919,7 @@ impl App {
             }
             Err(e) => {
                 if let Some(progress) = &mut self.download_progress {
-                    progress.error_message =
-                        Some(format!("Failed to download {}: {}", file_name, e));
+                    progress.error_message = Some(format!("Failed to download {file_name}: {e}"));
                 }
                 return Err(color_eyre::eyre::eyre!("Download failed: {}", e));
             }
@@ -1355,7 +1941,7 @@ impl App {
             .ok_or_else(|| color_eyre::eyre::eyre!("No download destination selected"))?;
 
         let folder_path = if self.current_path.is_empty() {
-            format!("{}/", folder_name)
+            format!("{folder_name}/")
         } else if self.current_path.ends_with('/') {
             format!("{}{}/", self.current_path, folder_name)
         } else {
@@ -1423,18 +2009,16 @@ impl App {
                         Err(e) => {
                             if let Some(progress) = &mut self.download_progress {
                                 progress.error_message =
-                                    Some(format!("Failed to download {}: {}", relative_path, e));
+                                    Some(format!("Failed to download {relative_path}: {e}"));
                             }
                             // Continue with other files even if one fails
-                            continue;
                         }
                     }
                 }
                 Err(e) => {
                     if let Some(progress) = &mut self.download_progress {
-                        progress.error_message = Some(format!("Failed to list file: {}", e));
+                        progress.error_message = Some(format!("Failed to list file: {e}"));
                     }
-                    continue;
                 }
             }
         }
@@ -1443,6 +2027,10 @@ impl App {
     }
 
     /// Handle Enter key when download picker is shown.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the file dialog or download fails.
     pub async fn confirm_download(&mut self) -> color_eyre::Result<()> {
         if self.show_download_picker {
             // Use the file dialog to pick a destination folder
@@ -1462,7 +2050,7 @@ impl App {
                 }
                 Err(e) => {
                     self.show_download_picker = false;
-                    self.error_message = Some(format!("Failed to open file dialog: {}", e));
+                    self.error_message = Some(format!("Failed to open file dialog: {e}"));
                 }
             }
         }

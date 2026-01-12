@@ -52,6 +52,7 @@ impl IconSet {
 }
 
 /// Detect terminal capabilities and return appropriate icon set
+#[must_use]
 pub fn detect_terminal_icons() -> IconSet {
     // Check for explicit override first
     if let Ok(val) = env::var("BLOBRS_ICONS") {
@@ -99,19 +100,16 @@ fn is_unicode_capable_terminal() -> bool {
 fn is_ascii_capable_terminal() -> bool {
     // Most terminals support ASCII, so this is our fallback
     // Only return false for very minimal environments
-    !matches!(
-        env::var("TERM").as_deref(),
-        Ok("dumb") | Ok("unknown") | Err(_)
-    )
+    !matches!(env::var("TERM").as_deref(), Ok("dumb" | "unknown") | Err(_))
 }
 
 /// Check if locale supports UTF-8
 fn is_utf8_locale() -> bool {
     for var in ["LC_ALL", "LC_CTYPE", "LANG"] {
-        if let Ok(locale) = env::var(var) {
-            if locale.to_uppercase().contains("UTF-8") || locale.to_uppercase().contains("UTF8") {
-                return true;
-            }
+        if let Ok(locale) = env::var(var)
+            && (locale.to_uppercase().contains("UTF-8") || locale.to_uppercase().contains("UTF8"))
+        {
+            return true;
         }
     }
     false

@@ -16,12 +16,20 @@ impl Widget for &App {
                 self.render_blob_browsing(area, buf);
 
                 // Render popup over the blob browsing view if needed
-                if self.show_blob_info_popup {
+                if self.show_delete_dialog {
+                    self.render_delete_dialog_popup(area, buf);
+                } else if self.is_deleting {
+                    self.render_delete_progress_popup(area, buf);
+                } else if self.show_clone_dialog {
+                    self.render_clone_dialog_popup(area, buf);
+                } else if self.is_cloning {
+                    self.render_clone_progress_popup(area, buf);
+                } else if self.show_blob_info_popup {
                     self.render_blob_info_popup(area, buf);
                 } else if self.show_download_picker {
                     self.render_download_picker_popup(area, buf);
                 } else if self.show_sort_popup {
-                    self.render_sort_popup(area, buf);
+                    App::render_sort_popup(area, buf);
                 } else if self.is_downloading {
                     self.render_download_progress_popup(area, buf);
                 }
@@ -32,7 +40,8 @@ impl Widget for &App {
 
 impl App {
     /// Calculate the height needed for footer text with wrapping
-    fn calculate_footer_height(&self, text: &str, available_width: u16) -> u16 {
+    #[allow(clippy::cast_possible_truncation)] // text length is always small for UI
+    fn calculate_footer_height(text: &str, available_width: u16) -> u16 {
         if available_width <= 4 {
             return 3; // Minimum height for borders and padding
         }
@@ -58,7 +67,7 @@ impl App {
         } else {
             "Press `Ctrl-C` or `q` or `Esc` to quit • `r`/`F5` to refresh • `↑`/`↓` or `k`/`j` to navigate • `→`/`l`/`Enter` to select container • `/` to search"
         };
-        let footer_height = self.calculate_footer_height(instructions, area.width);
+        let footer_height = Self::calculate_footer_height(instructions, area.width);
 
         // Create a vertical layout
         let mut constraints = vec![
@@ -73,6 +82,7 @@ impl App {
         // Add space for error or success message if present
         if self.error_message.is_some() || self.success_message.is_some() || self.is_loading {
             // Calculate height based on message length and terminal width
+            #[allow(clippy::cast_possible_truncation)] // UI text lengths are always small
             let message_height = if let Some(error) = &self.error_message {
                 // Estimate lines needed: error length / (width - padding), min 3, max 8
                 let available_width = area.width.saturating_sub(4); // Account for borders and padding
@@ -222,9 +232,9 @@ impl App {
         let instructions = if self.search_mode {
             "Search Mode: Type to filter • `Enter` to confirm • `Esc` to cancel • `Ctrl+↑`/`Ctrl+↓` to navigate"
         } else {
-            "Press `Ctrl-C` or `q` to quit • `Esc`/`←`/`h` to go back • `r`/`F5` to refresh • `↑`/`↓` or `k`/`j` to navigate • `→`/`l`/`Enter` to enter folder • `/` to search • `s` to sort • `i` for info • `c` to copy path • `d` to download • `Backspace` for container selection"
+            "Press `Ctrl-C` or `q` to quit • `Esc`/`←`/`h` to go back • `r`/`F5` to refresh • `↑`/`↓` or `k`/`j` to navigate • `→`/`l`/`Enter` to enter folder • `/` to search • `s` to sort • `i` for info • `y` to copy path • `c` to clone • `x` to delete • `d` to download • `Backspace` for container selection"
         };
-        let footer_height = self.calculate_footer_height(instructions, area.width);
+        let footer_height = Self::calculate_footer_height(instructions, area.width);
 
         // Create a vertical layout with main content, search (if active), error/loading, and footer
         let mut constraints = vec![
@@ -239,6 +249,7 @@ impl App {
         // Add space for error or success message if present
         if self.error_message.is_some() || self.success_message.is_some() || self.is_loading {
             // Calculate height based on message length and terminal width
+            #[allow(clippy::cast_possible_truncation)] // UI text lengths are always small
             let message_height = if let Some(error) = &self.error_message {
                 // Estimate lines needed: error length / (width - padding), min 3, max 8
                 let available_width = area.width.saturating_sub(4); // Account for borders and padding
@@ -455,13 +466,13 @@ impl App {
             } else {
                 blob_info.name.clone()
             };
-            info_lines.push(format!("Name: {}", name_display));
+            info_lines.push(format!("Name: {name_display}"));
             info_lines.push(String::new()); // Empty line
 
             if blob_info.is_folder {
                 // Folder-specific information
                 if let Some(blob_count) = blob_info.blob_count {
-                    info_lines.push(format!("Blobs: {}", blob_count));
+                    info_lines.push(format!("Blobs: {blob_count}"));
                 }
                 if let Some(total_size) = blob_info.total_size {
                     info_lines.push(format!("Total size: {}", format_bytes(total_size)));
@@ -472,7 +483,7 @@ impl App {
                     info_lines.push(format!("Size: {}", format_bytes(size)));
                 }
                 if let Some(ref last_modified) = blob_info.last_modified {
-                    info_lines.push(format!("Modified: {}", last_modified));
+                    info_lines.push(format!("Modified: {last_modified}"));
                 }
                 if let Some(ref etag) = blob_info.etag {
                     let etag_display = if etag.len() > (popup_width as usize).saturating_sub(8) {
@@ -480,7 +491,7 @@ impl App {
                     } else {
                         etag.clone()
                     };
-                    info_lines.push(format!("ETag: {}", etag_display));
+                    info_lines.push(format!("ETag: {etag_display}"));
                 }
             }
 
@@ -535,10 +546,10 @@ impl App {
             }
         }
 
-        let selected_file = if !self.files.is_empty() {
-            &self.files[self.selected_index]
-        } else {
+        let selected_file = if self.files.is_empty() {
             "No file selected"
+        } else {
+            &self.files[self.selected_index]
         };
 
         // Extract the name without the icon prefix
@@ -557,7 +568,7 @@ impl App {
         };
 
         let download_text = [
-            format!("Ready to download: {}", name),
+            format!("Ready to download: {name}"),
             String::new(),
             "Press Enter to select download destination".to_string(),
             "Press Esc to cancel".to_string(),
@@ -610,6 +621,11 @@ impl App {
 
             // Add bytes downloaded if available
             if let Some(total_bytes) = progress.total_bytes {
+                #[allow(
+                    clippy::cast_possible_truncation,
+                    clippy::cast_sign_loss,
+                    clippy::cast_precision_loss
+                )]
                 let percentage = if total_bytes > 0 {
                     (progress.bytes_downloaded as f64 / total_bytes as f64 * 100.0) as u8
                 } else {
@@ -631,7 +647,7 @@ impl App {
             // Add error message if present
             if let Some(error) = &progress.error_message {
                 progress_lines.push(String::new());
-                progress_lines.push(format!("Error: {}", error));
+                progress_lines.push(format!("Error: {error}"));
             }
 
             let info_text = progress_lines.join("\n");
@@ -649,7 +665,7 @@ impl App {
     }
 
     /// Render the sort selection popup.
-    fn render_sort_popup(&self, area: Rect, buf: &mut Buffer) {
+    fn render_sort_popup(area: Rect, buf: &mut Buffer) {
         // Calculate popup size
         let popup_width = 50;
         let popup_height = 10;
@@ -674,7 +690,7 @@ impl App {
             String::new(),
             "n - Sort by Name".to_string(),
             "m - Sort by Date Modified".to_string(),
-            "c - Sort by Date Created".to_string(),
+            "t - Sort by Date Created".to_string(),
             "s - Sort by Size".to_string(),
             String::new(),
             "Press Esc to cancel".to_string(),
@@ -693,9 +709,317 @@ impl App {
 
         info_paragraph.render(popup_area, buf);
     }
+
+    /// Render the clone dialog popup.
+    fn render_clone_dialog_popup(&self, area: Rect, buf: &mut Buffer) {
+        // Calculate popup size
+        let popup_width = (area.width * 3 / 4).min(70);
+
+        let item_type = if self.clone_is_folder {
+            "folder"
+        } else {
+            "blob"
+        };
+        let can_confirm =
+            self.clone_input != self.clone_original_path && !self.clone_input.is_empty();
+
+        let enter_hint = if can_confirm {
+            "Enter to confirm"
+        } else {
+            "Enter to confirm (change name first)"
+        };
+
+        // Calculate wrapped line counts for dynamic height
+        // Account for borders (2 chars)
+        let content_width = popup_width.saturating_sub(2) as usize;
+
+        let original_line = format!("Original: {}", self.clone_original_path);
+
+        // Calculate how many lines the original path will take when wrapped
+        #[allow(clippy::cast_possible_truncation)]
+        let original_lines = if content_width > 0 {
+            original_line.len().div_ceil(content_width).max(1) as u16
+        } else {
+            1
+        };
+
+        // New path input is always 1 line (scrolling)
+        // Calculate total height: title line (1) + blank (1) + original lines + blank (1) + new path (1) + blank (1) + hint line (1) + borders (2)
+        let popup_height = (1 + 1 + original_lines + 1 + 1 + 1 + 1 + 2).max(10);
+
+        // Center the popup
+        let popup_area = Rect {
+            x: (area.width.saturating_sub(popup_width)) / 2,
+            y: (area.height.saturating_sub(popup_height)) / 2,
+            width: popup_width,
+            height: popup_height,
+        };
+
+        // Clear the popup area with a background
+        for y in popup_area.y..popup_area.y + popup_area.height {
+            for x in popup_area.x..popup_area.x + popup_area.width {
+                buf[(x, y)].set_style(Style::default().bg(Color::Black));
+            }
+        }
+
+        // For the new path input, show a scrolling view that keeps cursor visible
+        let new_path_prefix = "New path: ";
+        let available_input_width = content_width.saturating_sub(new_path_prefix.len());
+
+        // Calculate visible portion of input - scroll to keep cursor at end visible
+        let visible_input = if self.clone_input.len() > available_input_width {
+            let start = self.clone_input.len() - available_input_width;
+            format!("…{}", &self.clone_input[start + 1..])
+        } else {
+            self.clone_input.clone()
+        };
+
+        let new_path_display = format!("{new_path_prefix}{visible_input}");
+
+        let clone_text = [
+            format!("Clone {item_type} to new path:"),
+            String::new(),
+            original_line,
+            String::new(),
+            new_path_display.clone(),
+            String::new(),
+            format!("{enter_hint} • Esc to cancel"),
+        ];
+
+        let info_text = clone_text.join("\n");
+
+        // Highlight the input line differently
+        let title_style = if can_confirm {
+            Style::default().fg(Color::Green).bg(Color::Black)
+        } else {
+            Style::default().fg(Color::Yellow).bg(Color::Black)
+        };
+
+        let info_paragraph = Paragraph::new(info_text)
+            .block(
+                Block::bordered()
+                    .border_type(BorderType::Rounded)
+                    .title(" Clone ")
+                    .style(title_style),
+            )
+            .style(Style::default().bg(Color::Black))
+            .wrap(Wrap { trim: false });
+
+        info_paragraph.render(popup_area, buf);
+
+        // Render cursor at end of input (always on the new path line)
+        // Y position: border (1) + title line (1) + blank (1) + original lines + blank (1) = new path line
+        let input_y = popup_area.y + 1 + 1 + original_lines + 1;
+        // X position: border (1) + prefix + visible input length
+        #[allow(clippy::cast_possible_truncation)]
+        let cursor_x = popup_area.x + 1 + new_path_display.len() as u16;
+
+        // Show cursor (blinking effect via underscore)
+        if cursor_x < popup_area.x + popup_area.width - 1
+            && input_y < popup_area.y + popup_area.height - 1
+        {
+            buf[(cursor_x, input_y)].set_char('▏');
+            buf[(cursor_x, input_y)].set_style(Style::default().fg(Color::White).bg(Color::Black));
+        }
+    }
+
+    /// Render the clone progress popup.
+    fn render_clone_progress_popup(&self, area: Rect, buf: &mut Buffer) {
+        if let Some(progress) = &self.clone_progress {
+            // Calculate popup size
+            let popup_width = (area.width * 3 / 4).min(70);
+            let popup_height = 10;
+
+            // Center the popup
+            let popup_area = Rect {
+                x: (area.width.saturating_sub(popup_width)) / 2,
+                y: (area.height.saturating_sub(popup_height)) / 2,
+                width: popup_width,
+                height: popup_height,
+            };
+
+            // Clear the popup area with a background
+            for y in popup_area.y..popup_area.y + popup_area.height {
+                for x in popup_area.x..popup_area.x + popup_area.width {
+                    buf[(x, y)].set_style(Style::default().bg(Color::Black));
+                }
+            }
+
+            let mut progress_lines = vec!["Cloning in progress...".to_string(), String::new()];
+
+            if !progress.current_file.is_empty() {
+                progress_lines.push(format!("Current: {}", progress.current_file));
+            }
+
+            progress_lines.push(format!(
+                "Files: {} / {}",
+                progress.files_completed, progress.total_files
+            ));
+
+            // Add error message if present
+            if let Some(error) = &progress.error_message {
+                progress_lines.push(String::new());
+                progress_lines.push(format!("Error: {error}"));
+            }
+
+            let info_text = progress_lines.join("\n");
+            let info_paragraph = Paragraph::new(info_text)
+                .block(
+                    Block::bordered()
+                        .border_type(BorderType::Rounded)
+                        .title(" Clone Progress ")
+                        .style(Style::default().fg(Color::Yellow).bg(Color::Black)),
+                )
+                .style(Style::default().bg(Color::Black));
+
+            info_paragraph.render(popup_area, buf);
+        }
+    }
+
+    /// Render the delete confirmation dialog popup.
+    fn render_delete_dialog_popup(&self, area: Rect, buf: &mut Buffer) {
+        // Calculate popup size
+        let popup_width = (area.width * 3 / 4).min(70);
+        let popup_height = 12;
+
+        // Center the popup
+        let popup_area = Rect {
+            x: (area.width.saturating_sub(popup_width)) / 2,
+            y: (area.height.saturating_sub(popup_height)) / 2,
+            width: popup_width,
+            height: popup_height,
+        };
+
+        // Clear the popup area with a background
+        for y in popup_area.y..popup_area.y + popup_area.height {
+            for x in popup_area.x..popup_area.x + popup_area.width {
+                buf[(x, y)].set_style(Style::default().bg(Color::Black));
+            }
+        }
+
+        let item_type = if self.delete_is_folder {
+            "folder"
+        } else {
+            "blob"
+        };
+        let can_confirm = self.delete_input == self.delete_target_name;
+
+        let enter_hint = if can_confirm {
+            "Enter to confirm"
+        } else {
+            "Type name to confirm"
+        };
+
+        let warning = if self.delete_is_folder {
+            "⚠ This will delete all blobs in this folder!"
+        } else {
+            "⚠ This action cannot be undone!"
+        };
+
+        let delete_text = [
+            format!("Delete {item_type}: {}", self.delete_target_name),
+            String::new(),
+            warning.to_string(),
+            String::new(),
+            format!("Type \"{}\" to confirm:", self.delete_target_name),
+            self.delete_input.clone(),
+            String::new(),
+            format!("{enter_hint} • Esc to cancel"),
+        ];
+
+        let info_text = delete_text.join("\n");
+
+        let title_style = if can_confirm {
+            Style::default().fg(Color::Red).bg(Color::Black)
+        } else {
+            Style::default().fg(Color::Yellow).bg(Color::Black)
+        };
+
+        let info_paragraph = Paragraph::new(info_text)
+            .block(
+                Block::bordered()
+                    .border_type(BorderType::Rounded)
+                    .title(" Delete ")
+                    .style(title_style),
+            )
+            .style(Style::default().bg(Color::Black));
+
+        info_paragraph.render(popup_area, buf);
+
+        // Render the input field with cursor
+        let input_y = popup_area.y + 6;
+        let input_x = popup_area.x + 1; // After left border
+        #[allow(clippy::cast_possible_truncation)]
+        let cursor_x = input_x + self.delete_input.len() as u16;
+
+        // Show cursor
+        if cursor_x < popup_area.x + popup_area.width - 1 {
+            buf[(cursor_x, input_y)].set_char('▏');
+            buf[(cursor_x, input_y)].set_style(Style::default().fg(Color::White).bg(Color::Black));
+        }
+    }
+
+    /// Render the delete progress popup.
+    fn render_delete_progress_popup(&self, area: Rect, buf: &mut Buffer) {
+        if let Some(progress) = &self.delete_progress {
+            // Calculate popup size
+            let popup_width = (area.width * 3 / 4).min(70);
+            let popup_height = 10;
+
+            // Center the popup
+            let popup_area = Rect {
+                x: (area.width.saturating_sub(popup_width)) / 2,
+                y: (area.height.saturating_sub(popup_height)) / 2,
+                width: popup_width,
+                height: popup_height,
+            };
+
+            // Clear the popup area with a background
+            for y in popup_area.y..popup_area.y + popup_area.height {
+                for x in popup_area.x..popup_area.x + popup_area.width {
+                    buf[(x, y)].set_style(Style::default().bg(Color::Black));
+                }
+            }
+
+            let mut progress_lines = vec!["Deleting...".to_string(), String::new()];
+
+            if !progress.current_file.is_empty() {
+                progress_lines.push(format!("Current: {}", progress.current_file));
+            }
+
+            progress_lines.push(format!(
+                "Files: {} / {}",
+                progress.files_completed, progress.total_files
+            ));
+
+            // Add error message if present
+            if let Some(error) = &progress.error_message {
+                progress_lines.push(String::new());
+                progress_lines.push(format!("Error: {error}"));
+            }
+
+            let info_text = progress_lines.join("\n");
+            let info_paragraph = Paragraph::new(info_text)
+                .block(
+                    Block::bordered()
+                        .border_type(BorderType::Rounded)
+                        .title(" Delete Progress ")
+                        .style(Style::default().fg(Color::Red).bg(Color::Black)),
+                )
+                .style(Style::default().bg(Color::Black));
+
+            info_paragraph.render(popup_area, buf);
+        }
+    }
 }
 
 /// Format bytes in human-readable format
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_precision_loss,
+    clippy::cast_possible_wrap
+)]
 fn format_bytes(bytes: u64) -> String {
     const UNITS: &[&str] = &["B", "KB", "MB", "GB", "TB"];
     const THRESHOLD: f64 = 1024.0;

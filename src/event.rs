@@ -54,6 +54,7 @@ impl Default for EventHandler {
 
 impl EventHandler {
     /// Constructs a new instance of [`EventHandler`] and spawns a new thread to handle events.
+    #[must_use]
     pub fn new() -> Self {
         let (sender, receiver) = mpsc::channel();
         let actor = EventThread::new(sender.clone());
