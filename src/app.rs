@@ -1,5 +1,9 @@
 use crate::{
     event::{AppEvent, Event, EventHandler},
+    preview::{
+        MAX_PARQUET_PREVIEW_BYTES, MAX_PREVIEW_BYTES, PreviewData, PreviewFileType,
+        parse_parquet_schema, parse_preview,
+    },
     terminal_icons::{IconSet, detect_terminal_icons},
 };
 use arboard::Clipboard;
@@ -15,11 +19,12 @@ use ratatui::{
 use regex::Regex;
 use reqwest;
 use sha2::Sha256;
+use std::fmt::Write as _;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum SortCriteria {
     Name,
     DateModified,
@@ -149,6 +154,20 @@ pub struct App {
     pub is_deleting: bool,
     /// Delete progress information.
     pub delete_progress: Option<DeleteProgress>,
+    /// Whether to show the preview panel.
+    pub show_preview: bool,
+    /// Preview data for the current file.
+    pub preview_data: Option<PreviewData>,
+    /// Preview file type.
+    pub preview_file_type: Option<PreviewFileType>,
+    /// Preview scroll offset (row, column).
+    pub preview_scroll: (usize, usize),
+    /// Whether preview is loading.
+    pub is_loading_preview: bool,
+    /// Preview error message.
+    pub preview_error: Option<String>,
+    /// Selected row in table preview.
+    pub preview_selected_row: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -221,6 +240,12 @@ impl std::fmt::Debug for App {
             .field("delete_is_folder", &self.delete_is_folder)
             .field("is_deleting", &self.is_deleting)
             .field("delete_progress", &self.delete_progress)
+            .field("show_preview", &self.show_preview)
+            .field("preview_file_type", &self.preview_file_type)
+            .field("preview_scroll", &self.preview_scroll)
+            .field("is_loading_preview", &self.is_loading_preview)
+            .field("preview_error", &self.preview_error)
+            .field("preview_selected_row", &self.preview_selected_row)
             .finish()
     }
 }
@@ -277,6 +302,13 @@ impl App {
             delete_is_folder: false,
             is_deleting: false,
             delete_progress: None,
+            show_preview: false,
+            preview_data: None,
+            preview_file_type: None,
+            preview_scroll: (0, 0),
+            is_loading_preview: false,
+            preview_error: None,
+            preview_selected_row: 0,
         };
 
         // Load container list
@@ -335,11 +367,11 @@ impl App {
 
         // Handle search mode separately
         if self.container_search_mode && self.state == AppState::ContainerSelection {
-            return self.handle_container_search_key_event(key_event).await;
+            return self.handle_container_search_key_event(key_event);
         }
 
         if self.search_mode && self.state == AppState::BlobBrowsing {
-            return self.handle_search_key_event(key_event).await;
+            return self.handle_search_key_event(key_event);
         }
 
         // Don't process keys while loading, cloning, or deleting
@@ -404,9 +436,31 @@ impl App {
                     }
                     KeyCode::Char('i') => {
                         if !self.show_blob_info_popup
+                            && !self.show_preview
                             && let Err(e) = self.show_blob_info().await
                         {
                             self.error_message = Some(format!("Failed to get blob info: {e}"));
+                        }
+                    }
+                    KeyCode::Char('p') => {
+                        if !self.show_blob_info_popup
+                            && !self.show_download_picker
+                            && !self.is_downloading
+                            && !self.show_sort_popup
+                            && !self.show_clone_dialog
+                            && !self.is_cloning
+                            && !self.show_delete_dialog
+                            && !self.is_deleting
+                        {
+                            if self.show_preview {
+                                // Toggle off
+                                self.close_preview();
+                            } else {
+                                // Toggle on - load preview
+                                if let Err(e) = self.load_preview().await {
+                                    self.error_message = Some(format!("Preview failed: {e}"));
+                                }
+                            }
                         }
                     }
                     KeyCode::Char('d') => {
@@ -415,7 +469,7 @@ impl App {
                             && !self.is_downloading
                             && !self.show_sort_popup
                         {
-                            self.show_download_picker().await;
+                            self.show_download_picker();
                         }
                     }
                     KeyCode::Char('s') => {
@@ -427,7 +481,7 @@ impl App {
                             self.show_sort_popup = true;
                         } else if self.show_sort_popup {
                             // Handle sort selection
-                            if let Err(e) = self.apply_sort(SortCriteria::Size).await {
+                            if let Err(e) = self.apply_sort(SortCriteria::Size) {
                                 self.error_message = Some(format!("Failed to sort: {e}"));
                             }
                             self.show_sort_popup = false;
@@ -435,7 +489,7 @@ impl App {
                     }
                     KeyCode::Char('n') => {
                         if self.show_sort_popup {
-                            if let Err(e) = self.apply_sort(SortCriteria::Name).await {
+                            if let Err(e) = self.apply_sort(SortCriteria::Name) {
                                 self.error_message = Some(format!("Failed to sort: {e}"));
                             }
                             self.show_sort_popup = false;
@@ -443,7 +497,7 @@ impl App {
                     }
                     KeyCode::Char('m') => {
                         if self.show_sort_popup {
-                            if let Err(e) = self.apply_sort(SortCriteria::DateModified).await {
+                            if let Err(e) = self.apply_sort(SortCriteria::DateModified) {
                                 self.error_message = Some(format!("Failed to sort: {e}"));
                             }
                             self.show_sort_popup = false;
@@ -451,7 +505,7 @@ impl App {
                     }
                     KeyCode::Char('t') => {
                         if self.show_sort_popup {
-                            if let Err(e) = self.apply_sort(SortCriteria::DateCreated).await {
+                            if let Err(e) = self.apply_sort(SortCriteria::DateCreated) {
                                 self.error_message = Some(format!("Failed to sort: {e}"));
                             }
                             self.show_sort_popup = false;
@@ -501,17 +555,23 @@ impl App {
                         }
                     }
                     KeyCode::Up | KeyCode::Char('k') => {
-                        if !self.show_blob_info_popup && !self.show_sort_popup {
+                        if self.show_preview {
+                            self.preview_scroll_up();
+                        } else if !self.show_blob_info_popup && !self.show_sort_popup {
                             self.move_up();
                         }
                     }
                     KeyCode::Down | KeyCode::Char('j') => {
-                        if !self.show_blob_info_popup && !self.show_sort_popup {
+                        if self.show_preview {
+                            self.preview_scroll_down();
+                        } else if !self.show_blob_info_popup && !self.show_sort_popup {
                             self.move_down();
                         }
                     }
                     KeyCode::Right | KeyCode::Char('l') | KeyCode::Enter => {
-                        if self.show_download_picker {
+                        if self.show_preview {
+                            self.preview_scroll_right();
+                        } else if self.show_download_picker {
                             if let Err(e) = self.confirm_download().await {
                                 self.error_message = Some(format!("Download failed: {e}"));
                             }
@@ -523,7 +583,9 @@ impl App {
                         }
                     }
                     KeyCode::Left | KeyCode::Char('h') => {
-                        if self.show_download_picker {
+                        if self.show_preview {
+                            self.preview_scroll_left();
+                        } else if self.show_download_picker {
                             // Close download picker
                             self.show_download_picker = false;
                             self.download_destination = None;
@@ -539,7 +601,10 @@ impl App {
                         }
                     }
                     KeyCode::Esc => {
-                        if self.show_download_picker {
+                        if self.show_preview {
+                            // Close preview panel
+                            self.close_preview();
+                        } else if self.show_download_picker {
                             // Close download picker
                             self.show_download_picker = false;
                             self.download_destination = None;
@@ -673,11 +738,11 @@ impl App {
     /// # Errors
     ///
     /// This function currently does not return errors but uses `Result` for API consistency.
-    pub async fn apply_sort(&mut self, criteria: SortCriteria) -> color_eyre::Result<()> {
-        self.sort_criteria = criteria.clone();
+    pub fn apply_sort(&mut self, criteria: SortCriteria) -> color_eyre::Result<()> {
+        self.sort_criteria = criteria;
 
         if !self.file_items.is_empty() {
-            Self::sort_file_items_static(&mut self.file_items, &criteria);
+            Self::sort_file_items_static(&mut self.file_items, criteria);
             // Update the display list
             self.files = self
                 .file_items
@@ -688,7 +753,7 @@ impl App {
 
         // Also sort the unfiltered list
         if !self.all_file_items.is_empty() {
-            Self::sort_file_items_static(&mut self.all_file_items, &criteria);
+            Self::sort_file_items_static(&mut self.all_file_items, criteria);
             self.all_files = self
                 .all_file_items
                 .iter()
@@ -700,7 +765,7 @@ impl App {
     }
 
     /// Sort file items based on the given criteria.
-    fn sort_file_items_static(items: &mut [FileItem], criteria: &SortCriteria) {
+    fn sort_file_items_static(items: &mut [FileItem], criteria: SortCriteria) {
         items.sort_by(|a, b| {
             // Always put folders first
             match (a.is_folder, b.is_folder) {
@@ -755,7 +820,7 @@ impl App {
         match self.list_file_items(&self.current_path).await {
             Ok(mut file_items) => {
                 // Apply current sorting
-                Self::sort_file_items_static(&mut file_items, &self.sort_criteria);
+                Self::sort_file_items_static(&mut file_items, self.sort_criteria);
 
                 // Create display strings
                 let files: Vec<String> = file_items
@@ -878,7 +943,7 @@ impl App {
     /// # Errors
     ///
     /// This function currently does not return errors but uses `Result` for API consistency.
-    pub async fn handle_search_key_event(&mut self, key_event: KeyEvent) -> color_eyre::Result<()> {
+    pub fn handle_search_key_event(&mut self, key_event: KeyEvent) -> color_eyre::Result<()> {
         match key_event.code {
             KeyCode::Esc => {
                 self.exit_search_mode();
@@ -1414,7 +1479,7 @@ impl App {
             let mut url =
                 format!("https://{account_name}.blob.core.windows.net/?comp=list&maxresults=5000");
             if let Some(ref marker) = next_marker {
-                url.push_str(&format!("&marker={}", urlencoding::encode(marker)));
+                let _ = write!(url, "&marker={}", urlencoding::encode(marker));
             }
 
             // Create timestamp in RFC 1123 format
@@ -1580,7 +1645,7 @@ impl App {
     /// # Errors
     ///
     /// This function currently does not return errors but uses `Result` for API consistency.
-    pub async fn handle_container_search_key_event(
+    pub fn handle_container_search_key_event(
         &mut self,
         key_event: KeyEvent,
     ) -> color_eyre::Result<()> {
@@ -1810,7 +1875,7 @@ impl App {
     }
 
     /// Show the download destination picker.
-    pub async fn show_download_picker(&mut self) {
+    pub fn show_download_picker(&mut self) {
         if self.files.is_empty() {
             return;
         }
@@ -2055,5 +2120,181 @@ impl App {
             }
         }
         Ok(())
+    }
+
+    // ========================================
+    // Preview Panel Methods
+    // ========================================
+
+    /// Load preview for the currently selected file.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if fetching or parsing the file fails.
+    pub async fn load_preview(&mut self) -> color_eyre::Result<()> {
+        if self.files.is_empty() {
+            return Ok(());
+        }
+
+        let selected_file = &self.files[self.selected_index];
+        let folder_prefix = format!("{} ", self.icons.folder);
+        let file_prefix = format!("{} ", self.icons.file);
+
+        // Check if it's a folder
+        if selected_file.starts_with(&folder_prefix) {
+            self.preview_error = Some("Cannot preview folders".to_string());
+            self.show_preview = true;
+            return Ok(());
+        }
+
+        let name = selected_file
+            .strip_prefix(&file_prefix)
+            .unwrap_or(selected_file);
+
+        // Check file type
+        let file_type = PreviewFileType::from_extension(name);
+        if !file_type.is_supported() {
+            self.preview_error = Some(
+                "Unsupported file type. Preview supports: CSV, TSV, JSON, Parquet, and text files"
+                    .to_string(),
+            );
+            self.preview_file_type = Some(file_type);
+            self.show_preview = true;
+            return Ok(());
+        }
+
+        self.preview_file_type = Some(file_type.clone());
+        self.is_loading_preview = true;
+        self.show_preview = true;
+        self.preview_error = None;
+        self.preview_data = None;
+        self.preview_scroll = (0, 0);
+        self.preview_selected_row = 0;
+
+        // Fetch file content (up to MAX_PREVIEW_BYTES)
+        let object_store = self
+            .object_store
+            .as_ref()
+            .ok_or_else(|| color_eyre::eyre::eyre!("No container selected"))?;
+
+        let blob_path = if self.current_path.is_empty() {
+            name.to_string()
+        } else if self.current_path.ends_with('/') {
+            format!("{}{}", self.current_path, name)
+        } else {
+            format!("{}/{}", self.current_path, name)
+        };
+
+        let object_path = ObjectPath::from(blob_path.as_str());
+
+        // For Parquet files, we need to fetch the footer from the end of the file
+        if file_type == PreviewFileType::Parquet {
+            // First, get the file size
+            let head_result = object_store.head(&object_path).await;
+            match head_result {
+                Ok(meta) => {
+                    let file_size = meta.size;
+                    // Fetch the last MAX_PARQUET_PREVIEW_BYTES bytes (footer is at the end)
+                    let start = file_size.saturating_sub(MAX_PARQUET_PREVIEW_BYTES as u64);
+                    let get_result = object_store.get_range(&object_path, start..file_size).await;
+
+                    self.is_loading_preview = false;
+
+                    match get_result {
+                        Ok(bytes) => match parse_parquet_schema(&bytes, Some(file_size)) {
+                            Ok(data) => {
+                                self.preview_data = Some(data);
+                            }
+                            Err(e) => {
+                                self.preview_error = Some(e);
+                            }
+                        },
+                        Err(e) => {
+                            self.preview_error = Some(format!("Failed to fetch file: {e}"));
+                        }
+                    }
+                }
+                Err(e) => {
+                    self.is_loading_preview = false;
+                    self.preview_error = Some(format!("Failed to get file info: {e}"));
+                }
+            }
+            return Ok(());
+        }
+
+        // For other file types, fetch from the beginning
+        let get_result = object_store
+            .get_range(&object_path, 0..(MAX_PREVIEW_BYTES as u64))
+            .await;
+
+        self.is_loading_preview = false;
+
+        match get_result {
+            Ok(bytes) => {
+                // Parse the data
+                match parse_preview(&bytes, &file_type) {
+                    Ok(data) => {
+                        self.preview_data = Some(data);
+                    }
+                    Err(e) => {
+                        self.preview_error = Some(e);
+                    }
+                }
+            }
+            Err(e) => {
+                self.preview_error = Some(format!("Failed to fetch file: {e}"));
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Close the preview panel.
+    pub fn close_preview(&mut self) {
+        self.show_preview = false;
+        self.preview_data = None;
+        self.preview_file_type = None;
+        self.preview_error = None;
+        self.preview_scroll = (0, 0);
+        self.preview_selected_row = 0;
+        self.is_loading_preview = false;
+    }
+
+    /// Scroll preview up (decrease row offset).
+    pub fn preview_scroll_up(&mut self) {
+        if self.preview_selected_row > 0 {
+            self.preview_selected_row = self.preview_selected_row.saturating_sub(1);
+        }
+        // Also adjust scroll offset if needed
+        if self.preview_selected_row < self.preview_scroll.0 {
+            self.preview_scroll.0 = self.preview_selected_row;
+        }
+    }
+
+    /// Scroll preview down (increase row offset).
+    pub fn preview_scroll_down(&mut self) {
+        let max_row = match &self.preview_data {
+            Some(PreviewData::Table(table)) => table.rows.len().saturating_sub(1),
+            Some(PreviewData::Json(json)) => json.content.lines().count().saturating_sub(1),
+            Some(PreviewData::Text(text)) => text.content.lines().count().saturating_sub(1),
+            Some(PreviewData::ParquetSchema(schema)) => {
+                // Metadata lines + schema fields + some padding
+                (7 + schema.fields.len()).saturating_sub(1)
+            }
+            None => 0,
+        };
+        if self.preview_selected_row < max_row {
+            self.preview_selected_row += 1;
+        }
+    }
+
+    /// Scroll preview left (decrease column offset).
+    pub fn preview_scroll_left(&mut self) {
+        self.preview_scroll.1 = self.preview_scroll.1.saturating_sub(1);
+    }
+
+    /// Scroll preview right (increase column offset).
+    pub fn preview_scroll_right(&mut self) {
+        self.preview_scroll.1 += 1;
     }
 }
