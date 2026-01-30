@@ -1,5 +1,6 @@
 use crate::{
     event::{AppEvent, Event, EventHandler},
+    preview::{MAX_PREVIEW_BYTES, PreviewData, PreviewFileType, parse_preview},
     terminal_icons::{IconSet, detect_terminal_icons},
 };
 use arboard::Clipboard;
@@ -149,6 +150,20 @@ pub struct App {
     pub is_deleting: bool,
     /// Delete progress information.
     pub delete_progress: Option<DeleteProgress>,
+    /// Whether to show the preview panel.
+    pub show_preview: bool,
+    /// Preview data for the current file.
+    pub preview_data: Option<PreviewData>,
+    /// Preview file type.
+    pub preview_file_type: Option<PreviewFileType>,
+    /// Preview scroll offset (row, column).
+    pub preview_scroll: (usize, usize),
+    /// Whether preview is loading.
+    pub is_loading_preview: bool,
+    /// Preview error message.
+    pub preview_error: Option<String>,
+    /// Selected row in table preview.
+    pub preview_selected_row: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -221,6 +236,12 @@ impl std::fmt::Debug for App {
             .field("delete_is_folder", &self.delete_is_folder)
             .field("is_deleting", &self.is_deleting)
             .field("delete_progress", &self.delete_progress)
+            .field("show_preview", &self.show_preview)
+            .field("preview_file_type", &self.preview_file_type)
+            .field("preview_scroll", &self.preview_scroll)
+            .field("is_loading_preview", &self.is_loading_preview)
+            .field("preview_error", &self.preview_error)
+            .field("preview_selected_row", &self.preview_selected_row)
             .finish()
     }
 }
@@ -277,6 +298,13 @@ impl App {
             delete_is_folder: false,
             is_deleting: false,
             delete_progress: None,
+            show_preview: false,
+            preview_data: None,
+            preview_file_type: None,
+            preview_scroll: (0, 0),
+            is_loading_preview: false,
+            preview_error: None,
+            preview_selected_row: 0,
         };
 
         // Load container list
@@ -404,9 +432,31 @@ impl App {
                     }
                     KeyCode::Char('i') => {
                         if !self.show_blob_info_popup
+                            && !self.show_preview
                             && let Err(e) = self.show_blob_info().await
                         {
                             self.error_message = Some(format!("Failed to get blob info: {e}"));
+                        }
+                    }
+                    KeyCode::Char('p') => {
+                        if !self.show_blob_info_popup
+                            && !self.show_download_picker
+                            && !self.is_downloading
+                            && !self.show_sort_popup
+                            && !self.show_clone_dialog
+                            && !self.is_cloning
+                            && !self.show_delete_dialog
+                            && !self.is_deleting
+                        {
+                            if self.show_preview {
+                                // Toggle off
+                                self.close_preview();
+                            } else {
+                                // Toggle on - load preview
+                                if let Err(e) = self.load_preview().await {
+                                    self.error_message = Some(format!("Preview failed: {e}"));
+                                }
+                            }
                         }
                     }
                     KeyCode::Char('d') => {
@@ -501,17 +551,23 @@ impl App {
                         }
                     }
                     KeyCode::Up | KeyCode::Char('k') => {
-                        if !self.show_blob_info_popup && !self.show_sort_popup {
+                        if self.show_preview {
+                            self.preview_scroll_up();
+                        } else if !self.show_blob_info_popup && !self.show_sort_popup {
                             self.move_up();
                         }
                     }
                     KeyCode::Down | KeyCode::Char('j') => {
-                        if !self.show_blob_info_popup && !self.show_sort_popup {
+                        if self.show_preview {
+                            self.preview_scroll_down();
+                        } else if !self.show_blob_info_popup && !self.show_sort_popup {
                             self.move_down();
                         }
                     }
                     KeyCode::Right | KeyCode::Char('l') | KeyCode::Enter => {
-                        if self.show_download_picker {
+                        if self.show_preview {
+                            self.preview_scroll_right();
+                        } else if self.show_download_picker {
                             if let Err(e) = self.confirm_download().await {
                                 self.error_message = Some(format!("Download failed: {e}"));
                             }
@@ -523,7 +579,9 @@ impl App {
                         }
                     }
                     KeyCode::Left | KeyCode::Char('h') => {
-                        if self.show_download_picker {
+                        if self.show_preview {
+                            self.preview_scroll_left();
+                        } else if self.show_download_picker {
                             // Close download picker
                             self.show_download_picker = false;
                             self.download_destination = None;
@@ -539,7 +597,10 @@ impl App {
                         }
                     }
                     KeyCode::Esc => {
-                        if self.show_download_picker {
+                        if self.show_preview {
+                            // Close preview panel
+                            self.close_preview();
+                        } else if self.show_download_picker {
                             // Close download picker
                             self.show_download_picker = false;
                             self.download_destination = None;
@@ -2055,5 +2116,139 @@ impl App {
             }
         }
         Ok(())
+    }
+
+    // ========================================
+    // Preview Panel Methods
+    // ========================================
+
+    /// Load preview for the currently selected file.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if fetching or parsing the file fails.
+    pub async fn load_preview(&mut self) -> color_eyre::Result<()> {
+        if self.files.is_empty() {
+            return Ok(());
+        }
+
+        let selected_file = &self.files[self.selected_index];
+        let folder_prefix = format!("{} ", self.icons.folder);
+        let file_prefix = format!("{} ", self.icons.file);
+
+        // Check if it's a folder
+        if selected_file.starts_with(&folder_prefix) {
+            self.preview_error = Some("Cannot preview folders".to_string());
+            self.show_preview = true;
+            return Ok(());
+        }
+
+        let name = selected_file
+            .strip_prefix(&file_prefix)
+            .unwrap_or(selected_file);
+
+        // Check file type
+        let file_type = PreviewFileType::from_extension(name);
+        if !file_type.is_supported() {
+            self.preview_error =
+                Some("Unsupported file type. Preview supports: CSV, TSV, JSON".to_string());
+            self.preview_file_type = Some(file_type);
+            self.show_preview = true;
+            return Ok(());
+        }
+
+        self.preview_file_type = Some(file_type.clone());
+        self.is_loading_preview = true;
+        self.show_preview = true;
+        self.preview_error = None;
+        self.preview_data = None;
+        self.preview_scroll = (0, 0);
+        self.preview_selected_row = 0;
+
+        // Fetch file content (up to MAX_PREVIEW_BYTES)
+        let object_store = self
+            .object_store
+            .as_ref()
+            .ok_or_else(|| color_eyre::eyre::eyre!("No container selected"))?;
+
+        let blob_path = if self.current_path.is_empty() {
+            name.to_string()
+        } else if self.current_path.ends_with('/') {
+            format!("{}{}", self.current_path, name)
+        } else {
+            format!("{}/{}", self.current_path, name)
+        };
+
+        let object_path = ObjectPath::from(blob_path.as_str());
+
+        // Get file content with size limit
+        let get_result = object_store
+            .get_range(&object_path, 0..(MAX_PREVIEW_BYTES as u64))
+            .await;
+
+        self.is_loading_preview = false;
+
+        match get_result {
+            Ok(bytes) => {
+                // Parse the data
+                match parse_preview(&bytes, &file_type) {
+                    Ok(data) => {
+                        self.preview_data = Some(data);
+                    }
+                    Err(e) => {
+                        self.preview_error = Some(e);
+                    }
+                }
+            }
+            Err(e) => {
+                self.preview_error = Some(format!("Failed to fetch file: {e}"));
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Close the preview panel.
+    pub fn close_preview(&mut self) {
+        self.show_preview = false;
+        self.preview_data = None;
+        self.preview_file_type = None;
+        self.preview_error = None;
+        self.preview_scroll = (0, 0);
+        self.preview_selected_row = 0;
+        self.is_loading_preview = false;
+    }
+
+    /// Scroll preview up (decrease row offset).
+    pub fn preview_scroll_up(&mut self) {
+        if self.preview_selected_row > 0 {
+            self.preview_selected_row = self.preview_selected_row.saturating_sub(1);
+        }
+        // Also adjust scroll offset if needed
+        if self.preview_selected_row < self.preview_scroll.0 {
+            self.preview_scroll.0 = self.preview_selected_row;
+        }
+    }
+
+    /// Scroll preview down (increase row offset).
+    pub fn preview_scroll_down(&mut self) {
+        let max_row = match &self.preview_data {
+            Some(PreviewData::Table(table)) => table.rows.len().saturating_sub(1),
+            Some(PreviewData::Json(json)) => json.content.lines().count().saturating_sub(1),
+            None => 0,
+        };
+        if self.preview_selected_row < max_row {
+            self.preview_selected_row += 1;
+        }
+    }
+
+    /// Scroll preview left (decrease column offset).
+    pub fn preview_scroll_left(&mut self) {
+        self.preview_scroll.1 = self.preview_scroll.1.saturating_sub(1);
+    }
+
+    /// Scroll preview right (increase column offset).
+    pub fn preview_scroll_right(&mut self) {
+        self.preview_scroll.1 += 1;
     }
 }

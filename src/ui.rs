@@ -1,11 +1,15 @@
 use ratatui::{
     buffer::Buffer,
     layout::{Alignment, Constraint, Direction, Layout, Rect},
-    style::{Color, Style, Stylize},
-    widgets::{Block, BorderType, List, ListItem, ListState, Paragraph, Widget, Wrap},
+    style::{Color, Modifier, Style, Stylize},
+    widgets::{
+        Block, BorderType, Cell, List, ListItem, ListState, Paragraph, Row, Table, TableState,
+        Widget, Wrap,
+    },
 };
 
 use crate::app::{App, AppState};
+use crate::preview::PreviewData;
 
 impl Widget for &App {
     /// Renders the user interface widgets.
@@ -231,8 +235,10 @@ impl App {
         // Calculate footer height based on instruction text
         let instructions = if self.search_mode {
             "Search Mode: Type to filter • `Enter` to confirm • `Esc` to cancel • `Ctrl+↑`/`Ctrl+↓` to navigate"
+        } else if self.show_preview {
+            "Preview: `↑`/`↓`/`k`/`j` to scroll rows • `←`/`→`/`h`/`l` to scroll columns • `p` or `Esc` to close preview"
         } else {
-            "Press `Ctrl-C` or `q` to quit • `Esc`/`←`/`h` to go back • `r`/`F5` to refresh • `↑`/`↓` or `k`/`j` to navigate • `→`/`l`/`Enter` to enter folder • `/` to search • `s` to sort • `i` for info • `y` to copy path • `c` to clone • `x` to delete • `d` to download • `Backspace` for container selection"
+            "Press `Ctrl-C` or `q` to quit • `Esc`/`←`/`h` to go back • `r`/`F5` to refresh • `↑`/`↓` or `k`/`j` to navigate • `→`/`l`/`Enter` to enter folder • `/` to search • `s` to sort • `i` for info • `p` to preview • `y` to copy path • `c` to clone • `x` to delete • `d` to download"
         };
         let footer_height = Self::calculate_footer_height(instructions, area.width);
 
@@ -282,6 +288,21 @@ impl App {
             .direction(Direction::Vertical)
             .constraints(constraints)
             .split(area);
+
+        // Main content area - split horizontally if preview is shown
+        let main_area = chunks[0];
+        let (file_list_area, preview_area) = if self.show_preview {
+            let horizontal_chunks = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([
+                    Constraint::Percentage(40), // File list takes 40%
+                    Constraint::Percentage(60), // Preview takes 60%
+                ])
+                .split(main_area);
+            (horizontal_chunks[0], Some(horizontal_chunks[1]))
+        } else {
+            (main_area, None)
+        };
 
         // Main block with file list
         let file_items: Vec<ListItem> = if self.is_loading {
@@ -350,7 +371,12 @@ impl App {
             .highlight_style(Style::default().bg(Color::DarkGray).fg(Color::Yellow))
             .highlight_symbol("▶ ");
 
-        ratatui::widgets::StatefulWidget::render(main_block, chunks[0], buf, &mut list_state);
+        ratatui::widgets::StatefulWidget::render(main_block, file_list_area, buf, &mut list_state);
+
+        // Render preview panel if active
+        if let Some(preview_rect) = preview_area {
+            self.render_preview_panel(preview_rect, buf);
+        }
 
         let mut chunk_index = 1;
 
@@ -1010,6 +1036,256 @@ impl App {
 
             info_paragraph.render(popup_area, buf);
         }
+    }
+
+    /// Render the preview panel for CSV, TSV, or JSON files.
+    fn render_preview_panel(&self, area: Rect, buf: &mut Buffer) {
+        // Get the file type name for the title
+        let file_type_name = self
+            .preview_file_type
+            .as_ref()
+            .map(|ft| ft.display_name())
+            .unwrap_or("Preview");
+
+        // Handle loading state
+        if self.is_loading_preview {
+            let loading = Paragraph::new(format!("{} Loading preview...", self.icons.loading))
+                .block(
+                    Block::bordered()
+                        .title(format!(" {} Preview ", file_type_name))
+                        .title_alignment(Alignment::Center)
+                        .border_type(BorderType::Rounded),
+                )
+                .fg(Color::Yellow)
+                .alignment(Alignment::Center);
+            loading.render(area, buf);
+            return;
+        }
+
+        // Handle error state
+        if let Some(error) = &self.preview_error {
+            let error_widget = Paragraph::new(format!("{} {}", self.icons.error, error))
+                .block(
+                    Block::bordered()
+                        .title(format!(" {} Preview ", file_type_name))
+                        .title_alignment(Alignment::Center)
+                        .border_type(BorderType::Rounded),
+                )
+                .fg(Color::Red)
+                .wrap(Wrap { trim: true })
+                .alignment(Alignment::Center);
+            error_widget.render(area, buf);
+            return;
+        }
+
+        // Render based on preview data type
+        match &self.preview_data {
+            Some(PreviewData::Table(table)) => {
+                self.render_table_preview(area, buf, table, file_type_name);
+            }
+            Some(PreviewData::Json(json)) => {
+                self.render_json_preview(area, buf, json);
+            }
+            None => {
+                let empty = Paragraph::new("No preview data available")
+                    .block(
+                        Block::bordered()
+                            .title(format!(" {} Preview ", file_type_name))
+                            .title_alignment(Alignment::Center)
+                            .border_type(BorderType::Rounded),
+                    )
+                    .fg(Color::DarkGray)
+                    .alignment(Alignment::Center);
+                empty.render(area, buf);
+            }
+        }
+    }
+
+    /// Render a table preview (for CSV, TSV, or JSON array of objects).
+    #[allow(clippy::cast_possible_truncation)]
+    fn render_table_preview(
+        &self,
+        area: Rect,
+        buf: &mut Buffer,
+        table_data: &crate::preview::TablePreview,
+        file_type_name: &str,
+    ) {
+        // Build title with row count info
+        let title = if table_data.truncated {
+            format!(
+                " {} Preview ({}/{} rows, truncated) ",
+                file_type_name,
+                table_data.rows.len(),
+                table_data.total_rows
+            )
+        } else {
+            format!(
+                " {} Preview ({} rows) ",
+                file_type_name,
+                table_data.rows.len()
+            )
+        };
+
+        // Calculate column widths based on content
+        let num_cols = table_data
+            .headers
+            .len()
+            .max(table_data.rows.first().map(|r| r.len()).unwrap_or(0));
+
+        if num_cols == 0 {
+            let empty = Paragraph::new("Empty table")
+                .block(
+                    Block::bordered()
+                        .title(title)
+                        .title_alignment(Alignment::Center)
+                        .border_type(BorderType::Rounded),
+                )
+                .fg(Color::DarkGray)
+                .alignment(Alignment::Center);
+            empty.render(area, buf);
+            return;
+        }
+
+        // Calculate max width for each column (considering headers and data)
+        let mut col_widths: Vec<usize> = vec![0; num_cols];
+
+        // Consider header widths
+        for (i, header) in table_data.headers.iter().enumerate() {
+            if i < col_widths.len() {
+                col_widths[i] = col_widths[i].max(header.len());
+            }
+        }
+
+        // Consider data widths (sample first 50 rows for efficiency)
+        for row in table_data.rows.iter().take(50) {
+            for (i, cell) in row.iter().enumerate() {
+                if i < col_widths.len() {
+                    col_widths[i] = col_widths[i].max(cell.len());
+                }
+            }
+        }
+
+        // Cap column widths and apply horizontal scroll offset
+        let col_offset = self.preview_scroll.1;
+        let visible_cols: Vec<usize> = col_widths
+            .iter()
+            .skip(col_offset)
+            .map(|w| (*w).clamp(3, 30)) // Min 3, max 30 chars per column
+            .collect();
+
+        // Build constraints for visible columns
+        let constraints: Vec<Constraint> = visible_cols
+            .iter()
+            .map(|w| Constraint::Length((*w as u16) + 2)) // +2 for padding
+            .collect();
+
+        // Build header row
+        let header_cells: Vec<Cell> = table_data
+            .headers
+            .iter()
+            .skip(col_offset)
+            .enumerate()
+            .map(|(i, h)| {
+                let display = if h.len() > visible_cols.get(i).copied().unwrap_or(30) {
+                    format!("{}…", &h[..visible_cols.get(i).copied().unwrap_or(30) - 1])
+                } else {
+                    h.clone()
+                };
+                Cell::from(display).style(
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                )
+            })
+            .collect();
+
+        let header_row = Row::new(header_cells).height(1);
+
+        // Build data rows with scroll offset
+        let rows: Vec<Row> = table_data
+            .rows
+            .iter()
+            .enumerate()
+            .map(|(row_idx, row)| {
+                let cells: Vec<Cell> = row
+                    .iter()
+                    .skip(col_offset)
+                    .enumerate()
+                    .map(|(i, cell)| {
+                        let max_len = visible_cols.get(i).copied().unwrap_or(30);
+                        let display = if cell.len() > max_len {
+                            format!("{}…", &cell[..max_len - 1])
+                        } else {
+                            cell.clone()
+                        };
+                        Cell::from(display)
+                    })
+                    .collect();
+
+                let style = if row_idx == self.preview_selected_row {
+                    Style::default().bg(Color::DarkGray).fg(Color::Yellow)
+                } else {
+                    Style::default().fg(Color::White)
+                };
+
+                Row::new(cells).style(style).height(1)
+            })
+            .collect();
+
+        // Create the table widget
+        let table = Table::new(rows, constraints)
+            .header(header_row)
+            .block(
+                Block::bordered()
+                    .title(title)
+                    .title_alignment(Alignment::Center)
+                    .border_type(BorderType::Rounded),
+            )
+            .row_highlight_style(Style::default().bg(Color::DarkGray).fg(Color::Yellow));
+
+        // Use TableState for scrolling
+        let mut table_state = TableState::default();
+        table_state.select(Some(self.preview_selected_row));
+
+        ratatui::widgets::StatefulWidget::render(table, area, buf, &mut table_state);
+    }
+
+    /// Render a JSON preview (for non-tabular JSON).
+    fn render_json_preview(
+        &self,
+        area: Rect,
+        buf: &mut Buffer,
+        json_data: &crate::preview::JsonPreview,
+    ) {
+        let title = if json_data.truncated {
+            format!(
+                " JSON Preview ({}/{} lines, truncated) ",
+                json_data.content.lines().count(),
+                json_data.total_lines
+            )
+        } else {
+            format!(" JSON Preview ({} lines) ", json_data.total_lines)
+        };
+
+        // Apply vertical scroll offset
+        let visible_content: String = json_data
+            .content
+            .lines()
+            .skip(self.preview_selected_row)
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let json_widget = Paragraph::new(visible_content)
+            .block(
+                Block::bordered()
+                    .title(title)
+                    .title_alignment(Alignment::Center)
+                    .border_type(BorderType::Rounded),
+            )
+            .fg(Color::White)
+            .wrap(Wrap { trim: false });
+
+        json_widget.render(area, buf);
     }
 }
 
