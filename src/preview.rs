@@ -1,4 +1,4 @@
-//! Preview module for displaying CSV, TSV, and JSON file contents.
+//! Preview module for displaying CSV, TSV, JSON, and text file contents.
 
 use std::io::Cursor;
 
@@ -14,8 +14,103 @@ pub enum PreviewFileType {
     Csv,
     Tsv,
     Json,
+    /// Generic text file with extension name (e.g., "MD", "PY", "TXT")
+    Text(String),
     Unsupported,
 }
+
+/// Known text file extensions (lowercase, without the dot)
+const TEXT_EXTENSIONS: &[&str] = &[
+    // Documentation
+    "txt",
+    "md",
+    "markdown",
+    "rst",
+    "adoc",
+    "asciidoc",
+    // Config files
+    "yaml",
+    "yml",
+    "toml",
+    "ini",
+    "cfg",
+    "conf",
+    "config",
+    // Data/markup
+    "xml",
+    "html",
+    "htm",
+    "svg",
+    "css",
+    // Scripts/code
+    "sh",
+    "bash",
+    "zsh",
+    "fish",
+    "ps1",
+    "py",
+    "pyw",
+    "pyi",
+    "rs",
+    "go",
+    "rb",
+    "pl",
+    "lua",
+    "js",
+    "ts",
+    "jsx",
+    "tsx",
+    "mjs",
+    "cjs",
+    "c",
+    "h",
+    "cpp",
+    "hpp",
+    "cc",
+    "cxx",
+    "java",
+    "kt",
+    "kts",
+    "scala",
+    "groovy",
+    "cs",
+    "fs",
+    "vb",
+    "swift",
+    "m",
+    "mm",
+    "r",
+    "jl",
+    "ex",
+    "exs",
+    "erl",
+    "hrl",
+    "hs",
+    "lhs",
+    "ml",
+    "mli",
+    "clj",
+    "cljs",
+    "sql",
+    "graphql",
+    "gql",
+    // Build/project files
+    "makefile",
+    "cmake",
+    "dockerfile",
+    "gradle",
+    "sbt",
+    "cabal",
+    // Misc
+    "log",
+    "env",
+    "gitignore",
+    "gitattributes",
+    "editorconfig",
+    "prettierrc",
+    "eslintrc",
+    "lock", // e.g., Cargo.lock, package-lock
+];
 
 impl PreviewFileType {
     /// Detect file type from file extension
@@ -27,9 +122,55 @@ impl PreviewFileType {
             Self::Tsv
         } else if lower.ends_with(".json") || lower.ends_with(".jsonl") {
             Self::Json
+        } else if let Some(ext) = Self::extract_extension(&lower) {
+            if TEXT_EXTENSIONS.contains(&ext.as_str()) {
+                Self::Text(ext.to_uppercase())
+            } else {
+                Self::Unsupported
+            }
+        } else {
+            // No extension - check for known extensionless files
+            let basename = filename
+                .rsplit('/')
+                .next()
+                .unwrap_or(filename)
+                .to_lowercase();
+            if matches!(
+                basename.as_str(),
+                "makefile" | "dockerfile" | "gemfile" | "rakefile" | "justfile" | "procfile"
+            ) {
+                Self::Text(basename.to_uppercase())
+            } else {
+                Self::Unsupported
+            }
+        }
+    }
+
+    /// Try to detect if data is valid UTF-8 text (for unknown extensions)
+    pub fn detect_from_content(data: &[u8]) -> Self {
+        // Check for common binary signatures
+        if is_likely_binary(data) {
+            return Self::Unsupported;
+        }
+
+        // Check if the content is valid UTF-8
+        if std::str::from_utf8(data).is_ok() {
+            Self::Text("TEXT".to_string())
         } else {
             Self::Unsupported
         }
+    }
+
+    /// Extract file extension (without the dot)
+    fn extract_extension(filename: &str) -> Option<String> {
+        let basename = filename.rsplit('/').next().unwrap_or(filename);
+        if let Some(dot_pos) = basename.rfind('.') {
+            let ext = &basename[dot_pos + 1..];
+            if !ext.is_empty() {
+                return Some(ext.to_string());
+            }
+        }
+        None
     }
 
     /// Check if this file type is supported for preview
@@ -38,12 +179,13 @@ impl PreviewFileType {
     }
 
     /// Get the display name for this file type
-    pub fn display_name(&self) -> &'static str {
+    pub fn display_name(&self) -> String {
         match self {
-            Self::Csv => "CSV",
-            Self::Tsv => "TSV",
-            Self::Json => "JSON",
-            Self::Unsupported => "Unsupported",
+            Self::Csv => "CSV".to_string(),
+            Self::Tsv => "TSV".to_string(),
+            Self::Json => "JSON".to_string(),
+            Self::Text(ext) => ext.clone(),
+            Self::Unsupported => "Unsupported".to_string(),
         }
     }
 }
@@ -55,6 +197,8 @@ pub enum PreviewData {
     Table(TablePreview),
     /// Pretty-printed JSON (for non-array JSON)
     Json(JsonPreview),
+    /// Generic text file
+    Text(TextPreview),
 }
 
 /// Tabular preview data
@@ -83,6 +227,19 @@ pub struct JsonPreview {
     pub total_lines: usize,
     /// Whether this is raw content (parsing failed, likely due to truncation)
     pub is_raw: bool,
+}
+
+/// Text preview data (for generic text files)
+#[derive(Debug, Clone)]
+pub struct TextPreview {
+    /// Text content
+    pub content: String,
+    /// Whether the content was truncated due to size limits
+    pub truncated: bool,
+    /// Total lines in the content
+    pub total_lines: usize,
+    /// File extension (for display purposes)
+    pub extension: String,
 }
 
 /// Parse CSV data from bytes
@@ -244,6 +401,38 @@ fn make_valid_utf8(data: &[u8]) -> String {
     String::from_utf8_lossy(data).to_string()
 }
 
+/// Check if data is likely a binary file (not text)
+fn is_likely_binary(data: &[u8]) -> bool {
+    // Check first few KB for binary indicators
+    let check_len = data.len().min(8192);
+    let sample = &data[..check_len];
+
+    // Count null bytes and other control characters
+    let mut null_count = 0;
+    let mut control_count = 0;
+
+    for &byte in sample {
+        if byte == 0 {
+            null_count += 1;
+        } else if byte < 0x09 || (byte > 0x0D && byte < 0x20 && byte != 0x1B) {
+            // Control chars except tab, newline, carriage return, form feed, escape
+            control_count += 1;
+        }
+    }
+
+    // If there are null bytes, it's almost certainly binary
+    if null_count > 0 {
+        return true;
+    }
+
+    // If more than 10% are unusual control characters, likely binary
+    if control_count > check_len / 10 {
+        return true;
+    }
+
+    false
+}
+
 /// Try to convert a JSON array to a table (if it's an array of objects with consistent keys)
 fn try_json_array_as_table(arr: &[serde_json::Value]) -> Option<TablePreview> {
     if arr.is_empty() {
@@ -335,8 +524,54 @@ pub fn parse_preview(data: &[u8], file_type: &PreviewFileType) -> Result<Preview
         PreviewFileType::Csv => parse_csv(data),
         PreviewFileType::Tsv => parse_tsv(data),
         PreviewFileType::Json => parse_json(data),
-        PreviewFileType::Unsupported => Err("Unsupported file type for preview".to_string()),
+        PreviewFileType::Text(ext) => parse_text(data, ext),
+        PreviewFileType::Unsupported => {
+            // Last resort: try to detect if it's valid UTF-8 text
+            let detected = PreviewFileType::detect_from_content(data);
+            if let PreviewFileType::Text(ext) = detected {
+                parse_text(data, &ext)
+            } else {
+                Err("Cannot preview binary file".to_string())
+            }
+        }
     }
+}
+
+/// Parse text data from bytes
+pub fn parse_text(data: &[u8], extension: &str) -> Result<PreviewData, String> {
+    // Ensure we have valid UTF-8
+    let text = match std::str::from_utf8(data) {
+        Ok(s) => s.to_string(),
+        Err(_) => {
+            // Try to salvage valid UTF-8 by trimming from the end
+            let valid_text = make_valid_utf8(data);
+            if valid_text.is_empty() {
+                return Err("Cannot preview binary file".to_string());
+            }
+            valid_text
+        }
+    };
+
+    let total_lines = text.lines().count();
+    // Check if we likely have truncated content (hit the 50KB limit)
+    let truncated = data.len() >= MAX_PREVIEW_BYTES;
+
+    // Truncate display if too many lines
+    let content = if total_lines > MAX_PREVIEW_ROWS * 2 {
+        text.lines()
+            .take(MAX_PREVIEW_ROWS * 2)
+            .collect::<Vec<_>>()
+            .join("\n")
+    } else {
+        text
+    };
+
+    Ok(PreviewData::Text(TextPreview {
+        content,
+        truncated,
+        total_lines,
+        extension: extension.to_string(),
+    }))
 }
 
 #[cfg(test)]
@@ -365,8 +600,35 @@ mod tests {
             PreviewFileType::from_extension("data.json"),
             PreviewFileType::Json
         );
+        // Text file extensions
         assert_eq!(
-            PreviewFileType::from_extension("data.txt"),
+            PreviewFileType::from_extension("readme.txt"),
+            PreviewFileType::Text("TXT".to_string())
+        );
+        assert_eq!(
+            PreviewFileType::from_extension("README.md"),
+            PreviewFileType::Text("MD".to_string())
+        );
+        assert_eq!(
+            PreviewFileType::from_extension("script.py"),
+            PreviewFileType::Text("PY".to_string())
+        );
+        assert_eq!(
+            PreviewFileType::from_extension("config.yaml"),
+            PreviewFileType::Text("YAML".to_string())
+        );
+        // Extensionless known files
+        assert_eq!(
+            PreviewFileType::from_extension("Makefile"),
+            PreviewFileType::Text("MAKEFILE".to_string())
+        );
+        assert_eq!(
+            PreviewFileType::from_extension("Dockerfile"),
+            PreviewFileType::Text("DOCKERFILE".to_string())
+        );
+        // Unknown extension
+        assert_eq!(
+            PreviewFileType::from_extension("data.xyz"),
             PreviewFileType::Unsupported
         );
     }
@@ -441,5 +703,55 @@ mod tests {
         } else {
             panic!("Expected raw JSON preview for truncated UTF-8");
         }
+    }
+
+    #[test]
+    fn test_text_file_parsing() {
+        let text_data = b"Hello, World!\nThis is a test file.\nLine 3.";
+        let result = parse_text(text_data, "TXT").unwrap();
+
+        if let PreviewData::Text(text) = result {
+            assert_eq!(text.extension, "TXT");
+            assert_eq!(text.total_lines, 3);
+            assert!(text.content.contains("Hello, World!"));
+            assert!(!text.truncated);
+        } else {
+            panic!("Expected text preview");
+        }
+    }
+
+    #[test]
+    fn test_binary_file_detection() {
+        // Binary data with null bytes and non-UTF8 sequences
+        let binary_data: &[u8] = &[0x00, 0x01, 0x02, 0xFF, 0xFE, 0x00, 0x89, 0x50, 0x4E, 0x47];
+
+        let detected = PreviewFileType::detect_from_content(binary_data);
+        assert_eq!(detected, PreviewFileType::Unsupported);
+    }
+
+    #[test]
+    fn test_unknown_extension_with_text_content() {
+        // Unknown extension but valid UTF-8 content
+        let text_data = b"Some valid text content";
+        let result = parse_preview(text_data, &PreviewFileType::Unsupported);
+
+        // Should fall back to text detection and succeed
+        assert!(result.is_ok());
+        if let Ok(PreviewData::Text(text)) = result {
+            assert_eq!(text.extension, "TEXT");
+        } else {
+            panic!("Expected text preview for unknown extension with valid UTF-8");
+        }
+    }
+
+    #[test]
+    fn test_unknown_extension_with_binary_content() {
+        // Unknown extension with binary content
+        let binary_data: &[u8] = &[0x00, 0x01, 0x02, 0xFF, 0xFE];
+        let result = parse_preview(binary_data, &PreviewFileType::Unsupported);
+
+        // Should fail with binary error
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("binary"));
     }
 }

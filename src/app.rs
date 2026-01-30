@@ -2235,6 +2235,7 @@ impl App {
         let max_row = match &self.preview_data {
             Some(PreviewData::Table(table)) => table.rows.len().saturating_sub(1),
             Some(PreviewData::Json(json)) => json.content.lines().count().saturating_sub(1),
+            Some(PreviewData::Text(text)) => text.content.lines().count().saturating_sub(1),
             None => 0,
         };
         if self.preview_selected_row < max_row {

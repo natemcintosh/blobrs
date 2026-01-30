@@ -1045,7 +1045,7 @@ impl App {
             .preview_file_type
             .as_ref()
             .map(|ft| ft.display_name())
-            .unwrap_or("Preview");
+            .unwrap_or_else(|| "Preview".to_string());
 
         // Handle loading state
         if self.is_loading_preview {
@@ -1081,10 +1081,13 @@ impl App {
         // Render based on preview data type
         match &self.preview_data {
             Some(PreviewData::Table(table)) => {
-                self.render_table_preview(area, buf, table, file_type_name);
+                self.render_table_preview(area, buf, table, &file_type_name);
             }
             Some(PreviewData::Json(json)) => {
                 self.render_json_preview(area, buf, json);
+            }
+            Some(PreviewData::Text(text)) => {
+                self.render_text_preview(area, buf, text);
             }
             None => {
                 let empty = Paragraph::new("No preview data available")
@@ -1308,6 +1311,66 @@ impl App {
             .wrap(Wrap { trim: false });
 
         json_widget.render(area, buf);
+    }
+
+    /// Render a text file preview.
+    fn render_text_preview(
+        &self,
+        area: Rect,
+        buf: &mut Buffer,
+        text_data: &crate::preview::TextPreview,
+    ) {
+        // Build title with extension and line count
+        let title = if text_data.truncated {
+            format!(
+                " {} Preview ({} lines, truncated at 50KB) ",
+                text_data.extension, text_data.total_lines
+            )
+        } else {
+            format!(
+                " {} Preview ({} lines) ",
+                text_data.extension, text_data.total_lines
+            )
+        };
+
+        // Apply vertical scroll offset
+        let mut visible_lines: Vec<&str> = text_data
+            .content
+            .lines()
+            .skip(self.preview_selected_row)
+            .collect();
+
+        // Add truncation indicator at the bottom if truncated
+        let truncation_indicator = if text_data.truncated {
+            Some("... [truncated at 50KB]")
+        } else {
+            None
+        };
+
+        // Build the visible content
+        let visible_content = if let Some(indicator) = truncation_indicator {
+            // Only show indicator if we're near the bottom
+            let content_height = area.height.saturating_sub(2) as usize; // Account for borders
+            if visible_lines.len() <= content_height {
+                visible_lines.push("");
+                visible_lines.push(indicator);
+            }
+            visible_lines.join("\n")
+        } else {
+            visible_lines.join("\n")
+        };
+
+        let text_widget = Paragraph::new(visible_content)
+            .block(
+                Block::bordered()
+                    .title(title)
+                    .title_alignment(Alignment::Center)
+                    .border_type(BorderType::Rounded),
+            )
+            .fg(Color::White)
+            .wrap(Wrap { trim: false });
+
+        text_widget.render(area, buf);
     }
 }
 
