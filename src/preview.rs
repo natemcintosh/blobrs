@@ -1,9 +1,15 @@
-//! Preview module for displaying CSV, TSV, JSON, and text file contents.
+//! Preview module for displaying CSV, TSV, JSON, Parquet, and text file contents.
 
 use std::io::Cursor;
 
+use bytes::Bytes;
+use parquet::file::reader::{FileReader, SerializedFileReader};
+
 /// Maximum bytes to download for preview (50KB)
 pub const MAX_PREVIEW_BYTES: usize = 50 * 1024;
+
+/// Maximum bytes to download for Parquet preview (1MB - parquet is compressed)
+pub const MAX_PARQUET_PREVIEW_BYTES: usize = 1024 * 1024;
 
 /// Maximum rows to display in table preview
 pub const MAX_PREVIEW_ROWS: usize = 100;
@@ -14,6 +20,7 @@ pub enum PreviewFileType {
     Csv,
     Tsv,
     Json,
+    Parquet,
     /// Generic text file with extension name (e.g., "MD", "PY", "TXT")
     Text(String),
     Unsupported,
@@ -122,6 +129,8 @@ impl PreviewFileType {
             Self::Tsv
         } else if lower.ends_with(".json") || lower.ends_with(".jsonl") {
             Self::Json
+        } else if lower.ends_with(".parquet") || lower.ends_with(".pq") {
+            Self::Parquet
         } else if let Some(ext) = Self::extract_extension(&lower) {
             if TEXT_EXTENSIONS.contains(&ext.as_str()) {
                 Self::Text(ext.to_uppercase())
@@ -184,6 +193,7 @@ impl PreviewFileType {
             Self::Csv => "CSV".to_string(),
             Self::Tsv => "TSV".to_string(),
             Self::Json => "JSON".to_string(),
+            Self::Parquet => "Parquet".to_string(),
             Self::Text(ext) => ext.clone(),
             Self::Unsupported => "Unsupported".to_string(),
         }
@@ -199,6 +209,8 @@ pub enum PreviewData {
     Json(JsonPreview),
     /// Generic text file
     Text(TextPreview),
+    /// Parquet schema view
+    ParquetSchema(ParquetSchemaPreview),
 }
 
 /// Tabular preview data
@@ -240,6 +252,21 @@ pub struct TextPreview {
     pub total_lines: usize,
     /// File extension (for display purposes)
     pub extension: String,
+}
+
+/// Parquet schema preview data
+#[derive(Debug, Clone)]
+pub struct ParquetSchemaPreview {
+    /// Schema fields as "column_name: Type" lines
+    pub fields: Vec<String>,
+    /// Number of row groups
+    pub num_row_groups: usize,
+    /// Total row count
+    pub num_rows: i64,
+    /// File size in bytes (if known)
+    pub file_size: Option<u64>,
+    /// Created by (writer version)
+    pub created_by: Option<String>,
 }
 
 /// Parse CSV data from bytes
@@ -524,6 +551,7 @@ pub fn parse_preview(data: &[u8], file_type: &PreviewFileType) -> Result<Preview
         PreviewFileType::Csv => parse_csv(data),
         PreviewFileType::Tsv => parse_tsv(data),
         PreviewFileType::Json => parse_json(data),
+        PreviewFileType::Parquet => parse_parquet_schema(data, None),
         PreviewFileType::Text(ext) => parse_text(data, ext),
         PreviewFileType::Unsupported => {
             // Last resort: try to detect if it's valid UTF-8 text
@@ -574,6 +602,98 @@ pub fn parse_text(data: &[u8], extension: &str) -> Result<PreviewData, String> {
     }))
 }
 
+/// Parse Parquet schema from footer bytes
+///
+/// This reads only the Parquet footer to extract schema and metadata.
+/// The `data` should be the suffix of the file (last 64KB or so),
+/// containing the footer.
+pub fn parse_parquet_schema(data: &[u8], file_size: Option<u64>) -> Result<PreviewData, String> {
+    // Convert to Bytes for ChunkReader trait
+    let bytes = Bytes::copy_from_slice(data);
+
+    // Create parquet file reader
+    let reader = SerializedFileReader::new(bytes)
+        .map_err(|e| format!("Failed to read Parquet file: {e}"))?;
+
+    let metadata = reader.metadata();
+    let file_metadata = metadata.file_metadata();
+
+    // Extract schema fields
+    let schema = file_metadata.schema();
+    let fields: Vec<String> = schema
+        .get_fields()
+        .iter()
+        .map(|field| {
+            let type_name = format_parquet_type(field);
+            format!("{}: {}", field.name(), type_name)
+        })
+        .collect();
+
+    // Count total rows across all row groups
+    let num_rows = metadata.row_groups().iter().map(|rg| rg.num_rows()).sum();
+
+    Ok(PreviewData::ParquetSchema(ParquetSchemaPreview {
+        fields,
+        num_row_groups: metadata.num_row_groups(),
+        num_rows,
+        file_size,
+        created_by: file_metadata.created_by().map(|s| s.to_string()),
+    }))
+}
+
+/// Format a Parquet schema type for display
+fn format_parquet_type(field: &parquet::schema::types::Type) -> String {
+    use parquet::basic::{ConvertedType, Type as PhysicalType};
+
+    if field.is_primitive() {
+        let physical = field.get_physical_type();
+        let converted = field.get_basic_info().converted_type();
+
+        // Use converted type if available for more meaningful names
+        match converted {
+            ConvertedType::NONE => match physical {
+                PhysicalType::BOOLEAN => "Boolean".to_string(),
+                PhysicalType::INT32 => "Int32".to_string(),
+                PhysicalType::INT64 => "Int64".to_string(),
+                PhysicalType::INT96 => "Int96".to_string(),
+                PhysicalType::FLOAT => "Float".to_string(),
+                PhysicalType::DOUBLE => "Double".to_string(),
+                PhysicalType::BYTE_ARRAY => "ByteArray".to_string(),
+                PhysicalType::FIXED_LEN_BYTE_ARRAY => "FixedLenByteArray".to_string(),
+            },
+            ConvertedType::UTF8 => "String".to_string(),
+            ConvertedType::INT_8 => "Int8".to_string(),
+            ConvertedType::INT_16 => "Int16".to_string(),
+            ConvertedType::INT_32 => "Int32".to_string(),
+            ConvertedType::INT_64 => "Int64".to_string(),
+            ConvertedType::UINT_8 => "UInt8".to_string(),
+            ConvertedType::UINT_16 => "UInt16".to_string(),
+            ConvertedType::UINT_32 => "UInt32".to_string(),
+            ConvertedType::UINT_64 => "UInt64".to_string(),
+            ConvertedType::DATE => "Date".to_string(),
+            ConvertedType::TIME_MILLIS | ConvertedType::TIME_MICROS => "Time".to_string(),
+            ConvertedType::TIMESTAMP_MILLIS | ConvertedType::TIMESTAMP_MICROS => {
+                "Timestamp".to_string()
+            }
+            ConvertedType::DECIMAL => "Decimal".to_string(),
+            ConvertedType::JSON => "Json".to_string(),
+            ConvertedType::BSON => "Bson".to_string(),
+            ConvertedType::INTERVAL => "Interval".to_string(),
+            ConvertedType::ENUM => "Enum".to_string(),
+            _ => format!("{physical:?}"),
+        }
+    } else if field.is_group() {
+        // It's a nested type (struct, list, map)
+        match field.get_basic_info().converted_type() {
+            ConvertedType::LIST => "List".to_string(),
+            ConvertedType::MAP | ConvertedType::MAP_KEY_VALUE => "Map".to_string(),
+            _ => "Struct".to_string(),
+        }
+    } else {
+        "Unknown".to_string()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -616,6 +736,15 @@ mod tests {
         assert_eq!(
             PreviewFileType::from_extension("config.yaml"),
             PreviewFileType::Text("YAML".to_string())
+        );
+        // Parquet files
+        assert_eq!(
+            PreviewFileType::from_extension("data.parquet"),
+            PreviewFileType::Parquet
+        );
+        assert_eq!(
+            PreviewFileType::from_extension("data.pq"),
+            PreviewFileType::Parquet
         );
         // Extensionless known files
         assert_eq!(
@@ -753,5 +882,64 @@ mod tests {
         // Should fail with binary error
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("binary"));
+    }
+
+    #[test]
+    fn test_parquet_schema_parsing() {
+        use arrow::array::{Int32Array, StringArray};
+        use arrow::datatypes::{DataType, Field, Schema};
+        use arrow::record_batch::RecordBatch;
+        use parquet::arrow::ArrowWriter;
+        use std::sync::Arc;
+
+        // Create a simple schema
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("name", DataType::Utf8, false),
+            Field::new("age", DataType::Int32, false),
+        ]));
+
+        // Create data
+        let names = StringArray::from(vec!["Alice", "Bob", "Charlie"]);
+        let ages = Int32Array::from(vec![30, 25, 35]);
+
+        let batch =
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(names), Arc::new(ages)]).unwrap();
+
+        // Write to Parquet bytes
+        let mut buffer: Vec<u8> = Vec::new();
+        {
+            let mut writer = ArrowWriter::try_new(&mut buffer, schema, None).unwrap();
+            writer.write(&batch).unwrap();
+            writer.close().unwrap();
+        }
+
+        // Parse the Parquet schema
+        let result = parse_parquet_schema(&buffer, Some(buffer.len() as u64)).unwrap();
+
+        if let PreviewData::ParquetSchema(schema) = result {
+            // Check schema fields
+            assert_eq!(schema.fields.len(), 2);
+            assert!(schema.fields[0].contains("name"));
+            assert!(schema.fields[0].contains("String")); // UTF8 maps to String
+            assert!(schema.fields[1].contains("age"));
+            assert!(schema.fields[1].contains("Int32"));
+
+            // Check metadata
+            assert_eq!(schema.num_rows, 3);
+            assert_eq!(schema.num_row_groups, 1);
+            assert!(schema.file_size.is_some());
+        } else {
+            panic!("Expected ParquetSchema preview");
+        }
+    }
+
+    #[test]
+    fn test_parquet_invalid_data() {
+        // Invalid data should return an error
+        let invalid_data = b"not a parquet file";
+        let result = parse_parquet_schema(invalid_data, None);
+
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("Failed to read Parquet"));
     }
 }

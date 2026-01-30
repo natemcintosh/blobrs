@@ -1,6 +1,9 @@
 use crate::{
     event::{AppEvent, Event, EventHandler},
-    preview::{MAX_PREVIEW_BYTES, PreviewData, PreviewFileType, parse_preview},
+    preview::{
+        MAX_PARQUET_PREVIEW_BYTES, MAX_PREVIEW_BYTES, PreviewData, PreviewFileType,
+        parse_parquet_schema, parse_preview,
+    },
     terminal_icons::{IconSet, detect_terminal_icons},
 };
 use arboard::Clipboard;
@@ -2150,8 +2153,10 @@ impl App {
         // Check file type
         let file_type = PreviewFileType::from_extension(name);
         if !file_type.is_supported() {
-            self.preview_error =
-                Some("Unsupported file type. Preview supports: CSV, TSV, JSON".to_string());
+            self.preview_error = Some(
+                "Unsupported file type. Preview supports: CSV, TSV, JSON, Parquet, and text files"
+                    .to_string(),
+            );
             self.preview_file_type = Some(file_type);
             self.show_preview = true;
             return Ok(());
@@ -2181,7 +2186,42 @@ impl App {
 
         let object_path = ObjectPath::from(blob_path.as_str());
 
-        // Get file content with size limit
+        // For Parquet files, we need to fetch the footer from the end of the file
+        if file_type == PreviewFileType::Parquet {
+            // First, get the file size
+            let head_result = object_store.head(&object_path).await;
+            match head_result {
+                Ok(meta) => {
+                    let file_size = meta.size;
+                    // Fetch the last MAX_PARQUET_PREVIEW_BYTES bytes (footer is at the end)
+                    let start = file_size.saturating_sub(MAX_PARQUET_PREVIEW_BYTES as u64);
+                    let get_result = object_store.get_range(&object_path, start..file_size).await;
+
+                    self.is_loading_preview = false;
+
+                    match get_result {
+                        Ok(bytes) => match parse_parquet_schema(&bytes, Some(file_size)) {
+                            Ok(data) => {
+                                self.preview_data = Some(data);
+                            }
+                            Err(e) => {
+                                self.preview_error = Some(e);
+                            }
+                        },
+                        Err(e) => {
+                            self.preview_error = Some(format!("Failed to fetch file: {e}"));
+                        }
+                    }
+                }
+                Err(e) => {
+                    self.is_loading_preview = false;
+                    self.preview_error = Some(format!("Failed to get file info: {e}"));
+                }
+            }
+            return Ok(());
+        }
+
+        // For other file types, fetch from the beginning
         let get_result = object_store
             .get_range(&object_path, 0..(MAX_PREVIEW_BYTES as u64))
             .await;
@@ -2236,6 +2276,10 @@ impl App {
             Some(PreviewData::Table(table)) => table.rows.len().saturating_sub(1),
             Some(PreviewData::Json(json)) => json.content.lines().count().saturating_sub(1),
             Some(PreviewData::Text(text)) => text.content.lines().count().saturating_sub(1),
+            Some(PreviewData::ParquetSchema(schema)) => {
+                // Metadata lines + schema fields + some padding
+                (7 + schema.fields.len()).saturating_sub(1)
+            }
             None => 0,
         };
         if self.preview_selected_row < max_row {

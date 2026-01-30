@@ -2,6 +2,7 @@ use ratatui::{
     buffer::Buffer,
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style, Stylize},
+    text::{Line, Span, Text},
     widgets::{
         Block, BorderType, Cell, List, ListItem, ListState, Paragraph, Row, Table, TableState,
         Widget, Wrap,
@@ -1089,6 +1090,9 @@ impl App {
             Some(PreviewData::Text(text)) => {
                 self.render_text_preview(area, buf, text);
             }
+            Some(PreviewData::ParquetSchema(schema)) => {
+                self.render_parquet_schema_preview(area, buf, schema);
+            }
             None => {
                 let empty = Paragraph::new("No preview data available")
                     .block(
@@ -1372,6 +1376,112 @@ impl App {
 
         text_widget.render(area, buf);
     }
+
+    /// Render a Parquet schema preview.
+    #[allow(clippy::vec_init_then_push)]
+    fn render_parquet_schema_preview(
+        &self,
+        area: Rect,
+        buf: &mut Buffer,
+        schema_data: &crate::preview::ParquetSchemaPreview,
+    ) {
+        let title = format!(" Parquet Schema ({} columns) ", schema_data.fields.len());
+
+        // Build metadata section
+        let mut lines: Vec<Line> = Vec::new();
+
+        // File metadata header
+        lines.push(Line::from(vec![
+            Span::styled(
+                "── Metadata ",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("─".repeat(30), Style::default().fg(Color::DarkGray)),
+        ]));
+        lines.push(Line::from(""));
+
+        // Row count
+        lines.push(Line::from(vec![
+            Span::styled("  Rows:        ", Style::default().fg(Color::Yellow)),
+            Span::styled(
+                format_number(schema_data.num_rows as u64),
+                Style::default().fg(Color::White),
+            ),
+        ]));
+
+        // Row groups
+        lines.push(Line::from(vec![
+            Span::styled("  Row Groups:  ", Style::default().fg(Color::Yellow)),
+            Span::styled(
+                schema_data.num_row_groups.to_string(),
+                Style::default().fg(Color::White),
+            ),
+        ]));
+
+        // File size (if known)
+        if let Some(size) = schema_data.file_size {
+            lines.push(Line::from(vec![
+                Span::styled("  File Size:   ", Style::default().fg(Color::Yellow)),
+                Span::styled(format_bytes(size), Style::default().fg(Color::White)),
+            ]));
+        }
+
+        // Created by (if known)
+        if let Some(ref created_by) = schema_data.created_by {
+            lines.push(Line::from(vec![
+                Span::styled("  Created By:  ", Style::default().fg(Color::Yellow)),
+                Span::styled(created_by.clone(), Style::default().fg(Color::White)),
+            ]));
+        }
+
+        lines.push(Line::from(""));
+
+        // Schema header
+        lines.push(Line::from(vec![
+            Span::styled(
+                "── Schema ",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("─".repeat(31), Style::default().fg(Color::DarkGray)),
+        ]));
+        lines.push(Line::from(""));
+
+        // Schema fields
+        for field in &schema_data.fields {
+            // Parse the field into name and type
+            if let Some((name, type_str)) = field.split_once(": ") {
+                lines.push(Line::from(vec![
+                    Span::styled("  ", Style::default()),
+                    Span::styled(name.to_string(), Style::default().fg(Color::Green)),
+                    Span::styled(": ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(type_str.to_string(), Style::default().fg(Color::Magenta)),
+                ]));
+            } else {
+                lines.push(Line::from(vec![
+                    Span::styled("  ", Style::default()),
+                    Span::styled(field.clone(), Style::default().fg(Color::White)),
+                ]));
+            }
+        }
+
+        // Apply scroll offset
+        let visible_lines: Vec<Line> = lines.into_iter().skip(self.preview_selected_row).collect();
+
+        let text = Text::from(visible_lines);
+
+        let schema_widget = Paragraph::new(text).block(
+            Block::bordered()
+                .title(title)
+                .title_alignment(Alignment::Center)
+                .border_type(BorderType::Rounded),
+        );
+
+        schema_widget.render(area, buf);
+    }
 }
 
 /// Format bytes in human-readable format
@@ -1400,4 +1510,17 @@ fn format_bytes(bytes: u64) -> String {
     } else {
         format!("{:.1} {}", size, UNITS[unit_index])
     }
+}
+
+/// Format a number with thousand separators
+fn format_number(n: u64) -> String {
+    let s = n.to_string();
+    let mut result = String::new();
+    for (i, c) in s.chars().rev().enumerate() {
+        if i > 0 && i % 3 == 0 {
+            result.push(',');
+        }
+        result.push(c);
+    }
+    result.chars().rev().collect()
 }
