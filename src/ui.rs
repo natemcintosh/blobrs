@@ -1042,18 +1042,17 @@ impl App {
     /// Render the preview panel for CSV, TSV, or JSON files.
     fn render_preview_panel(&self, area: Rect, buf: &mut Buffer) {
         // Get the file type name for the title
-        let file_type_name = self
-            .preview_file_type
-            .as_ref()
-            .map(|ft| ft.display_name())
-            .unwrap_or_else(|| "Preview".to_string());
+        let file_type_name = self.preview_file_type.as_ref().map_or_else(
+            || "Preview".to_string(),
+            super::preview::PreviewFileType::display_name,
+        );
 
         // Handle loading state
         if self.is_loading_preview {
             let loading = Paragraph::new(format!("{} Loading preview...", self.icons.loading))
                 .block(
                     Block::bordered()
-                        .title(format!(" {} Preview ", file_type_name))
+                        .title(format!(" {file_type_name} Preview "))
                         .title_alignment(Alignment::Center)
                         .border_type(BorderType::Rounded),
                 )
@@ -1068,7 +1067,7 @@ impl App {
             let error_widget = Paragraph::new(format!("{} {}", self.icons.error, error))
                 .block(
                     Block::bordered()
-                        .title(format!(" {} Preview ", file_type_name))
+                        .title(format!(" {file_type_name} Preview "))
                         .title_alignment(Alignment::Center)
                         .border_type(BorderType::Rounded),
                 )
@@ -1097,7 +1096,7 @@ impl App {
                 let empty = Paragraph::new("No preview data available")
                     .block(
                         Block::bordered()
-                            .title(format!(" {} Preview ", file_type_name))
+                            .title(format!(" {file_type_name} Preview "))
                             .title_alignment(Alignment::Center)
                             .border_type(BorderType::Rounded),
                     )
@@ -1137,7 +1136,7 @@ impl App {
         let num_cols = table_data
             .headers
             .len()
-            .max(table_data.rows.first().map(|r| r.len()).unwrap_or(0));
+            .max(table_data.rows.first().map_or(0, Vec::len));
 
         if num_cols == 0 {
             let empty = Paragraph::new("Empty table")
@@ -1406,7 +1405,7 @@ impl App {
         lines.push(Line::from(vec![
             Span::styled("  Rows:        ", Style::default().fg(Color::Yellow)),
             Span::styled(
-                format_number(schema_data.num_rows as u64),
+                format_number(schema_data.num_rows.cast_unsigned()),
                 Style::default().fg(Color::White),
             ),
         ]));

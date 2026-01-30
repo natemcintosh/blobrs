@@ -121,6 +121,8 @@ const TEXT_EXTENSIONS: &[&str] = &[
 
 impl PreviewFileType {
     /// Detect file type from file extension
+    #[must_use]
+    #[allow(clippy::case_sensitive_file_extension_comparisons)] // filename is already lowercased
     pub fn from_extension(filename: &str) -> Self {
         let lower = filename.to_lowercase();
         if lower.ends_with(".csv") {
@@ -156,6 +158,7 @@ impl PreviewFileType {
     }
 
     /// Try to detect if data is valid UTF-8 text (for unknown extensions)
+    #[must_use]
     pub fn detect_from_content(data: &[u8]) -> Self {
         // Check for common binary signatures
         if is_likely_binary(data) {
@@ -183,11 +186,13 @@ impl PreviewFileType {
     }
 
     /// Check if this file type is supported for preview
+    #[must_use]
     pub fn is_supported(&self) -> bool {
         !matches!(self, Self::Unsupported)
     }
 
     /// Get the display name for this file type
+    #[must_use]
     pub fn display_name(&self) -> String {
         match self {
             Self::Csv => "CSV".to_string(),
@@ -257,7 +262,7 @@ pub struct TextPreview {
 /// Parquet schema preview data
 #[derive(Debug, Clone)]
 pub struct ParquetSchemaPreview {
-    /// Schema fields as "column_name: Type" lines
+    /// Schema fields as "`column_name`: Type" lines
     pub fields: Vec<String>,
     /// Number of row groups
     pub num_row_groups: usize,
@@ -270,11 +275,13 @@ pub struct ParquetSchemaPreview {
 }
 
 /// Parse CSV data from bytes
+#[allow(clippy::missing_errors_doc)]
 pub fn parse_csv(data: &[u8]) -> Result<PreviewData, String> {
     parse_delimited(data, b',', PreviewFileType::Csv)
 }
 
 /// Parse TSV data from bytes
+#[allow(clippy::missing_errors_doc)]
 pub fn parse_tsv(data: &[u8]) -> Result<PreviewData, String> {
     parse_delimited(data, b'\t', PreviewFileType::Tsv)
 }
@@ -338,77 +345,74 @@ fn parse_delimited(
 }
 
 /// Parse JSON data from bytes
+#[allow(clippy::missing_errors_doc)]
 pub fn parse_json(data: &[u8]) -> Result<PreviewData, String> {
     // First, ensure we have valid UTF-8 (truncation might cut mid-character)
-    let text = match std::str::from_utf8(data) {
-        Ok(s) => s.to_string(),
-        Err(_) => {
-            // Try to find valid UTF-8 by trimming from the end
-            let valid_text = make_valid_utf8(data);
-            if valid_text.is_empty() {
-                return Err("Could not decode file as UTF-8".to_string());
-            }
-            valid_text
+    let text = if let Ok(s) = std::str::from_utf8(data) {
+        s.to_string()
+    } else {
+        // Try to find valid UTF-8 by trimming from the end
+        let valid_text = make_valid_utf8(data);
+        if valid_text.is_empty() {
+            return Err("Could not decode file as UTF-8".to_string());
         }
+        valid_text
     };
 
     // Try to parse as JSON
-    match serde_json::from_str::<serde_json::Value>(&text) {
-        Ok(value) => {
-            // Check if it's an array of objects (can be displayed as table)
-            if let serde_json::Value::Array(arr) = &value
-                && let Some(table) = try_json_array_as_table(arr)
-            {
-                return Ok(PreviewData::Table(table));
-            }
-
-            // Fall back to pretty-printed JSON
-            let pretty = serde_json::to_string_pretty(&value)
-                .map_err(|e| format!("Failed to format JSON: {e}"))?;
-
-            let total_lines = pretty.lines().count();
-            let truncated = total_lines > MAX_PREVIEW_ROWS * 2; // Allow more lines for JSON
-
-            // Truncate if too long
-            let content = if truncated {
-                pretty
-                    .lines()
-                    .take(MAX_PREVIEW_ROWS * 2)
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            } else {
-                pretty
-            };
-
-            Ok(PreviewData::Json(JsonPreview {
-                content,
-                truncated,
-                total_lines,
-                is_raw: false,
-            }))
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) {
+        // Check if it's an array of objects (can be displayed as table)
+        if let serde_json::Value::Array(arr) = &value
+            && let Some(table) = try_json_array_as_table(arr)
+        {
+            return Ok(PreviewData::Table(table));
         }
-        Err(_) => {
-            // JSON parsing failed (likely truncated) - show raw content
-            let total_lines = text.lines().count();
-            let truncated = true; // We assume it's truncated since parsing failed
 
-            // Truncate display if too long
-            let content = if total_lines > MAX_PREVIEW_ROWS * 2 {
-                text.lines()
-                    .take(MAX_PREVIEW_ROWS * 2)
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            } else {
-                text
-            };
+        // Fall back to pretty-printed JSON
+        let pretty = serde_json::to_string_pretty(&value)
+            .map_err(|e| format!("Failed to format JSON: {e}"))?;
 
-            Ok(PreviewData::Json(JsonPreview {
-                content,
-                truncated,
-                total_lines,
-                is_raw: true,
-            }))
-        }
+        let total_lines = pretty.lines().count();
+        let truncated = total_lines > MAX_PREVIEW_ROWS * 2; // Allow more lines for JSON
+
+        // Truncate if too long
+        let content = if truncated {
+            pretty
+                .lines()
+                .take(MAX_PREVIEW_ROWS * 2)
+                .collect::<Vec<_>>()
+                .join("\n")
+        } else {
+            pretty
+        };
+
+        Ok(PreviewData::Json(JsonPreview {
+            content,
+            truncated,
+            total_lines,
+            is_raw: false,
+        }))
+    } else {
+        // JSON parsing failed (likely truncated) - show raw content
+        let total_lines = text.lines().count();
+        let truncated = true; // We assume it's truncated since parsing failed
+
+        // Truncate display if too long
+        let content = if total_lines > MAX_PREVIEW_ROWS * 2 {
+            text.lines()
+                .take(MAX_PREVIEW_ROWS * 2)
+                .collect::<Vec<_>>()
+                .join("\n")
+        } else {
+            text
+        };
+
+        Ok(PreviewData::Json(JsonPreview {
+            content,
+            truncated,
+            total_lines,
+            is_raw: true,
+        }))
     }
 }
 
@@ -546,6 +550,7 @@ fn value_to_string(value: &serde_json::Value) -> String {
 }
 
 /// Parse data based on file type
+#[allow(clippy::missing_errors_doc)]
 pub fn parse_preview(data: &[u8], file_type: &PreviewFileType) -> Result<PreviewData, String> {
     match file_type {
         PreviewFileType::Csv => parse_csv(data),
@@ -566,18 +571,18 @@ pub fn parse_preview(data: &[u8], file_type: &PreviewFileType) -> Result<Preview
 }
 
 /// Parse text data from bytes
+#[allow(clippy::missing_errors_doc)]
 pub fn parse_text(data: &[u8], extension: &str) -> Result<PreviewData, String> {
     // Ensure we have valid UTF-8
-    let text = match std::str::from_utf8(data) {
-        Ok(s) => s.to_string(),
-        Err(_) => {
-            // Try to salvage valid UTF-8 by trimming from the end
-            let valid_text = make_valid_utf8(data);
-            if valid_text.is_empty() {
-                return Err("Cannot preview binary file".to_string());
-            }
-            valid_text
+    let text = if let Ok(s) = std::str::from_utf8(data) {
+        s.to_string()
+    } else {
+        // Try to salvage valid UTF-8 by trimming from the end
+        let valid_text = make_valid_utf8(data);
+        if valid_text.is_empty() {
+            return Err("Cannot preview binary file".to_string());
         }
+        valid_text
     };
 
     let total_lines = text.lines().count();
@@ -607,6 +612,7 @@ pub fn parse_text(data: &[u8], extension: &str) -> Result<PreviewData, String> {
 /// This reads only the Parquet footer to extract schema and metadata.
 /// The `data` should be the suffix of the file (last 64KB or so),
 /// containing the footer.
+#[allow(clippy::missing_errors_doc)]
 pub fn parse_parquet_schema(data: &[u8], file_size: Option<u64>) -> Result<PreviewData, String> {
     // Convert to Bytes for ChunkReader trait
     let bytes = Bytes::copy_from_slice(data);
@@ -630,14 +636,18 @@ pub fn parse_parquet_schema(data: &[u8], file_size: Option<u64>) -> Result<Previ
         .collect();
 
     // Count total rows across all row groups
-    let num_rows = metadata.row_groups().iter().map(|rg| rg.num_rows()).sum();
+    let num_rows = metadata
+        .row_groups()
+        .iter()
+        .map(parquet::file::metadata::RowGroupMetaData::num_rows)
+        .sum();
 
     Ok(PreviewData::ParquetSchema(ParquetSchemaPreview {
         fields,
         num_row_groups: metadata.num_row_groups(),
         num_rows,
         file_size,
-        created_by: file_metadata.created_by().map(|s| s.to_string()),
+        created_by: file_metadata.created_by().map(ToString::to_string),
     }))
 }
 

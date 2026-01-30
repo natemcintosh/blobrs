@@ -19,11 +19,12 @@ use ratatui::{
 use regex::Regex;
 use reqwest;
 use sha2::Sha256;
+use std::fmt::Write as _;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum SortCriteria {
     Name,
     DateModified,
@@ -366,11 +367,11 @@ impl App {
 
         // Handle search mode separately
         if self.container_search_mode && self.state == AppState::ContainerSelection {
-            return self.handle_container_search_key_event(key_event).await;
+            return self.handle_container_search_key_event(key_event);
         }
 
         if self.search_mode && self.state == AppState::BlobBrowsing {
-            return self.handle_search_key_event(key_event).await;
+            return self.handle_search_key_event(key_event);
         }
 
         // Don't process keys while loading, cloning, or deleting
@@ -468,7 +469,7 @@ impl App {
                             && !self.is_downloading
                             && !self.show_sort_popup
                         {
-                            self.show_download_picker().await;
+                            self.show_download_picker();
                         }
                     }
                     KeyCode::Char('s') => {
@@ -480,7 +481,7 @@ impl App {
                             self.show_sort_popup = true;
                         } else if self.show_sort_popup {
                             // Handle sort selection
-                            if let Err(e) = self.apply_sort(SortCriteria::Size).await {
+                            if let Err(e) = self.apply_sort(SortCriteria::Size) {
                                 self.error_message = Some(format!("Failed to sort: {e}"));
                             }
                             self.show_sort_popup = false;
@@ -488,7 +489,7 @@ impl App {
                     }
                     KeyCode::Char('n') => {
                         if self.show_sort_popup {
-                            if let Err(e) = self.apply_sort(SortCriteria::Name).await {
+                            if let Err(e) = self.apply_sort(SortCriteria::Name) {
                                 self.error_message = Some(format!("Failed to sort: {e}"));
                             }
                             self.show_sort_popup = false;
@@ -496,7 +497,7 @@ impl App {
                     }
                     KeyCode::Char('m') => {
                         if self.show_sort_popup {
-                            if let Err(e) = self.apply_sort(SortCriteria::DateModified).await {
+                            if let Err(e) = self.apply_sort(SortCriteria::DateModified) {
                                 self.error_message = Some(format!("Failed to sort: {e}"));
                             }
                             self.show_sort_popup = false;
@@ -504,7 +505,7 @@ impl App {
                     }
                     KeyCode::Char('t') => {
                         if self.show_sort_popup {
-                            if let Err(e) = self.apply_sort(SortCriteria::DateCreated).await {
+                            if let Err(e) = self.apply_sort(SortCriteria::DateCreated) {
                                 self.error_message = Some(format!("Failed to sort: {e}"));
                             }
                             self.show_sort_popup = false;
@@ -737,11 +738,11 @@ impl App {
     /// # Errors
     ///
     /// This function currently does not return errors but uses `Result` for API consistency.
-    pub async fn apply_sort(&mut self, criteria: SortCriteria) -> color_eyre::Result<()> {
-        self.sort_criteria = criteria.clone();
+    pub fn apply_sort(&mut self, criteria: SortCriteria) -> color_eyre::Result<()> {
+        self.sort_criteria = criteria;
 
         if !self.file_items.is_empty() {
-            Self::sort_file_items_static(&mut self.file_items, &criteria);
+            Self::sort_file_items_static(&mut self.file_items, criteria);
             // Update the display list
             self.files = self
                 .file_items
@@ -752,7 +753,7 @@ impl App {
 
         // Also sort the unfiltered list
         if !self.all_file_items.is_empty() {
-            Self::sort_file_items_static(&mut self.all_file_items, &criteria);
+            Self::sort_file_items_static(&mut self.all_file_items, criteria);
             self.all_files = self
                 .all_file_items
                 .iter()
@@ -764,7 +765,7 @@ impl App {
     }
 
     /// Sort file items based on the given criteria.
-    fn sort_file_items_static(items: &mut [FileItem], criteria: &SortCriteria) {
+    fn sort_file_items_static(items: &mut [FileItem], criteria: SortCriteria) {
         items.sort_by(|a, b| {
             // Always put folders first
             match (a.is_folder, b.is_folder) {
@@ -819,7 +820,7 @@ impl App {
         match self.list_file_items(&self.current_path).await {
             Ok(mut file_items) => {
                 // Apply current sorting
-                Self::sort_file_items_static(&mut file_items, &self.sort_criteria);
+                Self::sort_file_items_static(&mut file_items, self.sort_criteria);
 
                 // Create display strings
                 let files: Vec<String> = file_items
@@ -942,7 +943,7 @@ impl App {
     /// # Errors
     ///
     /// This function currently does not return errors but uses `Result` for API consistency.
-    pub async fn handle_search_key_event(&mut self, key_event: KeyEvent) -> color_eyre::Result<()> {
+    pub fn handle_search_key_event(&mut self, key_event: KeyEvent) -> color_eyre::Result<()> {
         match key_event.code {
             KeyCode::Esc => {
                 self.exit_search_mode();
@@ -1478,7 +1479,7 @@ impl App {
             let mut url =
                 format!("https://{account_name}.blob.core.windows.net/?comp=list&maxresults=5000");
             if let Some(ref marker) = next_marker {
-                url.push_str(&format!("&marker={}", urlencoding::encode(marker)));
+                let _ = write!(url, "&marker={}", urlencoding::encode(marker));
             }
 
             // Create timestamp in RFC 1123 format
@@ -1644,7 +1645,7 @@ impl App {
     /// # Errors
     ///
     /// This function currently does not return errors but uses `Result` for API consistency.
-    pub async fn handle_container_search_key_event(
+    pub fn handle_container_search_key_event(
         &mut self,
         key_event: KeyEvent,
     ) -> color_eyre::Result<()> {
@@ -1874,7 +1875,7 @@ impl App {
     }
 
     /// Show the download destination picker.
-    pub async fn show_download_picker(&mut self) {
+    pub fn show_download_picker(&mut self) {
         if self.files.is_empty() {
             return;
         }
