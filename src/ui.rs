@@ -1257,7 +1257,10 @@ impl App {
         buf: &mut Buffer,
         json_data: &crate::preview::JsonPreview,
     ) {
-        let title = if json_data.truncated {
+        // Build title based on mode and truncation state
+        let title = if json_data.is_raw {
+            " JSON Preview (raw, truncated at 50KB) ".to_string()
+        } else if json_data.truncated {
             format!(
                 " JSON Preview ({}/{} lines, truncated) ",
                 json_data.content.lines().count(),
@@ -1268,12 +1271,31 @@ impl App {
         };
 
         // Apply vertical scroll offset
-        let visible_content: String = json_data
+        let mut visible_lines: Vec<&str> = json_data
             .content
             .lines()
             .skip(self.preview_selected_row)
-            .collect::<Vec<_>>()
-            .join("\n");
+            .collect();
+
+        // Add truncation indicator at the bottom if truncated
+        let truncation_indicator = if json_data.truncated {
+            Some("... [truncated at 50KB]")
+        } else {
+            None
+        };
+
+        // Build the visible content
+        let visible_content = if let Some(indicator) = truncation_indicator {
+            // Only show indicator if we're near the bottom
+            let content_height = area.height.saturating_sub(2) as usize; // Account for borders
+            if visible_lines.len() <= content_height {
+                visible_lines.push("");
+                visible_lines.push(indicator);
+            }
+            visible_lines.join("\n")
+        } else {
+            visible_lines.join("\n")
+        };
 
         let json_widget = Paragraph::new(visible_content)
             .block(

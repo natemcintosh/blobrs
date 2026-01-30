@@ -75,12 +75,14 @@ pub struct TablePreview {
 /// JSON preview data (for non-tabular JSON)
 #[derive(Debug, Clone)]
 pub struct JsonPreview {
-    /// Pretty-printed JSON string
+    /// Pretty-printed JSON string (or raw content if parsing failed)
     pub content: String,
     /// Whether the content was truncated
     pub truncated: bool,
     /// Total lines in the formatted output
     pub total_lines: usize,
+    /// Whether this is raw content (parsing failed, likely due to truncation)
+    pub is_raw: bool,
 }
 
 /// Parse CSV data from bytes
@@ -153,42 +155,93 @@ fn parse_delimited(
 
 /// Parse JSON data from bytes
 pub fn parse_json(data: &[u8]) -> Result<PreviewData, String> {
-    let text = std::str::from_utf8(data).map_err(|e| format!("Invalid UTF-8: {e}"))?;
-
-    // Try to parse as JSON
-    let value: serde_json::Value =
-        serde_json::from_str(text).map_err(|e| format!("Invalid JSON: {e}"))?;
-
-    // Check if it's an array of objects (can be displayed as table)
-    if let serde_json::Value::Array(arr) = &value
-        && let Some(table) = try_json_array_as_table(arr)
-    {
-        return Ok(PreviewData::Table(table));
-    }
-
-    // Fall back to pretty-printed JSON
-    let pretty =
-        serde_json::to_string_pretty(&value).map_err(|e| format!("Failed to format JSON: {e}"))?;
-
-    let total_lines = pretty.lines().count();
-    let truncated = total_lines > MAX_PREVIEW_ROWS * 2; // Allow more lines for JSON
-
-    // Truncate if too long
-    let content = if truncated {
-        pretty
-            .lines()
-            .take(MAX_PREVIEW_ROWS * 2)
-            .collect::<Vec<_>>()
-            .join("\n")
-    } else {
-        pretty
+    // First, ensure we have valid UTF-8 (truncation might cut mid-character)
+    let text = match std::str::from_utf8(data) {
+        Ok(s) => s.to_string(),
+        Err(_) => {
+            // Try to find valid UTF-8 by trimming from the end
+            let valid_text = make_valid_utf8(data);
+            if valid_text.is_empty() {
+                return Err("Could not decode file as UTF-8".to_string());
+            }
+            valid_text
+        }
     };
 
-    Ok(PreviewData::Json(JsonPreview {
-        content,
-        truncated,
-        total_lines,
-    }))
+    // Try to parse as JSON
+    match serde_json::from_str::<serde_json::Value>(&text) {
+        Ok(value) => {
+            // Check if it's an array of objects (can be displayed as table)
+            if let serde_json::Value::Array(arr) = &value
+                && let Some(table) = try_json_array_as_table(arr)
+            {
+                return Ok(PreviewData::Table(table));
+            }
+
+            // Fall back to pretty-printed JSON
+            let pretty = serde_json::to_string_pretty(&value)
+                .map_err(|e| format!("Failed to format JSON: {e}"))?;
+
+            let total_lines = pretty.lines().count();
+            let truncated = total_lines > MAX_PREVIEW_ROWS * 2; // Allow more lines for JSON
+
+            // Truncate if too long
+            let content = if truncated {
+                pretty
+                    .lines()
+                    .take(MAX_PREVIEW_ROWS * 2)
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            } else {
+                pretty
+            };
+
+            Ok(PreviewData::Json(JsonPreview {
+                content,
+                truncated,
+                total_lines,
+                is_raw: false,
+            }))
+        }
+        Err(_) => {
+            // JSON parsing failed (likely truncated) - show raw content
+            let total_lines = text.lines().count();
+            let truncated = true; // We assume it's truncated since parsing failed
+
+            // Truncate display if too long
+            let content = if total_lines > MAX_PREVIEW_ROWS * 2 {
+                text.lines()
+                    .take(MAX_PREVIEW_ROWS * 2)
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            } else {
+                text
+            };
+
+            Ok(PreviewData::Json(JsonPreview {
+                content,
+                truncated,
+                total_lines,
+                is_raw: true,
+            }))
+        }
+    }
+}
+
+/// Convert bytes to valid UTF-8 by trimming invalid bytes from the end
+fn make_valid_utf8(data: &[u8]) -> String {
+    // Try progressively shorter slices until we get valid UTF-8
+    // (truncation might have cut in the middle of a multi-byte character)
+    for trim in 0..4 {
+        if data.len() <= trim {
+            break;
+        }
+        if let Ok(s) = std::str::from_utf8(&data[..data.len() - trim]) {
+            return s.to_string();
+        }
+    }
+    // If still invalid, use lossy conversion
+    String::from_utf8_lossy(data).to_string()
 }
 
 /// Try to convert a JSON array to a table (if it's an array of objects with consistent keys)
@@ -351,8 +404,42 @@ mod tests {
 
         if let PreviewData::Json(json) = result {
             assert!(json.content.contains("Alice"));
+            assert!(!json.is_raw); // Valid JSON should not be raw
         } else {
             panic!("Expected JSON preview for nested object");
+        }
+    }
+
+    #[test]
+    fn test_truncated_json_falls_back_to_raw() {
+        // Simulate truncated JSON (incomplete array)
+        let truncated_json = br#"[{"name": "Alice", "age": 30}, {"name": "Bob""#;
+        let result = parse_json(truncated_json).unwrap();
+
+        if let PreviewData::Json(json) = result {
+            assert!(json.is_raw); // Should be raw since parsing failed
+            assert!(json.truncated); // Should be marked as truncated
+            assert!(json.content.contains("Alice")); // Content should still be there
+        } else {
+            panic!("Expected raw JSON preview for truncated JSON");
+        }
+    }
+
+    #[test]
+    fn test_truncated_utf8_handling() {
+        // Create data with truncated multi-byte UTF-8 character at the end
+        // '€' is 3 bytes: 0xE2 0x82 0xAC
+        let mut data = br#"{"price": ""#.to_vec();
+        data.push(0xE2); // First byte of '€'
+        data.push(0x82); // Second byte of '€' - incomplete!
+
+        let result = parse_json(&data).unwrap();
+
+        if let PreviewData::Json(json) = result {
+            assert!(json.is_raw); // Should be raw since it's incomplete
+            assert!(json.content.contains("price")); // Should still have valid content
+        } else {
+            panic!("Expected raw JSON preview for truncated UTF-8");
         }
     }
 }
