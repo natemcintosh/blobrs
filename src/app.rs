@@ -73,7 +73,6 @@ pub enum EntryKind {
     Folder,
 }
 
-
 #[derive(Debug, Clone)]
 pub struct FileItem {
     pub display_name: String, // What to show in the UI (with icon)
@@ -87,8 +86,12 @@ pub struct FileItem {
 #[derive(Debug, Clone)]
 pub enum Modal {
     None,
-    BlobInfo { info: BlobInfo },
-    DownloadPicker { destination: Option<PathBuf> },
+    BlobInfo {
+        info: BlobInfo,
+    },
+    DownloadPicker {
+        destination: Option<PathBuf>,
+    },
     SortPicker,
     Clone {
         input: String,
@@ -372,231 +375,230 @@ impl App {
             }
         } else if self.is_browsing() {
             match key_event.code {
-                    KeyCode::Char('/') => {
-                        if !self.is_modal_blob_info() {
-                            self.enter_search_mode();
-                        }
+                KeyCode::Char('/') => {
+                    if !self.is_modal_blob_info() {
+                        self.enter_search_mode();
                     }
-                    KeyCode::Char('r') | KeyCode::F(5) => {
-                        if !self.is_modal_blob_info()
-                            && let Err(e) = self.refresh_files().await
-                        {
-                            self.error_message = Some(format!("Refresh failed: {e}"));
-                        }
+                }
+                KeyCode::Char('r') | KeyCode::F(5) => {
+                    if !self.is_modal_blob_info()
+                        && let Err(e) = self.refresh_files().await
+                    {
+                        self.error_message = Some(format!("Refresh failed: {e}"));
                     }
-                    KeyCode::Char('i') => {
-                        if !self.is_modal_blob_info()
-                            && !self.ui.show_preview
-                            && let Err(e) = self.show_blob_info().await
-                        {
-                            self.error_message = Some(format!("Failed to get blob info: {e}"));
-                        }
+                }
+                KeyCode::Char('i') => {
+                    if !self.is_modal_blob_info()
+                        && !self.ui.show_preview
+                        && let Err(e) = self.show_blob_info().await
+                    {
+                        self.error_message = Some(format!("Failed to get blob info: {e}"));
                     }
-                    KeyCode::Char('p') => {
-                        if !self.is_modal_blob_info()
-                            && !self.is_modal_download_picker()
-                            && !self.is_downloading()
-                            && !self.is_modal_sort_picker()
-                            && !self.is_modal_clone_dialog()
-                            && !self.is_cloning()
-                            && !self.is_modal_delete_dialog()
-                            && !self.is_deleting()
-                        {
-                            if self.ui.show_preview {
-                                // Toggle off
-                                self.close_preview();
-                            } else {
-                                // Toggle on - load preview
-                                if let Err(e) = self.load_preview().await {
-                                    self.error_message = Some(format!("Preview failed: {e}"));
-                                }
-                            }
-                        }
-                    }
-                    KeyCode::Char('d') => {
-                        if !self.is_modal_blob_info()
-                            && !self.is_modal_download_picker()
-                            && !self.is_downloading()
-                            && !self.is_modal_sort_picker()
-                        {
-                            self.show_download_picker();
-                        }
-                    }
-                    KeyCode::Char('s') => {
-                        if !self.is_modal_blob_info()
-                            && !self.is_modal_download_picker()
-                            && !self.is_downloading()
-                            && !self.is_modal_sort_picker()
-                        {
-                            self.modal = Modal::SortPicker;
-                        } else if self.is_modal_sort_picker() {
-                            // Handle sort selection
-                            if let Err(e) = self.apply_sort(SortCriteria::Size) {
-                                self.error_message = Some(format!("Failed to sort: {e}"));
-                            }
-                            self.close_modal();
-                        }
-                    }
-                    KeyCode::Char('n') => {
-                        if self.is_modal_sort_picker() {
-                            if let Err(e) = self.apply_sort(SortCriteria::Name) {
-                                self.error_message = Some(format!("Failed to sort: {e}"));
-                            }
-                            self.close_modal();
-                        }
-                    }
-                    KeyCode::Char('m') => {
-                        if self.is_modal_sort_picker() {
-                            if let Err(e) = self.apply_sort(SortCriteria::DateModified) {
-                                self.error_message = Some(format!("Failed to sort: {e}"));
-                            }
-                            self.close_modal();
-                        }
-                    }
-                    KeyCode::Char('t') => {
-                        if self.is_modal_sort_picker() {
-                            if let Err(e) = self.apply_sort(SortCriteria::DateCreated) {
-                                self.error_message = Some(format!("Failed to sort: {e}"));
-                            }
-                            self.close_modal();
-                        }
-                    }
-                    KeyCode::Char('y') => {
-                        if !self.is_modal_blob_info()
-                            && !self.is_modal_download_picker()
-                            && !self.is_downloading()
-                            && !self.is_modal_sort_picker()
-                            && !self.is_modal_clone_dialog()
-                            && !self.is_cloning()
-                        {
-                            // Copy blob path to clipboard
-                            if let Err(e) = self.copy_blob_path_to_clipboard() {
-                                self.error_message =
-                                    Some(format!("Failed to copy to clipboard: {e}"));
-                            }
-                        }
-                    }
-                    KeyCode::Char('c') => {
-                        if !self.is_modal_blob_info()
-                            && !self.is_modal_download_picker()
-                            && !self.is_downloading()
-                            && !self.is_modal_sort_picker()
-                            && !self.is_modal_clone_dialog()
-                            && !self.is_cloning()
-                            && !self.is_modal_delete_dialog()
-                            && !self.is_deleting()
-                        {
-                            // Open clone dialog
-                            self.open_clone_dialog();
-                        }
-                    }
-                    KeyCode::Char('x') | KeyCode::Delete => {
-                        if !self.is_modal_blob_info()
-                            && !self.is_modal_download_picker()
-                            && !self.is_downloading()
-                            && !self.is_modal_sort_picker()
-                            && !self.is_modal_clone_dialog()
-                            && !self.is_cloning()
-                            && !self.is_modal_delete_dialog()
-                            && !self.is_deleting()
-                        {
-                            // Open delete dialog
-                            self.open_delete_dialog();
-                        }
-                    }
-                    KeyCode::Up | KeyCode::Char('k') => {
+                }
+                KeyCode::Char('p') => {
+                    if !self.is_modal_blob_info()
+                        && !self.is_modal_download_picker()
+                        && !self.is_downloading()
+                        && !self.is_modal_sort_picker()
+                        && !self.is_modal_clone_dialog()
+                        && !self.is_cloning()
+                        && !self.is_modal_delete_dialog()
+                        && !self.is_deleting()
+                    {
                         if self.ui.show_preview {
-                            self.preview_scroll_up();
-                        } else if !self.is_modal_blob_info() && !self.is_modal_sort_picker() {
-                            self.move_up();
-                        }
-                    }
-                    KeyCode::Down | KeyCode::Char('j') => {
-                        if self.ui.show_preview {
-                            self.preview_scroll_down();
-                        } else if !self.is_modal_blob_info() && !self.is_modal_sort_picker() {
-                            self.move_down();
-                        }
-                    }
-                    KeyCode::Right | KeyCode::Char('l') | KeyCode::Enter => {
-                        if self.ui.show_preview {
-                            self.preview_scroll_right();
-                        } else if self.is_modal_download_picker() {
-                            if let Err(e) = self.confirm_download().await {
-                                self.error_message = Some(format!("Download failed: {e}"));
+                            // Toggle off
+                            self.close_preview();
+                        } else {
+                            // Toggle on - load preview
+                            if let Err(e) = self.load_preview().await {
+                                self.error_message = Some(format!("Preview failed: {e}"));
                             }
-                        } else if !self.is_modal_blob_info()
-                            && !self.is_modal_sort_picker()
-                            && let Err(e) = self.enter_directory().await
-                        {
-                            self.error_message = Some(format!("Enter directory failed: {e}"));
                         }
                     }
-                    KeyCode::Left | KeyCode::Char('h') => {
-                        if self.ui.show_preview {
-                            self.preview_scroll_left();
-                        } else if self.is_modal_download_picker() {
-                            // Close download picker
-                            self.close_modal();
-                        } else if self.is_modal_blob_info() {
-                            // Close popup
-                            self.close_modal();
-                        } else if self.is_modal_sort_picker() {
-                            // Close sort popup
-                            self.close_modal();
-                        } else if let Err(e) = self.go_up_directory().await {
+                }
+                KeyCode::Char('d') => {
+                    if !self.is_modal_blob_info()
+                        && !self.is_modal_download_picker()
+                        && !self.is_downloading()
+                        && !self.is_modal_sort_picker()
+                    {
+                        self.show_download_picker();
+                    }
+                }
+                KeyCode::Char('s') => {
+                    if !self.is_modal_blob_info()
+                        && !self.is_modal_download_picker()
+                        && !self.is_downloading()
+                        && !self.is_modal_sort_picker()
+                    {
+                        self.modal = Modal::SortPicker;
+                    } else if self.is_modal_sort_picker() {
+                        // Handle sort selection
+                        if let Err(e) = self.apply_sort(SortCriteria::Size) {
+                            self.error_message = Some(format!("Failed to sort: {e}"));
+                        }
+                        self.close_modal();
+                    }
+                }
+                KeyCode::Char('n') => {
+                    if self.is_modal_sort_picker() {
+                        if let Err(e) = self.apply_sort(SortCriteria::Name) {
+                            self.error_message = Some(format!("Failed to sort: {e}"));
+                        }
+                        self.close_modal();
+                    }
+                }
+                KeyCode::Char('m') => {
+                    if self.is_modal_sort_picker() {
+                        if let Err(e) = self.apply_sort(SortCriteria::DateModified) {
+                            self.error_message = Some(format!("Failed to sort: {e}"));
+                        }
+                        self.close_modal();
+                    }
+                }
+                KeyCode::Char('t') => {
+                    if self.is_modal_sort_picker() {
+                        if let Err(e) = self.apply_sort(SortCriteria::DateCreated) {
+                            self.error_message = Some(format!("Failed to sort: {e}"));
+                        }
+                        self.close_modal();
+                    }
+                }
+                KeyCode::Char('y') => {
+                    if !self.is_modal_blob_info()
+                        && !self.is_modal_download_picker()
+                        && !self.is_downloading()
+                        && !self.is_modal_sort_picker()
+                        && !self.is_modal_clone_dialog()
+                        && !self.is_cloning()
+                    {
+                        // Copy blob path to clipboard
+                        if let Err(e) = self.copy_blob_path_to_clipboard() {
+                            self.error_message = Some(format!("Failed to copy to clipboard: {e}"));
+                        }
+                    }
+                }
+                KeyCode::Char('c') => {
+                    if !self.is_modal_blob_info()
+                        && !self.is_modal_download_picker()
+                        && !self.is_downloading()
+                        && !self.is_modal_sort_picker()
+                        && !self.is_modal_clone_dialog()
+                        && !self.is_cloning()
+                        && !self.is_modal_delete_dialog()
+                        && !self.is_deleting()
+                    {
+                        // Open clone dialog
+                        self.open_clone_dialog();
+                    }
+                }
+                KeyCode::Char('x') | KeyCode::Delete => {
+                    if !self.is_modal_blob_info()
+                        && !self.is_modal_download_picker()
+                        && !self.is_downloading()
+                        && !self.is_modal_sort_picker()
+                        && !self.is_modal_clone_dialog()
+                        && !self.is_cloning()
+                        && !self.is_modal_delete_dialog()
+                        && !self.is_deleting()
+                    {
+                        // Open delete dialog
+                        self.open_delete_dialog();
+                    }
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    if self.ui.show_preview {
+                        self.preview_scroll_up();
+                    } else if !self.is_modal_blob_info() && !self.is_modal_sort_picker() {
+                        self.move_up();
+                    }
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    if self.ui.show_preview {
+                        self.preview_scroll_down();
+                    } else if !self.is_modal_blob_info() && !self.is_modal_sort_picker() {
+                        self.move_down();
+                    }
+                }
+                KeyCode::Right | KeyCode::Char('l') | KeyCode::Enter => {
+                    if self.ui.show_preview {
+                        self.preview_scroll_right();
+                    } else if self.is_modal_download_picker() {
+                        if let Err(e) = self.confirm_download().await {
+                            self.error_message = Some(format!("Download failed: {e}"));
+                        }
+                    } else if !self.is_modal_blob_info()
+                        && !self.is_modal_sort_picker()
+                        && let Err(e) = self.enter_directory().await
+                    {
+                        self.error_message = Some(format!("Enter directory failed: {e}"));
+                    }
+                }
+                KeyCode::Left | KeyCode::Char('h') => {
+                    if self.ui.show_preview {
+                        self.preview_scroll_left();
+                    } else if self.is_modal_download_picker() {
+                        // Close download picker
+                        self.close_modal();
+                    } else if self.is_modal_blob_info() {
+                        // Close popup
+                        self.close_modal();
+                    } else if self.is_modal_sort_picker() {
+                        // Close sort popup
+                        self.close_modal();
+                    } else if let Err(e) = self.go_up_directory().await {
+                        self.error_message = Some(format!("Go up failed: {e}"));
+                    }
+                }
+                KeyCode::Esc => {
+                    if self.ui.show_preview {
+                        // Close preview panel
+                        self.close_preview();
+                    } else if self.is_modal_download_picker() {
+                        // Close download picker
+                        self.close_modal();
+                    } else if self.is_modal_blob_info() {
+                        // Close popup
+                        self.close_modal();
+                    } else if self.is_modal_sort_picker() {
+                        // Close sort popup
+                        self.close_modal();
+                    } else if self
+                        .browsing()
+                        .is_some_and(|state| !state.current_path.is_empty())
+                    {
+                        // Go up one directory level if not at container root
+                        if let Err(e) = self.go_up_directory().await {
                             self.error_message = Some(format!("Go up failed: {e}"));
                         }
+                    } else {
+                        // At container root, go back to container selection
+                        self.session = Session::Selecting;
+                        self.search = Search::Inactive;
+                        self.close_modal();
                     }
-                    KeyCode::Esc => {
-                        if self.ui.show_preview {
-                            // Close preview panel
-                            self.close_preview();
-                        } else if self.is_modal_download_picker() {
-                            // Close download picker
-                            self.close_modal();
-                        } else if self.is_modal_blob_info() {
-                            // Close popup
-                            self.close_modal();
-                        } else if self.is_modal_sort_picker() {
-                            // Close sort popup
-                            self.close_modal();
-                        } else if self
-                            .browsing()
-                            .is_some_and(|state| !state.current_path.is_empty())
-                        {
-                            // Go up one directory level if not at container root
-                            if let Err(e) = self.go_up_directory().await {
-                                self.error_message = Some(format!("Go up failed: {e}"));
-                            }
-                        } else {
-                            // At container root, go back to container selection
-                            self.session = Session::Selecting;
-                            self.search = Search::Inactive;
-                            self.close_modal();
-                        }
+                }
+                KeyCode::Backspace => {
+                    if self.is_modal_download_picker() {
+                        // Close download picker
+                        self.close_modal();
+                    } else if self.is_modal_blob_info() {
+                        // Close popup
+                        self.close_modal();
+                    } else if self.is_modal_sort_picker() {
+                        // Close sort popup
+                        self.close_modal();
+                    } else {
+                        // Go back to container selection
+                        self.session = Session::Selecting;
+                        self.search = Search::Inactive;
+                        self.close_modal();
                     }
-                    KeyCode::Backspace => {
-                        if self.is_modal_download_picker() {
-                            // Close download picker
-                            self.close_modal();
-                        } else if self.is_modal_blob_info() {
-                            // Close popup
-                            self.close_modal();
-                        } else if self.is_modal_sort_picker() {
-                            // Close sort popup
-                            self.close_modal();
-                        } else {
-                            // Go back to container selection
-                            self.session = Session::Selecting;
-                            self.search = Search::Inactive;
-                            self.close_modal();
-                        }
-                    }
-                    _ => {
-                        self.error_message = None;
-                        self.success_message = None;
-                    }
+                }
+                _ => {
+                    self.error_message = None;
+                    self.success_message = None;
+                }
             }
         }
         Ok(())
@@ -699,7 +701,10 @@ impl App {
     fn blocks_input(&self) -> bool {
         matches!(
             self.async_op,
-            AsyncOp::LoadingContainers | AsyncOp::LoadingFiles | AsyncOp::Cloning(_) | AsyncOp::Deleting(_)
+            AsyncOp::LoadingContainers
+                | AsyncOp::LoadingFiles
+                | AsyncOp::Cloning(_)
+                | AsyncOp::Deleting(_)
         )
     }
 
@@ -1327,9 +1332,7 @@ impl App {
         key_event: KeyEvent,
     ) -> color_eyre::Result<()> {
         let Modal::DeleteConfirm {
-            input,
-            target_name,
-            ..
+            input, target_name, ..
         } = &mut self.modal
         else {
             return Ok(());
@@ -1990,9 +1993,15 @@ impl App {
         let blob_path = if browsing.current_path.is_empty() {
             blob_name.to_string()
         } else if browsing.current_path.ends_with('/') {
-            format!("{current_path}{blob_name}", current_path = browsing.current_path)
+            format!(
+                "{current_path}{blob_name}",
+                current_path = browsing.current_path
+            )
         } else {
-            format!("{current_path}/{blob_name}", current_path = browsing.current_path)
+            format!(
+                "{current_path}/{blob_name}",
+                current_path = browsing.current_path
+            )
         };
 
         let object_path = ObjectPath::from(blob_path.as_str());
@@ -2007,9 +2016,7 @@ impl App {
                     .to_string(),
                 etag: meta.e_tag.clone(),
             }),
-            Err(e) => Err(color_eyre::eyre::eyre!(
-                "Failed to get blob metadata: {e}",
-            )),
+            Err(e) => Err(color_eyre::eyre::eyre!("Failed to get blob metadata: {e}",)),
         }
     }
 
@@ -2179,9 +2186,15 @@ impl App {
         let blob_path = if browsing.current_path.is_empty() {
             file_name.to_string()
         } else if browsing.current_path.ends_with('/') {
-            format!("{current_path}{file_name}", current_path = browsing.current_path)
+            format!(
+                "{current_path}{file_name}",
+                current_path = browsing.current_path
+            )
         } else {
-            format!("{current_path}/{file_name}", current_path = browsing.current_path)
+            format!(
+                "{current_path}/{file_name}",
+                current_path = browsing.current_path
+            )
         };
 
         let object_path = ObjectPath::from(blob_path.as_str());
@@ -2561,7 +2574,9 @@ impl App {
 
 #[cfg(test)]
 mod tests {
-    use super::{App, AsyncOp, BrowsingState, EntryKind, Modal, Search, Session, SortCriteria};
+    use super::{
+        App, AsyncOp, BrowsingState, EntryKind, Modal, Search, Session, SortCriteria, UiToggles,
+    };
     use crate::event::EventHandler;
     use crate::terminal_icons::detect_terminal_icons;
 
@@ -2724,7 +2739,10 @@ mod tests {
         app.enter_container_search_mode();
 
         match &app.search {
-            Search::Containers { query, all_containers } => {
+            Search::Containers {
+                query,
+                all_containers,
+            } => {
                 assert!(query.is_empty());
                 assert_eq!(all_containers.len(), 2);
             }

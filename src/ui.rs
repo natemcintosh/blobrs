@@ -28,14 +28,14 @@ impl Widget for &App {
                         is_folder,
                         ..
                     } => {
-                        self.render_delete_dialog_popup(area, buf, input, target_name, *is_folder);
+                        App::render_delete_dialog_popup(area, buf, input, target_name, *is_folder);
                     }
                     Modal::Clone {
                         input,
                         original_path,
                         is_folder,
                     } => {
-                        self.render_clone_dialog_popup(area, buf, input, original_path, *is_folder);
+                        App::render_clone_dialog_popup(area, buf, input, original_path, *is_folder);
                     }
                     Modal::BlobInfo { info } => {
                         self.render_blob_info_popup(area, buf, info);
@@ -48,13 +48,13 @@ impl Widget for &App {
                     }
                     Modal::None => match &self.async_op {
                         AsyncOp::Deleting(progress) => {
-                            Self::render_delete_progress_popup(area, buf, progress);
+                            App::render_delete_progress_popup(area, buf, progress);
                         }
                         AsyncOp::Cloning(progress) => {
-                            Self::render_clone_progress_popup(area, buf, progress);
+                            App::render_clone_progress_popup(area, buf, progress);
                         }
                         AsyncOp::Downloading(progress) => {
-                            Self::render_download_progress_popup(area, buf, progress);
+                            App::render_download_progress_popup(area, buf, progress);
                         }
                         _ => {}
                     },
@@ -107,15 +107,17 @@ impl App {
         }
 
         // Add space for error or success message if present
-        if self.error_message.is_some() || self.success_message.is_some() || self.is_loading_containers() {
+        if self.error_message.is_some()
+            || self.success_message.is_some()
+            || self.is_loading_containers()
+        {
             // Calculate height based on message length and terminal width
             #[allow(clippy::cast_possible_truncation)] // UI text lengths are always small
             let message_height = if let Some(error) = &self.error_message {
                 // Estimate lines needed: error length / (width - padding), min 3, max 8
                 let available_width = area.width.saturating_sub(4); // Account for borders and padding
                 if available_width > 0 {
-                    ((error.len()
-                        + format!("{error_icon} ", error_icon = self.icons.error).len())
+                    ((error.len() + format!("{error_icon} ", error_icon = self.icons.error).len())
                         as u16)
                         .div_ceil(available_width)
                         .clamp(3, 8)
@@ -154,9 +156,7 @@ impl App {
                 loading = self.icons.loading
             ))]
         } else if self.containers.is_empty() {
-            let has_query = self
-                .container_search_query()
-                .is_some_and(|q| !q.is_empty());
+            let has_query = self.container_search_query().is_some_and(|q| !q.is_empty());
             if self.is_searching_containers() && has_query {
                 vec![ListItem::new(format!(
                     "{search} No containers found matching search",
@@ -230,12 +230,14 @@ impl App {
 
         // Error/Success/Loading message if present
         if let Some(error) = &self.error_message {
-            let error_widget =
-                Paragraph::new(format!("{error_icon} {error}", error_icon = self.icons.error))
-                .block(Block::bordered().border_type(BorderType::Rounded))
-                .fg(Color::Red)
-                .wrap(ratatui::widgets::Wrap { trim: true })
-                .alignment(Alignment::Left);
+            let error_widget = Paragraph::new(format!(
+                "{error_icon} {error}",
+                error_icon = self.icons.error
+            ))
+            .block(Block::bordered().border_type(BorderType::Rounded))
+            .fg(Color::Red)
+            .wrap(ratatui::widgets::Wrap { trim: true })
+            .alignment(Alignment::Left);
             error_widget.render(chunks[chunk_index], buf);
             chunk_index += 1;
         } else if let Some(success) = &self.success_message {
@@ -243,10 +245,10 @@ impl App {
                 "{success_icon} {success}",
                 success_icon = self.icons.success
             ))
-                .block(Block::bordered().border_type(BorderType::Rounded))
-                .fg(Color::Green)
-                .wrap(ratatui::widgets::Wrap { trim: true })
-                .alignment(Alignment::Left);
+            .block(Block::bordered().border_type(BorderType::Rounded))
+            .fg(Color::Green)
+            .wrap(ratatui::widgets::Wrap { trim: true })
+            .alignment(Alignment::Left);
             success_widget.render(chunks[chunk_index], buf);
             chunk_index += 1;
         } else if self.is_loading_containers() {
@@ -298,15 +300,15 @@ impl App {
         }
 
         // Add space for error or success message if present
-        if self.error_message.is_some() || self.success_message.is_some() || self.is_loading_files() {
+        if self.error_message.is_some() || self.success_message.is_some() || self.is_loading_files()
+        {
             // Calculate height based on message length and terminal width
             #[allow(clippy::cast_possible_truncation)] // UI text lengths are always small
             let message_height = if let Some(error) = &self.error_message {
                 // Estimate lines needed: error length / (width - padding), min 3, max 8
                 let available_width = area.width.saturating_sub(4); // Account for borders and padding
                 if available_width > 0 {
-                    ((error.len()
-                        + format!("{error_icon} ", error_icon = self.icons.error).len())
+                    ((error.len() + format!("{error_icon} ", error_icon = self.icons.error).len())
                         as u16)
                         .div_ceil(available_width)
                         .clamp(3, 8)
@@ -360,9 +362,7 @@ impl App {
                 loading = self.icons.loading
             ))]
         } else if browsing.files.is_empty() {
-            let has_query = self
-                .file_search_query()
-                .is_some_and(|q| !q.is_empty());
+            let has_query = self.file_search_query().is_some_and(|q| !q.is_empty());
             if self.is_searching_files() && has_query {
                 vec![ListItem::new(format!(
                     "{search} No results found",
@@ -375,7 +375,8 @@ impl App {
                 ))]
             }
         } else {
-            browsing.files
+            browsing
+                .files
                 .iter()
                 .map(|file| ListItem::new(file.as_str()))
                 .collect()
@@ -389,7 +390,10 @@ impl App {
         let current_path_display = if browsing.current_path.is_empty() {
             "/ (root)".to_string()
         } else {
-            format!("/{path}", path = browsing.current_path.trim_end_matches('/'))
+            format!(
+                "/{path}",
+                path = browsing.current_path.trim_end_matches('/')
+            )
         };
 
         let container_name =
@@ -453,12 +457,14 @@ impl App {
 
         // Error/Success/Loading message if present
         if let Some(error) = &self.error_message {
-            let error_widget =
-                Paragraph::new(format!("{error_icon} {error}", error_icon = self.icons.error))
-                .block(Block::bordered().border_type(BorderType::Rounded))
-                .fg(Color::Red)
-                .wrap(ratatui::widgets::Wrap { trim: true })
-                .alignment(Alignment::Left);
+            let error_widget = Paragraph::new(format!(
+                "{error_icon} {error}",
+                error_icon = self.icons.error
+            ))
+            .block(Block::bordered().border_type(BorderType::Rounded))
+            .fg(Color::Red)
+            .wrap(ratatui::widgets::Wrap { trim: true })
+            .alignment(Alignment::Left);
             error_widget.render(chunks[chunk_index], buf);
             chunk_index += 1;
         } else if let Some(success) = &self.success_message {
@@ -466,10 +472,10 @@ impl App {
                 "{success_icon} {success}",
                 success_icon = self.icons.success
             ))
-                .block(Block::bordered().border_type(BorderType::Rounded))
-                .fg(Color::Green)
-                .wrap(ratatui::widgets::Wrap { trim: true })
-                .alignment(Alignment::Left);
+            .block(Block::bordered().border_type(BorderType::Rounded))
+            .fg(Color::Green)
+            .wrap(ratatui::widgets::Wrap { trim: true })
+            .alignment(Alignment::Left);
             success_widget.render(chunks[chunk_index], buf);
             chunk_index += 1;
         } else if self.is_loading_files() {
@@ -494,7 +500,12 @@ impl App {
         footer.render(chunks[chunk_index], buf);
     }
 
-    fn render_blob_info_popup(&self, area: Rect, buf: &mut Buffer, blob_info: &crate::app::BlobInfo) {
+    fn render_blob_info_popup(
+        &self,
+        area: Rect,
+        buf: &mut Buffer,
+        blob_info: &crate::app::BlobInfo,
+    ) {
         // Calculate popup size and position
         let popup_width = area.width.clamp(40, 60); // Between 40 and 60 characters wide
         let popup_height = area.height.clamp(10, 20); // Between 10 and 20 lines tall
@@ -683,7 +694,6 @@ impl App {
 
     /// Render the download progress popup.
     fn render_download_progress_popup(
-        &self,
         area: Rect,
         buf: &mut Buffer,
         progress: &crate::app::DownloadProgress,
@@ -808,7 +818,6 @@ impl App {
 
     /// Render the clone dialog popup.
     fn render_clone_dialog_popup(
-        &self,
         area: Rect,
         buf: &mut Buffer,
         input: &str,
@@ -818,11 +827,7 @@ impl App {
         // Calculate popup size
         let popup_width = (area.width * 3 / 4).min(70);
 
-        let item_type = if is_folder {
-            "folder"
-        } else {
-            "blob"
-        };
+        let item_type = if is_folder { "folder" } else { "blob" };
         let can_confirm = input != original_path && !input.is_empty();
 
         let enter_hint = if can_confirm {
@@ -927,7 +932,6 @@ impl App {
 
     /// Render the clone progress popup.
     fn render_clone_progress_popup(
-        &self,
         area: Rect,
         buf: &mut Buffer,
         progress: &crate::app::CloneProgress,
@@ -983,7 +987,6 @@ impl App {
 
     /// Render the delete confirmation dialog popup.
     fn render_delete_dialog_popup(
-        &self,
         area: Rect,
         buf: &mut Buffer,
         input: &str,
@@ -1009,11 +1012,7 @@ impl App {
             }
         }
 
-        let item_type = if is_folder {
-            "folder"
-        } else {
-            "blob"
-        };
+        let item_type = if is_folder { "folder" } else { "blob" };
         let can_confirm = input == target_name;
 
         let enter_hint = if can_confirm {
@@ -1073,7 +1072,6 @@ impl App {
 
     /// Render the delete progress popup.
     fn render_delete_progress_popup(
-        &self,
         area: Rect,
         buf: &mut Buffer,
         progress: &crate::app::DeleteProgress,
@@ -1196,7 +1194,7 @@ impl App {
     }
 
     /// Render a table preview (for CSV, TSV, or JSON array of objects).
-    #[allow(clippy::cast_possible_truncation)]
+    #[allow(clippy::cast_possible_truncation, clippy::too_many_lines)]
     fn render_table_preview(
         &self,
         area: Rect,

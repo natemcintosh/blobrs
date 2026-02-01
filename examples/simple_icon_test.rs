@@ -24,7 +24,7 @@ fn main() {
         "[DIR] [FILE] [LOADING] [ERROR] [OK]"
     };
 
-    println!("\n🎭 Detected Icons: {}", icons);
+    println!("\n🎭 Detected Icons: {icons}");
 }
 
 fn is_unicode_capable() -> bool {
