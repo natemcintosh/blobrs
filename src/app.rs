@@ -223,7 +223,7 @@ impl std::fmt::Debug for App {
             .field("preview_scroll", &self.preview_scroll)
             .field("preview_error", &self.preview_error)
             .field("preview_selected_row", &self.preview_selected_row)
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -303,6 +303,7 @@ impl App {
     /// # Errors
     ///
     /// Returns an error if an async operation triggered by a key event fails.
+    #[allow(clippy::too_many_lines)]
     pub async fn handle_key_event(&mut self, key_event: KeyEvent) -> color_eyre::Result<()> {
         // Handle delete dialog separately
         if self.is_modal_delete_dialog() {
@@ -562,8 +563,7 @@ impl App {
                             self.close_modal();
                         } else if self
                             .browsing()
-                            .map(|state| !state.current_path.is_empty())
-                            .unwrap_or(false)
+                            .is_some_and(|state| !state.current_path.is_empty())
                         {
                             // Go up one directory level if not at container root
                             if let Err(e) = self.go_up_directory().await {
@@ -619,14 +619,14 @@ impl App {
     pub(crate) fn browsing(&self) -> Option<&BrowsingState> {
         match &self.session {
             Session::Browsing(state) => Some(state),
-            _ => None,
+            Session::Selecting => None,
         }
     }
 
     fn browsing_mut(&mut self) -> Option<&mut BrowsingState> {
         match &mut self.session {
             Session::Browsing(state) => Some(state),
-            _ => None,
+            Session::Selecting => None,
         }
     }
 
@@ -729,7 +729,7 @@ impl App {
             let name = prefix.as_ref().trim_end_matches('/');
             if let Some(last_part) = name.split('/').next_back() {
                 items.push(FileItem {
-                    display_name: format!("{} {}", self.icons.folder, last_part),
+                    display_name: format!("{folder} {last_part}", folder = self.icons.folder),
                     actual_name: last_part.to_string(),
                     kind: EntryKind::Folder,
                     size: None,
@@ -744,7 +744,7 @@ impl App {
             let name = meta.location.as_ref();
             if let Some(last_part) = name.split('/').next_back() {
                 items.push(FileItem {
-                    display_name: format!("{} {}", self.icons.file, last_part),
+                    display_name: format!("{file} {last_part}", file = self.icons.file),
                     actual_name: last_part.to_string(),
                     kind: EntryKind::File,
                     size: Some(meta.size),
@@ -880,12 +880,14 @@ impl App {
                 }
 
                 if let Some(query) = search_query {
-                    if !query.is_empty() {
+                    if query.is_empty() {
+                        if let Some(state) = self.browsing_mut() {
+                            state.file_items = file_items;
+                            state.files = files;
+                            state.selected_index = 0;
+                        }
+                    } else {
                         self.apply_file_search(&query);
-                    } else if let Some(state) = self.browsing_mut() {
-                        state.file_items = file_items;
-                        state.files = files;
-                        state.selected_index = 0;
                     }
                 } else if let Some(state) = self.browsing_mut() {
                     state.file_items = file_items;
@@ -943,14 +945,14 @@ impl App {
             return Ok(());
         }
         // Check if the selected item is a directory (starts with folder icon)
-        let folder_prefix = format!("{} ", self.icons.folder);
+        let folder_prefix = format!("{folder} ", folder = self.icons.folder);
         if let Some(dir_name) = selected_file.strip_prefix(&folder_prefix) {
             let new_path = if current_path.is_empty() {
                 format!("{dir_name}/")
             } else if current_path.ends_with('/') {
-                format!("{}{}/", current_path, dir_name)
+                format!("{current_path}{dir_name}/")
             } else {
-                format!("{}/{}/", current_path, dir_name)
+                format!("{current_path}/{dir_name}/")
             };
 
             if let Some(state) = self.browsing_mut() {
@@ -984,7 +986,8 @@ impl App {
         let trimmed = current_path.trim_end_matches('/');
         if let Some(last_slash) = trimmed.rfind('/') {
             if let Some(state) = self.browsing_mut() {
-                state.current_path = format!("{}/", &trimmed[..last_slash]);
+                let new_path = &trimmed[..last_slash];
+                state.current_path = format!("{new_path}/");
             }
         } else if let Some(state) = self.browsing_mut() {
             state.current_path = String::new(); // Go to root
@@ -1039,9 +1042,8 @@ impl App {
     ///
     /// This function currently does not return errors but uses `Result` for API consistency.
     pub fn handle_search_key_event(&mut self, key_event: KeyEvent) -> color_eyre::Result<()> {
-        let query = match &mut self.search {
-            Search::Files { query, .. } => query,
-            _ => return Ok(()),
+        let Search::Files { query, .. } = &mut self.search else {
+            return Ok(());
         };
 
         match key_event.code {
@@ -1082,13 +1084,13 @@ impl App {
         &mut self,
         key_event: KeyEvent,
     ) -> color_eyre::Result<()> {
-        let (input, original_path, _is_folder) = match &mut self.modal {
-            Modal::Clone {
-                input,
-                original_path,
-                is_folder,
-            } => (input, original_path, is_folder),
-            _ => return Ok(()),
+        let Modal::Clone {
+            input,
+            original_path,
+            is_folder: _is_folder,
+        } = &mut self.modal
+        else {
+            return Ok(());
         };
 
         match key_event.code {
@@ -1131,8 +1133,8 @@ impl App {
         };
 
         let selected_file = selected_file.as_str();
-        let folder_prefix = format!("{} ", self.icons.folder);
-        let file_prefix = format!("{} ", self.icons.file);
+        let folder_prefix = format!("{folder} ", folder = self.icons.folder);
+        let file_prefix = format!("{file} ", file = self.icons.file);
 
         let (item_name, is_folder) = if selected_file.starts_with(&folder_prefix) {
             let name = selected_file
@@ -1155,14 +1157,14 @@ impl App {
             }
         } else if current_path.ends_with('/') {
             if is_folder {
-                format!("{}{}/", current_path, item_name)
+                format!("{current_path}{item_name}/")
             } else {
-                format!("{}{}", current_path, item_name)
+                format!("{current_path}{item_name}")
             }
         } else if is_folder {
-            format!("{}/{}/", current_path, item_name)
+            format!("{current_path}/{item_name}/")
         } else {
-            format!("{}/{}", current_path, item_name)
+            format!("{current_path}/{item_name}")
         };
 
         self.modal = Modal::Clone {
@@ -1324,13 +1326,13 @@ impl App {
         &mut self,
         key_event: KeyEvent,
     ) -> color_eyre::Result<()> {
-        let (input, target_name) = match &mut self.modal {
-            Modal::DeleteConfirm {
-                input,
-                target_name,
-                ..
-            } => (input, target_name),
-            _ => return Ok(()),
+        let Modal::DeleteConfirm {
+            input,
+            target_name,
+            ..
+        } = &mut self.modal
+        else {
+            return Ok(());
         };
 
         match key_event.code {
@@ -1373,8 +1375,8 @@ impl App {
         };
 
         let selected_file = selected_file.as_str();
-        let folder_prefix = format!("{} ", self.icons.folder);
-        let file_prefix = format!("{} ", self.icons.file);
+        let folder_prefix = format!("{folder} ", folder = self.icons.folder);
+        let file_prefix = format!("{file} ", file = self.icons.file);
 
         let (item_name, is_folder) = if selected_file.starts_with(&folder_prefix) {
             let name = selected_file
@@ -1397,14 +1399,14 @@ impl App {
             }
         } else if current_path.ends_with('/') {
             if is_folder {
-                format!("{}{}/", current_path, item_name)
+                format!("{current_path}{item_name}/")
             } else {
-                format!("{}{}", current_path, item_name)
+                format!("{current_path}{item_name}")
             }
         } else if is_folder {
-            format!("{}/{}/", current_path, item_name)
+            format!("{current_path}/{item_name}/")
         } else {
-            format!("{}/{}", current_path, item_name)
+            format!("{current_path}/{item_name}")
         };
 
         self.modal = Modal::DeleteConfirm {
@@ -1631,11 +1633,11 @@ impl App {
                 }
 
                 if let Some(query) = search_query {
-                    if !query.is_empty() {
-                        self.apply_container_search(&query);
-                    } else {
+                    if query.is_empty() {
                         self.containers = containers;
                         self.selected_container_index = 0;
+                    } else {
+                        self.apply_container_search(&query);
                     }
                 } else {
                     self.containers = containers;
@@ -1849,9 +1851,8 @@ impl App {
         &mut self,
         key_event: KeyEvent,
     ) -> color_eyre::Result<()> {
-        let query = match &mut self.search {
-            Search::Containers { query, .. } => query,
-            _ => return Ok(()),
+        let Search::Containers { query, .. } = &mut self.search else {
+            return Ok(());
         };
 
         match key_event.code {
@@ -1911,8 +1912,8 @@ impl App {
         if selected_file.is_empty() {
             return Ok(());
         }
-        let folder_prefix = format!("{} ", self.icons.folder);
-        let file_prefix = format!("{} ", self.icons.file);
+        let folder_prefix = format!("{folder} ", folder = self.icons.folder);
+        let file_prefix = format!("{file} ", file = self.icons.file);
 
         let is_folder = selected_file.starts_with(&folder_prefix);
         let name = if is_folder {
@@ -1947,9 +1948,15 @@ impl App {
         let folder_path = if browsing.current_path.is_empty() {
             format!("{folder_name}/")
         } else if browsing.current_path.ends_with('/') {
-            format!("{}{}/", browsing.current_path, folder_name)
+            format!(
+                "{current_path}{folder_name}/",
+                current_path = browsing.current_path
+            )
         } else {
-            format!("{}/{}/", browsing.current_path, folder_name)
+            format!(
+                "{current_path}/{folder_name}/",
+                current_path = browsing.current_path
+            )
         };
 
         let object_path = ObjectPath::from(folder_path.as_str());
@@ -1983,9 +1990,9 @@ impl App {
         let blob_path = if browsing.current_path.is_empty() {
             blob_name.to_string()
         } else if browsing.current_path.ends_with('/') {
-            format!("{}{}", browsing.current_path, blob_name)
+            format!("{current_path}{blob_name}", current_path = browsing.current_path)
         } else {
-            format!("{}/{}", browsing.current_path, blob_name)
+            format!("{current_path}/{blob_name}", current_path = browsing.current_path)
         };
 
         let object_path = ObjectPath::from(blob_path.as_str());
@@ -2001,8 +2008,7 @@ impl App {
                 etag: meta.e_tag.clone(),
             }),
             Err(e) => Err(color_eyre::eyre::eyre!(
-                "Failed to get blob metadata: {}",
-                e
+                "Failed to get blob metadata: {e}",
             )),
         }
     }
@@ -2029,8 +2035,8 @@ impl App {
         if selected_file.is_empty() {
             return Ok(());
         }
-        let folder_prefix = format!("{} ", self.icons.folder);
-        let file_prefix = format!("{} ", self.icons.file);
+        let folder_prefix = format!("{folder} ", folder = self.icons.folder);
+        let file_prefix = format!("{file} ", file = self.icons.file);
         let selected_file = selected_file.as_str();
 
         let (item_name, is_folder) = if selected_file.starts_with(&folder_prefix) {
@@ -2060,14 +2066,14 @@ impl App {
             }
         } else if current_path.ends_with('/') {
             if is_folder {
-                format!("{}{}/", current_path, item_name)
+                format!("{current_path}{item_name}/")
             } else {
-                format!("{}{}", current_path, item_name)
+                format!("{current_path}{item_name}")
             }
         } else if is_folder {
-            format!("{}/{}/", current_path, item_name)
+            format!("{current_path}/{item_name}/")
         } else {
-            format!("{}/{}", current_path, item_name)
+            format!("{current_path}/{item_name}")
         };
 
         // Copy to clipboard
@@ -2120,9 +2126,11 @@ impl App {
             return Ok(());
         }
 
-        let destination = destination.expect("destination checked");
-        let folder_prefix = format!("{} ", self.icons.folder);
-        let file_prefix = format!("{} ", self.icons.file);
+        let Some(destination) = destination else {
+            return Ok(());
+        };
+        let folder_prefix = format!("{folder} ", folder = self.icons.folder);
+        let file_prefix = format!("{file} ", file = self.icons.file);
 
         let is_folder = selected_file.starts_with(&folder_prefix);
         let name = if is_folder {
@@ -2171,9 +2179,9 @@ impl App {
         let blob_path = if browsing.current_path.is_empty() {
             file_name.to_string()
         } else if browsing.current_path.ends_with('/') {
-            format!("{}{}", browsing.current_path, file_name)
+            format!("{current_path}{file_name}", current_path = browsing.current_path)
         } else {
-            format!("{}/{}", browsing.current_path, file_name)
+            format!("{current_path}/{file_name}", current_path = browsing.current_path)
         };
 
         let object_path = ObjectPath::from(blob_path.as_str());
@@ -2239,9 +2247,15 @@ impl App {
         let folder_path = if browsing.current_path.is_empty() {
             format!("{folder_name}/")
         } else if browsing.current_path.ends_with('/') {
-            format!("{}{}/", browsing.current_path, folder_name)
+            format!(
+                "{current_path}{folder_name}/",
+                current_path = browsing.current_path
+            )
         } else {
-            format!("{}/{}/", browsing.current_path, folder_name)
+            format!(
+                "{current_path}/{folder_name}/",
+                current_path = browsing.current_path
+            )
         };
 
         let object_path = ObjectPath::from(folder_path.as_str());
@@ -2364,6 +2378,7 @@ impl App {
     /// # Errors
     ///
     /// Returns an error if fetching or parsing the file fails.
+    #[allow(clippy::too_many_lines)]
     pub async fn load_preview(&mut self) -> color_eyre::Result<()> {
         let (selected_file, current_path) = match self.browsing() {
             Some(state) => {
@@ -2381,8 +2396,8 @@ impl App {
         if selected_file.is_empty() {
             return Ok(());
         }
-        let folder_prefix = format!("{} ", self.icons.folder);
-        let file_prefix = format!("{} ", self.icons.file);
+        let folder_prefix = format!("{folder} ", folder = self.icons.folder);
+        let file_prefix = format!("{file} ", file = self.icons.file);
 
         // Check if it's a folder
         if selected_file.starts_with(&folder_prefix) {
@@ -2425,9 +2440,9 @@ impl App {
         let blob_path = if current_path.is_empty() {
             name.to_string()
         } else if current_path.ends_with('/') {
-            format!("{}{}", current_path, name)
+            format!("{current_path}{name}")
         } else {
-            format!("{}/{}", current_path, name)
+            format!("{current_path}/{name}")
         };
 
         let object_path = ObjectPath::from(blob_path.as_str());
@@ -2584,7 +2599,7 @@ mod tests {
         app.session = Session::Browsing(BrowsingState {
             object_store: std::sync::Arc::new(object_store::memory::InMemory::new()),
             current_path: String::new(),
-            files: vec![format!("{} file.txt", app.icons.file)],
+            files: vec![format!("{file} file.txt", file = app.icons.file)],
             file_items: Vec::new(),
             selected_index: 0,
         });
@@ -2611,7 +2626,7 @@ mod tests {
         app.session = Session::Browsing(BrowsingState {
             object_store: std::sync::Arc::new(object_store::memory::InMemory::new()),
             current_path: String::new(),
-            files: vec![format!("{} logs", app.icons.folder)],
+            files: vec![format!("{folder} logs", folder = app.icons.folder)],
             file_items: Vec::new(),
             selected_index: 0,
         });
@@ -2640,7 +2655,7 @@ mod tests {
         app.session = Session::Browsing(BrowsingState {
             object_store: std::sync::Arc::new(object_store::memory::InMemory::new()),
             current_path: String::new(),
-            files: vec![format!("{} report.csv", app.icons.file)],
+            files: vec![format!("{file} report.csv", file = app.icons.file)],
             file_items: Vec::new(),
             selected_index: 0,
         });

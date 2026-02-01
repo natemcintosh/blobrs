@@ -48,13 +48,13 @@ impl Widget for &App {
                     }
                     Modal::None => match &self.async_op {
                         AsyncOp::Deleting(progress) => {
-                            self.render_delete_progress_popup(area, buf, progress);
+                            Self::render_delete_progress_popup(area, buf, progress);
                         }
                         AsyncOp::Cloning(progress) => {
-                            self.render_clone_progress_popup(area, buf, progress);
+                            Self::render_clone_progress_popup(area, buf, progress);
                         }
                         AsyncOp::Downloading(progress) => {
-                            self.render_download_progress_popup(area, buf, progress);
+                            Self::render_download_progress_popup(area, buf, progress);
                         }
                         _ => {}
                     },
@@ -86,6 +86,7 @@ impl App {
         lines_needed + 2
     }
 
+    #[allow(clippy::too_many_lines)]
     fn render_container_selection(&self, area: Rect, buf: &mut Buffer) {
         // Calculate footer height based on instruction text
         let instructions = if self.is_searching_containers() {
@@ -113,7 +114,9 @@ impl App {
                 // Estimate lines needed: error length / (width - padding), min 3, max 8
                 let available_width = area.width.saturating_sub(4); // Account for borders and padding
                 if available_width > 0 {
-                    ((error.len() + format!("{} ", self.icons.error).len()) as u16)
+                    ((error.len()
+                        + format!("{error_icon} ", error_icon = self.icons.error).len())
+                        as u16)
                         .div_ceil(available_width)
                         .clamp(3, 8)
                 } else {
@@ -123,7 +126,9 @@ impl App {
                 // Estimate lines needed: success length / (width - padding), min 3, max 8
                 let available_width = area.width.saturating_sub(4); // Account for borders and padding
                 if available_width > 0 {
-                    ((success.len() + format!("{} ", self.icons.success).len()) as u16)
+                    ((success.len()
+                        + format!("{success_icon} ", success_icon = self.icons.success).len())
+                        as u16)
                         .div_ceil(available_width)
                         .clamp(3, 8)
                 } else {
@@ -145,29 +150,31 @@ impl App {
         // Container list
         let container_items: Vec<ListItem> = if self.is_loading_containers() {
             vec![ListItem::new(format!(
-                "{} Loading containers...",
-                self.icons.loading
+                "{loading} Loading containers...",
+                loading = self.icons.loading
             ))]
         } else if self.containers.is_empty() {
             let has_query = self
                 .container_search_query()
-                .map(|q| !q.is_empty())
-                .unwrap_or(false);
+                .is_some_and(|q| !q.is_empty());
             if self.is_searching_containers() && has_query {
                 vec![ListItem::new(format!(
-                    "{} No containers found matching search",
-                    self.icons.search
+                    "{search} No containers found matching search",
+                    search = self.icons.search
                 ))]
             } else {
                 vec![ListItem::new(format!(
-                    "{} No containers found",
-                    self.icons.empty
+                    "{empty} No containers found",
+                    empty = self.icons.empty
                 ))]
             }
         } else {
             self.containers
                 .iter()
-                .map(|container| ListItem::new(format!("{} {}", self.icons.folder, container.name)))
+                .map(|container| {
+                    let name = &container.name;
+                    ListItem::new(format!("{folder} {name}", folder = self.icons.folder))
+                })
                 .collect()
         };
 
@@ -178,15 +185,15 @@ impl App {
 
         let title = if self.is_searching_containers() {
             format!(
-                " Azure Storage Account: {} - Select Container [SEARCH] ({} shown) ",
-                self.storage_account,
-                self.containers.len()
+                " Azure Storage Account: {account} - Select Container [SEARCH] ({count} shown) ",
+                account = self.storage_account,
+                count = self.containers.len()
             )
         } else {
             format!(
-                " Azure Storage Account: {} - Select Container ({} containers) ",
-                self.storage_account,
-                self.containers.len()
+                " Azure Storage Account: {account} - Select Container ({count} containers) ",
+                account = self.storage_account,
+                count = self.containers.len()
             )
         };
 
@@ -208,7 +215,7 @@ impl App {
         // Search input if in container search mode
         if self.is_searching_containers() {
             let query = self.container_search_query().unwrap_or("");
-            let search_text = format!("Search: {}", query);
+            let search_text = format!("Search: {query}");
             let search_widget = Paragraph::new(search_text)
                 .block(
                     Block::bordered()
@@ -223,7 +230,8 @@ impl App {
 
         // Error/Success/Loading message if present
         if let Some(error) = &self.error_message {
-            let error_widget = Paragraph::new(format!("{} {}", self.icons.error, error))
+            let error_widget =
+                Paragraph::new(format!("{error_icon} {error}", error_icon = self.icons.error))
                 .block(Block::bordered().border_type(BorderType::Rounded))
                 .fg(Color::Red)
                 .wrap(ratatui::widgets::Wrap { trim: true })
@@ -231,7 +239,10 @@ impl App {
             error_widget.render(chunks[chunk_index], buf);
             chunk_index += 1;
         } else if let Some(success) = &self.success_message {
-            let success_widget = Paragraph::new(format!("{} {}", self.icons.success, success))
+            let success_widget = Paragraph::new(format!(
+                "{success_icon} {success}",
+                success_icon = self.icons.success
+            ))
                 .block(Block::bordered().border_type(BorderType::Rounded))
                 .fg(Color::Green)
                 .wrap(ratatui::widgets::Wrap { trim: true })
@@ -239,11 +250,13 @@ impl App {
             success_widget.render(chunks[chunk_index], buf);
             chunk_index += 1;
         } else if self.is_loading_containers() {
-            let loading_widget =
-                Paragraph::new(format!("{} Loading containers...", self.icons.loading))
-                    .block(Block::bordered().border_type(BorderType::Rounded))
-                    .fg(Color::Yellow)
-                    .alignment(Alignment::Center);
+            let loading_widget = Paragraph::new(format!(
+                "{loading} Loading containers...",
+                loading = self.icons.loading
+            ))
+            .block(Block::bordered().border_type(BorderType::Rounded))
+            .fg(Color::Yellow)
+            .alignment(Alignment::Center);
             loading_widget.render(chunks[chunk_index], buf);
             chunk_index += 1;
         }
@@ -258,6 +271,7 @@ impl App {
         footer.render(chunks[chunk_index], buf);
     }
 
+    #[allow(clippy::too_many_lines)]
     fn render_blob_browsing(&self, area: Rect, buf: &mut Buffer) {
         let Some(browsing) = self.browsing() else {
             return;
@@ -291,7 +305,9 @@ impl App {
                 // Estimate lines needed: error length / (width - padding), min 3, max 8
                 let available_width = area.width.saturating_sub(4); // Account for borders and padding
                 if available_width > 0 {
-                    ((error.len() + format!("{} ", self.icons.error).len()) as u16)
+                    ((error.len()
+                        + format!("{error_icon} ", error_icon = self.icons.error).len())
+                        as u16)
                         .div_ceil(available_width)
                         .clamp(3, 8)
                 } else {
@@ -301,7 +317,9 @@ impl App {
                 // Estimate lines needed: success length / (width - padding), min 3, max 8
                 let available_width = area.width.saturating_sub(4); // Account for borders and padding
                 if available_width > 0 {
-                    ((success.len() + format!("{} ", self.icons.success).len()) as u16)
+                    ((success.len()
+                        + format!("{success_icon} ", success_icon = self.icons.success).len())
+                        as u16)
                         .div_ceil(available_width)
                         .clamp(3, 8)
                 } else {
@@ -337,21 +355,23 @@ impl App {
 
         // Main block with file list
         let file_items: Vec<ListItem> = if self.is_loading_files() {
-            vec![ListItem::new(format!("{} Loading...", self.icons.loading))]
+            vec![ListItem::new(format!(
+                "{loading} Loading...",
+                loading = self.icons.loading
+            ))]
         } else if browsing.files.is_empty() {
             let has_query = self
                 .file_search_query()
-                .map(|q| !q.is_empty())
-                .unwrap_or(false);
+                .is_some_and(|q| !q.is_empty());
             if self.is_searching_files() && has_query {
                 vec![ListItem::new(format!(
-                    "{} No results found",
-                    self.icons.search
+                    "{search} No results found",
+                    search = self.icons.search
                 ))]
             } else {
                 vec![ListItem::new(format!(
-                    "{} No items found",
-                    self.icons.empty
+                    "{empty} No items found",
+                    empty = self.icons.empty
                 ))]
             }
         } else {
@@ -369,7 +389,7 @@ impl App {
         let current_path_display = if browsing.current_path.is_empty() {
             "/ (root)".to_string()
         } else {
-            format!("/{}", browsing.current_path.trim_end_matches('/'))
+            format!("/{path}", path = browsing.current_path.trim_end_matches('/'))
         };
 
         let container_name =
@@ -381,17 +401,17 @@ impl App {
 
         let title = if self.is_searching_files() {
             format!(
-                " Container: {} - {} [SEARCH] ({} shown) ",
-                container_name,
-                current_path_display,
-                browsing.files.len()
+                " Container: {container} - {path} [SEARCH] ({count} shown) ",
+                container = container_name,
+                path = current_path_display,
+                count = browsing.files.len()
             )
         } else {
             format!(
-                " Container: {} - {} ({} items) ",
-                container_name,
-                current_path_display,
-                browsing.files.len()
+                " Container: {container} - {path} ({count} items) ",
+                container = container_name,
+                path = current_path_display,
+                count = browsing.files.len()
             )
         };
 
@@ -418,7 +438,7 @@ impl App {
         // Search input if in search mode
         if self.is_searching_files() {
             let query = self.file_search_query().unwrap_or("");
-            let search_text = format!("Search: {}", query);
+            let search_text = format!("Search: {query}");
             let search_widget = Paragraph::new(search_text)
                 .block(
                     Block::bordered()
@@ -433,7 +453,8 @@ impl App {
 
         // Error/Success/Loading message if present
         if let Some(error) = &self.error_message {
-            let error_widget = Paragraph::new(format!("{} {}", self.icons.error, error))
+            let error_widget =
+                Paragraph::new(format!("{error_icon} {error}", error_icon = self.icons.error))
                 .block(Block::bordered().border_type(BorderType::Rounded))
                 .fg(Color::Red)
                 .wrap(ratatui::widgets::Wrap { trim: true })
@@ -441,7 +462,10 @@ impl App {
             error_widget.render(chunks[chunk_index], buf);
             chunk_index += 1;
         } else if let Some(success) = &self.success_message {
-            let success_widget = Paragraph::new(format!("{} {}", self.icons.success, success))
+            let success_widget = Paragraph::new(format!(
+                "{success_icon} {success}",
+                success_icon = self.icons.success
+            ))
                 .block(Block::bordered().border_type(BorderType::Rounded))
                 .fg(Color::Green)
                 .wrap(ratatui::widgets::Wrap { trim: true })
@@ -450,8 +474,8 @@ impl App {
             chunk_index += 1;
         } else if self.is_loading_files() {
             let loading_widget = Paragraph::new(format!(
-                "{} Loading Azure Blob Storage...",
-                self.icons.loading
+                "{loading} Loading Azure Blob Storage...",
+                loading = self.icons.loading
             ))
             .block(Block::bordered().border_type(BorderType::Rounded))
             .fg(Color::Yellow)
@@ -811,7 +835,7 @@ impl App {
         // Account for borders (2 chars)
         let content_width = popup_width.saturating_sub(2) as usize;
 
-        let original_line = format!("Original: {}", original_path);
+        let original_line = format!("Original: {original_path}");
 
         // Calculate how many lines the original path will take when wrapped
         #[allow(clippy::cast_possible_truncation)]
