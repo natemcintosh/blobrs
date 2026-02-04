@@ -276,7 +276,7 @@ impl App {
     #[allow(clippy::too_many_lines)]
     fn render_blob_browsing(&self, area: Rect, buf: &mut Buffer) {
         let Some(browsing) = self.browsing() else {
-            return;
+            unreachable!("render_blob_browsing called when session is not Session::Browsing");
         };
 
         // Calculate footer height based on instruction text

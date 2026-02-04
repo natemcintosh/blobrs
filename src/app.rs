@@ -2602,6 +2602,7 @@ mod tests {
             storage_account: "test-account".to_string(),
             access_key: "test-key".to_string(),
             containers: Vec::new(),
+            all_containers: Vec::new(),
             selected_container_index: 0,
             async_op: AsyncOp::None,
             error_message: None,
@@ -2749,6 +2750,7 @@ mod tests {
                 name: "beta".to_string(),
             },
         ];
+        app.all_containers = app.containers.clone();
 
         app.enter_container_search_mode();
 
