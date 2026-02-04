@@ -9,34 +9,55 @@ use ratatui::{
     },
 };
 
-use crate::app::{App, AppState};
+use crate::app::{App, AsyncOp, Modal, Session};
 use crate::preview::PreviewData;
 
 impl Widget for &App {
     /// Renders the user interface widgets.
     fn render(self, area: Rect, buf: &mut Buffer) {
-        match self.state {
-            AppState::ContainerSelection => self.render_container_selection(area, buf),
-            AppState::BlobBrowsing => {
+        match &self.session {
+            Session::Selecting => self.render_container_selection(area, buf),
+            Session::Browsing(_) => {
                 self.render_blob_browsing(area, buf);
 
                 // Render popup over the blob browsing view if needed
-                if self.show_delete_dialog {
-                    self.render_delete_dialog_popup(area, buf);
-                } else if self.is_deleting {
-                    self.render_delete_progress_popup(area, buf);
-                } else if self.show_clone_dialog {
-                    self.render_clone_dialog_popup(area, buf);
-                } else if self.is_cloning {
-                    self.render_clone_progress_popup(area, buf);
-                } else if self.show_blob_info_popup {
-                    self.render_blob_info_popup(area, buf);
-                } else if self.show_download_picker {
-                    self.render_download_picker_popup(area, buf);
-                } else if self.show_sort_popup {
-                    App::render_sort_popup(area, buf);
-                } else if self.is_downloading {
-                    self.render_download_progress_popup(area, buf);
+                match &self.modal {
+                    Modal::DeleteConfirm {
+                        input,
+                        target_name,
+                        is_folder,
+                        ..
+                    } => {
+                        App::render_delete_dialog_popup(area, buf, input, target_name, *is_folder);
+                    }
+                    Modal::Clone {
+                        input,
+                        original_path,
+                        is_folder,
+                    } => {
+                        App::render_clone_dialog_popup(area, buf, input, original_path, *is_folder);
+                    }
+                    Modal::BlobInfo { info } => {
+                        self.render_blob_info_popup(area, buf, info);
+                    }
+                    Modal::DownloadPicker { .. } => {
+                        self.render_download_picker_popup(area, buf);
+                    }
+                    Modal::SortPicker => {
+                        App::render_sort_popup(area, buf);
+                    }
+                    Modal::None => match &self.async_op {
+                        AsyncOp::Deleting(progress) => {
+                            App::render_delete_progress_popup(area, buf, progress);
+                        }
+                        AsyncOp::Cloning(progress) => {
+                            App::render_clone_progress_popup(area, buf, progress);
+                        }
+                        AsyncOp::Downloading(progress) => {
+                            App::render_download_progress_popup(area, buf, progress);
+                        }
+                        _ => {}
+                    },
                 }
             }
         }
@@ -65,9 +86,10 @@ impl App {
         lines_needed + 2
     }
 
+    #[allow(clippy::too_many_lines)]
     fn render_container_selection(&self, area: Rect, buf: &mut Buffer) {
         // Calculate footer height based on instruction text
-        let instructions = if self.container_search_mode {
+        let instructions = if self.is_searching_containers() {
             "Search Mode: Type to filter containers • `Enter` to confirm • `Esc` to cancel • `Ctrl+↑`/`Ctrl+↓` to navigate"
         } else {
             "Press `Ctrl-C` or `q` or `Esc` to quit • `r`/`F5` to refresh • `↑`/`↓` or `k`/`j` to navigate • `→`/`l`/`Enter` to select container • `/` to search"
@@ -80,19 +102,23 @@ impl App {
         ];
 
         // Add space for search input if in container search mode
-        if self.container_search_mode {
+        if self.is_searching_containers() {
             constraints.push(Constraint::Length(3)); // Search input area
         }
 
         // Add space for error or success message if present
-        if self.error_message.is_some() || self.success_message.is_some() || self.is_loading {
+        if self.error_message.is_some()
+            || self.success_message.is_some()
+            || self.is_loading_containers()
+        {
             // Calculate height based on message length and terminal width
             #[allow(clippy::cast_possible_truncation)] // UI text lengths are always small
             let message_height = if let Some(error) = &self.error_message {
                 // Estimate lines needed: error length / (width - padding), min 3, max 8
                 let available_width = area.width.saturating_sub(4); // Account for borders and padding
                 if available_width > 0 {
-                    ((error.len() + format!("{} ", self.icons.error).len()) as u16)
+                    ((error.len() + format!("{error_icon} ", error_icon = self.icons.error).len())
+                        as u16)
                         .div_ceil(available_width)
                         .clamp(3, 8)
                 } else {
@@ -102,7 +128,9 @@ impl App {
                 // Estimate lines needed: success length / (width - padding), min 3, max 8
                 let available_width = area.width.saturating_sub(4); // Account for borders and padding
                 if available_width > 0 {
-                    ((success.len() + format!("{} ", self.icons.success).len()) as u16)
+                    ((success.len()
+                        + format!("{success_icon} ", success_icon = self.icons.success).len())
+                        as u16)
                         .div_ceil(available_width)
                         .clamp(3, 8)
                 } else {
@@ -122,46 +150,50 @@ impl App {
             .split(area);
 
         // Container list
-        let container_items: Vec<ListItem> = if self.is_loading {
+        let container_items: Vec<ListItem> = if self.is_loading_containers() {
             vec![ListItem::new(format!(
-                "{} Loading containers...",
-                self.icons.loading
+                "{loading} Loading containers...",
+                loading = self.icons.loading
             ))]
         } else if self.containers.is_empty() {
-            if self.container_search_mode && !self.container_search_query.is_empty() {
+            let has_query = self.container_search_query().is_some_and(|q| !q.is_empty());
+            if self.is_searching_containers() && has_query {
                 vec![ListItem::new(format!(
-                    "{} No containers found matching search",
-                    self.icons.search
+                    "{search} No containers found matching search",
+                    search = self.icons.search
                 ))]
             } else {
                 vec![ListItem::new(format!(
-                    "{} No containers found",
-                    self.icons.empty
+                    "{empty} No containers found",
+                    empty = self.icons.empty
                 ))]
             }
         } else {
             self.containers
                 .iter()
-                .map(|container| ListItem::new(format!("{} {}", self.icons.folder, container.name)))
+                .map(|container| {
+                    let name = &container.name;
+                    ListItem::new(format!("{folder} {name}", folder = self.icons.folder))
+                })
                 .collect()
         };
 
         let mut list_state = ListState::default();
-        if !self.is_loading && !self.containers.is_empty() {
+        if !self.is_loading_containers() && !self.containers.is_empty() {
             list_state.select(Some(self.selected_container_index));
         }
 
-        let title = if self.container_search_mode {
+        let title = if self.is_searching_containers() {
             format!(
-                " Azure Storage Account: {} - Select Container [SEARCH] ({} shown) ",
-                self.storage_account,
-                self.containers.len()
+                " Azure Storage Account: {account} - Select Container [SEARCH] ({count} shown) ",
+                account = self.storage_account,
+                count = self.containers.len()
             )
         } else {
             format!(
-                " Azure Storage Account: {} - Select Container ({} containers) ",
-                self.storage_account,
-                self.containers.len()
+                " Azure Storage Account: {account} - Select Container ({count} containers) ",
+                account = self.storage_account,
+                count = self.containers.len()
             )
         };
 
@@ -181,8 +213,9 @@ impl App {
         let mut chunk_index = 1;
 
         // Search input if in container search mode
-        if self.container_search_mode {
-            let search_text = format!("Search: {}", self.container_search_query);
+        if self.is_searching_containers() {
+            let query = self.container_search_query().unwrap_or("");
+            let search_text = format!("Search: {query}");
             let search_widget = Paragraph::new(search_text)
                 .block(
                     Block::bordered()
@@ -197,27 +230,35 @@ impl App {
 
         // Error/Success/Loading message if present
         if let Some(error) = &self.error_message {
-            let error_widget = Paragraph::new(format!("{} {}", self.icons.error, error))
-                .block(Block::bordered().border_type(BorderType::Rounded))
-                .fg(Color::Red)
-                .wrap(ratatui::widgets::Wrap { trim: true })
-                .alignment(Alignment::Left);
+            let error_widget = Paragraph::new(format!(
+                "{error_icon} {error}",
+                error_icon = self.icons.error
+            ))
+            .block(Block::bordered().border_type(BorderType::Rounded))
+            .fg(Color::Red)
+            .wrap(ratatui::widgets::Wrap { trim: true })
+            .alignment(Alignment::Left);
             error_widget.render(chunks[chunk_index], buf);
             chunk_index += 1;
         } else if let Some(success) = &self.success_message {
-            let success_widget = Paragraph::new(format!("{} {}", self.icons.success, success))
-                .block(Block::bordered().border_type(BorderType::Rounded))
-                .fg(Color::Green)
-                .wrap(ratatui::widgets::Wrap { trim: true })
-                .alignment(Alignment::Left);
+            let success_widget = Paragraph::new(format!(
+                "{success_icon} {success}",
+                success_icon = self.icons.success
+            ))
+            .block(Block::bordered().border_type(BorderType::Rounded))
+            .fg(Color::Green)
+            .wrap(ratatui::widgets::Wrap { trim: true })
+            .alignment(Alignment::Left);
             success_widget.render(chunks[chunk_index], buf);
             chunk_index += 1;
-        } else if self.is_loading {
-            let loading_widget =
-                Paragraph::new(format!("{} Loading containers...", self.icons.loading))
-                    .block(Block::bordered().border_type(BorderType::Rounded))
-                    .fg(Color::Yellow)
-                    .alignment(Alignment::Center);
+        } else if self.is_loading_containers() {
+            let loading_widget = Paragraph::new(format!(
+                "{loading} Loading containers...",
+                loading = self.icons.loading
+            ))
+            .block(Block::bordered().border_type(BorderType::Rounded))
+            .fg(Color::Yellow)
+            .alignment(Alignment::Center);
             loading_widget.render(chunks[chunk_index], buf);
             chunk_index += 1;
         }
@@ -232,11 +273,16 @@ impl App {
         footer.render(chunks[chunk_index], buf);
     }
 
+    #[allow(clippy::too_many_lines)]
     fn render_blob_browsing(&self, area: Rect, buf: &mut Buffer) {
+        let Some(browsing) = self.browsing() else {
+            unreachable!("render_blob_browsing called when session is not Session::Browsing");
+        };
+
         // Calculate footer height based on instruction text
-        let instructions = if self.search_mode {
+        let instructions = if self.is_searching_files() {
             "Search Mode: Type to filter • `Enter` to confirm • `Esc` to cancel • `Ctrl+↑`/`Ctrl+↓` to navigate"
-        } else if self.show_preview {
+        } else if self.ui.show_preview {
             "Preview: `↑`/`↓`/`k`/`j` to scroll rows • `←`/`→`/`h`/`l` to scroll columns • `p` or `Esc` to close preview"
         } else {
             "Press `Ctrl-C` or `q` to quit • `Esc`/`←`/`h` to go back • `r`/`F5` to refresh • `↑`/`↓` or `k`/`j` to navigate • `→`/`l`/`Enter` to enter folder • `/` to search • `s` to sort • `i` for info • `p` to preview • `y` to copy path • `c` to clone • `x` to delete • `d` to download"
@@ -249,19 +295,21 @@ impl App {
         ];
 
         // Add space for search input if in search mode
-        if self.search_mode {
+        if self.is_searching_files() {
             constraints.push(Constraint::Length(3)); // Search input area
         }
 
         // Add space for error or success message if present
-        if self.error_message.is_some() || self.success_message.is_some() || self.is_loading {
+        if self.error_message.is_some() || self.success_message.is_some() || self.is_loading_files()
+        {
             // Calculate height based on message length and terminal width
             #[allow(clippy::cast_possible_truncation)] // UI text lengths are always small
             let message_height = if let Some(error) = &self.error_message {
                 // Estimate lines needed: error length / (width - padding), min 3, max 8
                 let available_width = area.width.saturating_sub(4); // Account for borders and padding
                 if available_width > 0 {
-                    ((error.len() + format!("{} ", self.icons.error).len()) as u16)
+                    ((error.len() + format!("{error_icon} ", error_icon = self.icons.error).len())
+                        as u16)
                         .div_ceil(available_width)
                         .clamp(3, 8)
                 } else {
@@ -271,7 +319,9 @@ impl App {
                 // Estimate lines needed: success length / (width - padding), min 3, max 8
                 let available_width = area.width.saturating_sub(4); // Account for borders and padding
                 if available_width > 0 {
-                    ((success.len() + format!("{} ", self.icons.success).len()) as u16)
+                    ((success.len()
+                        + format!("{success_icon} ", success_icon = self.icons.success).len())
+                        as u16)
                         .div_ceil(available_width)
                         .clamp(3, 8)
                 } else {
@@ -292,7 +342,7 @@ impl App {
 
         // Main content area - split horizontally if preview is shown
         let main_area = chunks[0];
-        let (file_list_area, preview_area) = if self.show_preview {
+        let (file_list_area, preview_area) = if self.ui.show_preview {
             let horizontal_chunks = Layout::default()
                 .direction(Direction::Horizontal)
                 .constraints([
@@ -306,36 +356,44 @@ impl App {
         };
 
         // Main block with file list
-        let file_items: Vec<ListItem> = if self.is_loading {
-            vec![ListItem::new(format!("{} Loading...", self.icons.loading))]
-        } else if self.files.is_empty() {
-            if self.search_mode && !self.search_query.is_empty() {
+        let file_items: Vec<ListItem> = if self.is_loading_files() {
+            vec![ListItem::new(format!(
+                "{loading} Loading...",
+                loading = self.icons.loading
+            ))]
+        } else if browsing.files.is_empty() {
+            let has_query = self.file_search_query().is_some_and(|q| !q.is_empty());
+            if self.is_searching_files() && has_query {
                 vec![ListItem::new(format!(
-                    "{} No results found",
-                    self.icons.search
+                    "{search} No results found",
+                    search = self.icons.search
                 ))]
             } else {
                 vec![ListItem::new(format!(
-                    "{} No items found",
-                    self.icons.empty
+                    "{empty} No items found",
+                    empty = self.icons.empty
                 ))]
             }
         } else {
-            self.files
+            browsing
+                .files
                 .iter()
                 .map(|file| ListItem::new(file.as_str()))
                 .collect()
         };
 
         let mut list_state = ListState::default();
-        if !self.is_loading && !self.files.is_empty() {
-            list_state.select(Some(self.selected_index));
+        if !self.is_loading_files() && !browsing.files.is_empty() {
+            list_state.select(Some(browsing.selected_index));
         }
 
-        let current_path_display = if self.current_path.is_empty() {
+        let current_path_display = if browsing.current_path.is_empty() {
             "/ (root)".to_string()
         } else {
-            format!("/{}", self.current_path.trim_end_matches('/'))
+            format!(
+                "/{path}",
+                path = browsing.current_path.trim_end_matches('/')
+            )
         };
 
         let container_name =
@@ -345,19 +403,19 @@ impl App {
                 "Unknown"
             };
 
-        let title = if self.search_mode {
+        let title = if self.is_searching_files() {
             format!(
-                " Container: {} - {} [SEARCH] ({} shown) ",
-                container_name,
-                current_path_display,
-                self.files.len()
+                " Container: {container} - {path} [SEARCH] ({count} shown) ",
+                container = container_name,
+                path = current_path_display,
+                count = browsing.files.len()
             )
         } else {
             format!(
-                " Container: {} - {} ({} items) ",
-                container_name,
-                current_path_display,
-                self.files.len()
+                " Container: {container} - {path} ({count} items) ",
+                container = container_name,
+                path = current_path_display,
+                count = browsing.files.len()
             )
         };
 
@@ -382,8 +440,9 @@ impl App {
         let mut chunk_index = 1;
 
         // Search input if in search mode
-        if self.search_mode {
-            let search_text = format!("Search: {}", self.search_query);
+        if self.is_searching_files() {
+            let query = self.file_search_query().unwrap_or("");
+            let search_text = format!("Search: {query}");
             let search_widget = Paragraph::new(search_text)
                 .block(
                     Block::bordered()
@@ -398,25 +457,31 @@ impl App {
 
         // Error/Success/Loading message if present
         if let Some(error) = &self.error_message {
-            let error_widget = Paragraph::new(format!("{} {}", self.icons.error, error))
-                .block(Block::bordered().border_type(BorderType::Rounded))
-                .fg(Color::Red)
-                .wrap(ratatui::widgets::Wrap { trim: true })
-                .alignment(Alignment::Left);
+            let error_widget = Paragraph::new(format!(
+                "{error_icon} {error}",
+                error_icon = self.icons.error
+            ))
+            .block(Block::bordered().border_type(BorderType::Rounded))
+            .fg(Color::Red)
+            .wrap(ratatui::widgets::Wrap { trim: true })
+            .alignment(Alignment::Left);
             error_widget.render(chunks[chunk_index], buf);
             chunk_index += 1;
         } else if let Some(success) = &self.success_message {
-            let success_widget = Paragraph::new(format!("{} {}", self.icons.success, success))
-                .block(Block::bordered().border_type(BorderType::Rounded))
-                .fg(Color::Green)
-                .wrap(ratatui::widgets::Wrap { trim: true })
-                .alignment(Alignment::Left);
+            let success_widget = Paragraph::new(format!(
+                "{success_icon} {success}",
+                success_icon = self.icons.success
+            ))
+            .block(Block::bordered().border_type(BorderType::Rounded))
+            .fg(Color::Green)
+            .wrap(ratatui::widgets::Wrap { trim: true })
+            .alignment(Alignment::Left);
             success_widget.render(chunks[chunk_index], buf);
             chunk_index += 1;
-        } else if self.is_loading {
+        } else if self.is_loading_files() {
             let loading_widget = Paragraph::new(format!(
-                "{} Loading Azure Blob Storage...",
-                self.icons.loading
+                "{loading} Loading Azure Blob Storage...",
+                loading = self.icons.loading
             ))
             .block(Block::bordered().border_type(BorderType::Rounded))
             .fg(Color::Yellow)
@@ -435,7 +500,12 @@ impl App {
         footer.render(chunks[chunk_index], buf);
     }
 
-    fn render_blob_info_popup(&self, area: Rect, buf: &mut Buffer) {
+    fn render_blob_info_popup(
+        &self,
+        area: Rect,
+        buf: &mut Buffer,
+        blob_info: &crate::app::BlobInfo,
+    ) {
         // Calculate popup size and position
         let popup_width = area.width.clamp(40, 60); // Between 40 and 60 characters wide
         let popup_height = area.height.clamp(10, 20); // Between 10 and 20 lines tall
@@ -457,62 +527,65 @@ impl App {
             .style(Style::default().bg(Color::Black));
         clear_block.render(popup_area, buf);
 
-        if let Some(ref blob_info) = self.current_blob_info {
-            // Create layout for popup content
-            let inner_area = Rect {
-                x: popup_area.x + 1,
-                y: popup_area.y + 1,
-                width: popup_area.width.saturating_sub(2),
-                height: popup_area.height.saturating_sub(2),
-            };
+        // Create layout for popup content
+        let inner_area = Rect {
+            x: popup_area.x + 1,
+            y: popup_area.y + 1,
+            width: popup_area.width.saturating_sub(2),
+            height: popup_area.height.saturating_sub(2),
+        };
 
-            let _chunks = Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([
-                    Constraint::Min(0),    // Main info area
-                    Constraint::Length(1), // Footer
-                ])
-                .split(inner_area);
+        let _chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Min(0),    // Main info area
+                Constraint::Length(1), // Footer
+            ])
+            .split(inner_area);
 
-            let mut info_lines = Vec::new();
+        let mut info_lines = Vec::new();
 
-            // Title
-            if blob_info.is_folder {
+        match blob_info {
+            crate::app::BlobInfo::Folder {
+                name,
+                blob_count,
+                total_size,
+            } => {
                 info_lines.push(format!("{} Folder Information", self.icons.folder));
-            } else {
-                info_lines.push(format!("{} Blob Information", self.icons.file));
+                info_lines.push(String::new());
+
+                let name_display = if name.len() > (popup_width as usize).saturating_sub(8) {
+                    format!("{}...", &name[0..(popup_width as usize).saturating_sub(11)])
+                } else {
+                    name.clone()
+                };
+                info_lines.push(format!("Name: {name_display}"));
+                info_lines.push(String::new());
+
+                info_lines.push(format!("Blobs: {blob_count}"));
+                info_lines.push(format!("Total size: {}", format_bytes(*total_size)));
             }
-            info_lines.push(String::new()); // Empty line
+            crate::app::BlobInfo::File {
+                name,
+                size,
+                last_modified,
+                etag,
+            } => {
+                info_lines.push(format!("{} Blob Information", self.icons.file));
+                info_lines.push(String::new());
 
-            // Name
-            let name_display = if blob_info.name.len() > (popup_width as usize).saturating_sub(8) {
-                format!(
-                    "{}...",
-                    &blob_info.name[0..(popup_width as usize).saturating_sub(11)]
-                )
-            } else {
-                blob_info.name.clone()
-            };
-            info_lines.push(format!("Name: {name_display}"));
-            info_lines.push(String::new()); // Empty line
+                let name_display = if name.len() > (popup_width as usize).saturating_sub(8) {
+                    format!("{}...", &name[0..(popup_width as usize).saturating_sub(11)])
+                } else {
+                    name.clone()
+                };
+                info_lines.push(format!("Name: {name_display}"));
+                info_lines.push(String::new());
 
-            if blob_info.is_folder {
-                // Folder-specific information
-                if let Some(blob_count) = blob_info.blob_count {
-                    info_lines.push(format!("Blobs: {blob_count}"));
-                }
-                if let Some(total_size) = blob_info.total_size {
-                    info_lines.push(format!("Total size: {}", format_bytes(total_size)));
-                }
-            } else {
-                // Blob-specific information
-                if let Some(size) = blob_info.size {
-                    info_lines.push(format!("Size: {}", format_bytes(size)));
-                }
-                if let Some(ref last_modified) = blob_info.last_modified {
-                    info_lines.push(format!("Modified: {last_modified}"));
-                }
-                if let Some(ref etag) = blob_info.etag {
+                info_lines.push(format!("Size: {}", format_bytes(*size)));
+                info_lines.push(format!("Modified: {last_modified}"));
+
+                if let Some(etag) = etag {
                     let etag_display = if etag.len() > (popup_width as usize).saturating_sub(8) {
                         format!("{}...", &etag[0..(popup_width as usize).saturating_sub(11)])
                     } else {
@@ -521,39 +594,43 @@ impl App {
                     info_lines.push(format!("ETag: {etag_display}"));
                 }
             }
-
-            let info_text = info_lines.join("\n");
-            let info_paragraph = Paragraph::new(info_text)
-                .block(
-                    Block::bordered()
-                        .border_type(BorderType::Rounded)
-                        .title(" Information ")
-                        .style(Style::default().fg(Color::Cyan).bg(Color::Black)),
-                )
-                .style(Style::default().bg(Color::Black))
-                .wrap(ratatui::widgets::Wrap { trim: true });
-
-            info_paragraph.render(popup_area, buf);
-
-            // Footer with instructions (overlaid at bottom of popup)
-            let footer_area = Rect {
-                x: popup_area.x + 2,
-                y: popup_area.y + popup_area.height.saturating_sub(2),
-                width: popup_area.width.saturating_sub(4),
-                height: 1,
-            };
-
-            let instructions = "Press Esc, ← or h to close";
-            let footer_text = Paragraph::new(instructions)
-                .style(Style::default().fg(Color::Yellow).bg(Color::Black))
-                .alignment(Alignment::Center);
-
-            footer_text.render(footer_area, buf);
         }
+
+        let info_text = info_lines.join("\n");
+        let info_paragraph = Paragraph::new(info_text)
+            .block(
+                Block::bordered()
+                    .border_type(BorderType::Rounded)
+                    .title(" Information ")
+                    .style(Style::default().fg(Color::Cyan).bg(Color::Black)),
+            )
+            .style(Style::default().bg(Color::Black))
+            .wrap(ratatui::widgets::Wrap { trim: true });
+
+        info_paragraph.render(popup_area, buf);
+
+        // Footer with instructions (overlaid at bottom of popup)
+        let footer_area = Rect {
+            x: popup_area.x + 2,
+            y: popup_area.y + popup_area.height.saturating_sub(2),
+            width: popup_area.width.saturating_sub(4),
+            height: 1,
+        };
+
+        let instructions = "Press Esc, ← or h to close";
+        let footer_text = Paragraph::new(instructions)
+            .style(Style::default().fg(Color::Yellow).bg(Color::Black))
+            .alignment(Alignment::Center);
+
+        footer_text.render(footer_area, buf);
     }
 
     /// Render the download destination picker popup.
     fn render_download_picker_popup(&self, area: Rect, buf: &mut Buffer) {
+        let Some(browsing) = self.browsing() else {
+            return;
+        };
+
         // Calculate popup size
         let popup_width = (area.width * 3 / 4).min(60);
         let popup_height = 8;
@@ -573,10 +650,10 @@ impl App {
             }
         }
 
-        let selected_file = if self.files.is_empty() {
+        let selected_file = if browsing.files.is_empty() {
             "No file selected"
         } else {
-            &self.files[self.selected_index]
+            &browsing.files[browsing.selected_index]
         };
 
         // Extract the name without the icon prefix
@@ -616,79 +693,81 @@ impl App {
     }
 
     /// Render the download progress popup.
-    fn render_download_progress_popup(&self, area: Rect, buf: &mut Buffer) {
-        if let Some(progress) = &self.download_progress {
-            // Calculate popup size
-            let popup_width = (area.width * 3 / 4).min(70);
-            let popup_height = 12;
+    fn render_download_progress_popup(
+        area: Rect,
+        buf: &mut Buffer,
+        progress: &crate::app::DownloadProgress,
+    ) {
+        // Calculate popup size
+        let popup_width = (area.width * 3 / 4).min(70);
+        let popup_height = 12;
 
-            // Center the popup
-            let popup_area = Rect {
-                x: (area.width.saturating_sub(popup_width)) / 2,
-                y: (area.height.saturating_sub(popup_height)) / 2,
-                width: popup_width,
-                height: popup_height,
-            };
+        // Center the popup
+        let popup_area = Rect {
+            x: (area.width.saturating_sub(popup_width)) / 2,
+            y: (area.height.saturating_sub(popup_height)) / 2,
+            width: popup_width,
+            height: popup_height,
+        };
 
-            // Clear the popup area with a background
-            for y in popup_area.y..popup_area.y + popup_area.height {
-                for x in popup_area.x..popup_area.x + popup_area.width {
-                    buf[(x, y)].set_style(Style::default().bg(Color::Black));
-                }
+        // Clear the popup area with a background
+        for y in popup_area.y..popup_area.y + popup_area.height {
+            for x in popup_area.x..popup_area.x + popup_area.width {
+                buf[(x, y)].set_style(Style::default().bg(Color::Black));
             }
-
-            let mut progress_lines = vec![
-                format!("Downloading: {}", progress.current_file),
-                String::new(),
-                format!(
-                    "Files: {} / {}",
-                    progress.files_completed, progress.total_files
-                ),
-            ];
-
-            // Add bytes downloaded if available
-            if let Some(total_bytes) = progress.total_bytes {
-                #[allow(
-                    clippy::cast_possible_truncation,
-                    clippy::cast_sign_loss,
-                    clippy::cast_precision_loss
-                )]
-                let percentage = if total_bytes > 0 {
-                    (progress.bytes_downloaded as f64 / total_bytes as f64 * 100.0) as u8
-                } else {
-                    100
-                };
-                progress_lines.push(format!(
-                    "Size: {} / {} ({}%)",
-                    format_bytes(progress.bytes_downloaded),
-                    format_bytes(total_bytes),
-                    percentage
-                ));
-            } else {
-                progress_lines.push(format!(
-                    "Downloaded: {}",
-                    format_bytes(progress.bytes_downloaded)
-                ));
-            }
-
-            // Add error message if present
-            if let Some(error) = &progress.error_message {
-                progress_lines.push(String::new());
-                progress_lines.push(format!("Error: {error}"));
-            }
-
-            let info_text = progress_lines.join("\n");
-            let info_paragraph = Paragraph::new(info_text)
-                .block(
-                    Block::bordered()
-                        .border_type(BorderType::Rounded)
-                        .title(" Download Progress ")
-                        .style(Style::default().fg(Color::Yellow).bg(Color::Black)),
-                )
-                .style(Style::default().bg(Color::Black));
-
-            info_paragraph.render(popup_area, buf);
         }
+
+        let mut progress_lines = vec![
+            format!("Downloading: {}", progress.current_file),
+            String::new(),
+            format!(
+                "Files: {} / {}",
+                progress.files_completed, progress.total_files
+            ),
+        ];
+
+        // Add bytes downloaded if available
+        if let Some(total_bytes) = progress.total_bytes {
+            #[allow(
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss,
+                clippy::cast_precision_loss
+            )]
+            let percentage = if total_bytes > 0 {
+                (progress.bytes_downloaded as f64 / total_bytes as f64 * 100.0) as u8
+            } else {
+                100
+            };
+            progress_lines.push(format!(
+                "Size: {} / {} ({}%)",
+                format_bytes(progress.bytes_downloaded),
+                format_bytes(total_bytes),
+                percentage
+            ));
+        } else {
+            progress_lines.push(format!(
+                "Downloaded: {}",
+                format_bytes(progress.bytes_downloaded)
+            ));
+        }
+
+        // Add error message if present
+        if let Some(error) = &progress.error_message {
+            progress_lines.push(String::new());
+            progress_lines.push(format!("Error: {error}"));
+        }
+
+        let info_text = progress_lines.join("\n");
+        let info_paragraph = Paragraph::new(info_text)
+            .block(
+                Block::bordered()
+                    .border_type(BorderType::Rounded)
+                    .title(" Download Progress ")
+                    .style(Style::default().fg(Color::Yellow).bg(Color::Black)),
+            )
+            .style(Style::default().bg(Color::Black));
+
+        info_paragraph.render(popup_area, buf);
     }
 
     /// Render the sort selection popup.
@@ -738,17 +817,18 @@ impl App {
     }
 
     /// Render the clone dialog popup.
-    fn render_clone_dialog_popup(&self, area: Rect, buf: &mut Buffer) {
+    fn render_clone_dialog_popup(
+        area: Rect,
+        buf: &mut Buffer,
+        input: &str,
+        original_path: &str,
+        is_folder: bool,
+    ) {
         // Calculate popup size
         let popup_width = (area.width * 3 / 4).min(70);
 
-        let item_type = if self.clone_is_folder {
-            "folder"
-        } else {
-            "blob"
-        };
-        let can_confirm =
-            self.clone_input != self.clone_original_path && !self.clone_input.is_empty();
+        let item_type = if is_folder { "folder" } else { "blob" };
+        let can_confirm = input != original_path && !input.is_empty();
 
         let enter_hint = if can_confirm {
             "Enter to confirm"
@@ -760,7 +840,7 @@ impl App {
         // Account for borders (2 chars)
         let content_width = popup_width.saturating_sub(2) as usize;
 
-        let original_line = format!("Original: {}", self.clone_original_path);
+        let original_line = format!("Original: {original_path}");
 
         // Calculate how many lines the original path will take when wrapped
         #[allow(clippy::cast_possible_truncation)]
@@ -794,11 +874,11 @@ impl App {
         let available_input_width = content_width.saturating_sub(new_path_prefix.len());
 
         // Calculate visible portion of input - scroll to keep cursor at end visible
-        let visible_input = if self.clone_input.len() > available_input_width {
-            let start = self.clone_input.len() - available_input_width;
-            format!("…{}", &self.clone_input[start + 1..])
+        let visible_input = if input.len() > available_input_width {
+            let start = input.len() - available_input_width;
+            format!("…{}", &input[start + 1..])
         } else {
-            self.clone_input.clone()
+            input.to_string()
         };
 
         let new_path_display = format!("{new_path_prefix}{visible_input}");
@@ -851,60 +931,68 @@ impl App {
     }
 
     /// Render the clone progress popup.
-    fn render_clone_progress_popup(&self, area: Rect, buf: &mut Buffer) {
-        if let Some(progress) = &self.clone_progress {
-            // Calculate popup size
-            let popup_width = (area.width * 3 / 4).min(70);
-            let popup_height = 10;
+    fn render_clone_progress_popup(
+        area: Rect,
+        buf: &mut Buffer,
+        progress: &crate::app::CloneProgress,
+    ) {
+        // Calculate popup size
+        let popup_width = (area.width * 3 / 4).min(70);
+        let popup_height = 10;
 
-            // Center the popup
-            let popup_area = Rect {
-                x: (area.width.saturating_sub(popup_width)) / 2,
-                y: (area.height.saturating_sub(popup_height)) / 2,
-                width: popup_width,
-                height: popup_height,
-            };
+        // Center the popup
+        let popup_area = Rect {
+            x: (area.width.saturating_sub(popup_width)) / 2,
+            y: (area.height.saturating_sub(popup_height)) / 2,
+            width: popup_width,
+            height: popup_height,
+        };
 
-            // Clear the popup area with a background
-            for y in popup_area.y..popup_area.y + popup_area.height {
-                for x in popup_area.x..popup_area.x + popup_area.width {
-                    buf[(x, y)].set_style(Style::default().bg(Color::Black));
-                }
+        // Clear the popup area with a background
+        for y in popup_area.y..popup_area.y + popup_area.height {
+            for x in popup_area.x..popup_area.x + popup_area.width {
+                buf[(x, y)].set_style(Style::default().bg(Color::Black));
             }
-
-            let mut progress_lines = vec!["Cloning in progress...".to_string(), String::new()];
-
-            if !progress.current_file.is_empty() {
-                progress_lines.push(format!("Current: {}", progress.current_file));
-            }
-
-            progress_lines.push(format!(
-                "Files: {} / {}",
-                progress.files_completed, progress.total_files
-            ));
-
-            // Add error message if present
-            if let Some(error) = &progress.error_message {
-                progress_lines.push(String::new());
-                progress_lines.push(format!("Error: {error}"));
-            }
-
-            let info_text = progress_lines.join("\n");
-            let info_paragraph = Paragraph::new(info_text)
-                .block(
-                    Block::bordered()
-                        .border_type(BorderType::Rounded)
-                        .title(" Clone Progress ")
-                        .style(Style::default().fg(Color::Yellow).bg(Color::Black)),
-                )
-                .style(Style::default().bg(Color::Black));
-
-            info_paragraph.render(popup_area, buf);
         }
+
+        let mut progress_lines = vec!["Cloning in progress...".to_string(), String::new()];
+
+        if !progress.current_file.is_empty() {
+            progress_lines.push(format!("Current: {}", progress.current_file));
+        }
+
+        progress_lines.push(format!(
+            "Files: {} / {}",
+            progress.files_completed, progress.total_files
+        ));
+
+        // Add error message if present
+        if let Some(error) = &progress.error_message {
+            progress_lines.push(String::new());
+            progress_lines.push(format!("Error: {error}"));
+        }
+
+        let info_text = progress_lines.join("\n");
+        let info_paragraph = Paragraph::new(info_text)
+            .block(
+                Block::bordered()
+                    .border_type(BorderType::Rounded)
+                    .title(" Clone Progress ")
+                    .style(Style::default().fg(Color::Yellow).bg(Color::Black)),
+            )
+            .style(Style::default().bg(Color::Black));
+
+        info_paragraph.render(popup_area, buf);
     }
 
     /// Render the delete confirmation dialog popup.
-    fn render_delete_dialog_popup(&self, area: Rect, buf: &mut Buffer) {
+    fn render_delete_dialog_popup(
+        area: Rect,
+        buf: &mut Buffer,
+        input: &str,
+        target_name: &str,
+        is_folder: bool,
+    ) {
         // Calculate popup size
         let popup_width = (area.width * 3 / 4).min(70);
         let popup_height = 12;
@@ -924,12 +1012,8 @@ impl App {
             }
         }
 
-        let item_type = if self.delete_is_folder {
-            "folder"
-        } else {
-            "blob"
-        };
-        let can_confirm = self.delete_input == self.delete_target_name;
+        let item_type = if is_folder { "folder" } else { "blob" };
+        let can_confirm = input == target_name;
 
         let enter_hint = if can_confirm {
             "Enter to confirm"
@@ -937,19 +1021,19 @@ impl App {
             "Type name to confirm"
         };
 
-        let warning = if self.delete_is_folder {
+        let warning = if is_folder {
             "⚠ This will delete all blobs in this folder!"
         } else {
             "⚠ This action cannot be undone!"
         };
 
         let delete_text = [
-            format!("Delete {item_type}: {}", self.delete_target_name),
+            format!("Delete {item_type}: {target_name}"),
             String::new(),
             warning.to_string(),
             String::new(),
-            format!("Type \"{}\" to confirm:", self.delete_target_name),
-            self.delete_input.clone(),
+            format!("Type \"{target_name}\" to confirm:"),
+            input.to_string(),
             String::new(),
             format!("{enter_hint} • Esc to cancel"),
         ];
@@ -977,7 +1061,7 @@ impl App {
         let input_y = popup_area.y + 6;
         let input_x = popup_area.x + 1; // After left border
         #[allow(clippy::cast_possible_truncation)]
-        let cursor_x = input_x + self.delete_input.len() as u16;
+        let cursor_x = input_x + input.len() as u16;
 
         // Show cursor
         if cursor_x < popup_area.x + popup_area.width - 1 {
@@ -987,56 +1071,58 @@ impl App {
     }
 
     /// Render the delete progress popup.
-    fn render_delete_progress_popup(&self, area: Rect, buf: &mut Buffer) {
-        if let Some(progress) = &self.delete_progress {
-            // Calculate popup size
-            let popup_width = (area.width * 3 / 4).min(70);
-            let popup_height = 10;
+    fn render_delete_progress_popup(
+        area: Rect,
+        buf: &mut Buffer,
+        progress: &crate::app::DeleteProgress,
+    ) {
+        // Calculate popup size
+        let popup_width = (area.width * 3 / 4).min(70);
+        let popup_height = 10;
 
-            // Center the popup
-            let popup_area = Rect {
-                x: (area.width.saturating_sub(popup_width)) / 2,
-                y: (area.height.saturating_sub(popup_height)) / 2,
-                width: popup_width,
-                height: popup_height,
-            };
+        // Center the popup
+        let popup_area = Rect {
+            x: (area.width.saturating_sub(popup_width)) / 2,
+            y: (area.height.saturating_sub(popup_height)) / 2,
+            width: popup_width,
+            height: popup_height,
+        };
 
-            // Clear the popup area with a background
-            for y in popup_area.y..popup_area.y + popup_area.height {
-                for x in popup_area.x..popup_area.x + popup_area.width {
-                    buf[(x, y)].set_style(Style::default().bg(Color::Black));
-                }
+        // Clear the popup area with a background
+        for y in popup_area.y..popup_area.y + popup_area.height {
+            for x in popup_area.x..popup_area.x + popup_area.width {
+                buf[(x, y)].set_style(Style::default().bg(Color::Black));
             }
-
-            let mut progress_lines = vec!["Deleting...".to_string(), String::new()];
-
-            if !progress.current_file.is_empty() {
-                progress_lines.push(format!("Current: {}", progress.current_file));
-            }
-
-            progress_lines.push(format!(
-                "Files: {} / {}",
-                progress.files_completed, progress.total_files
-            ));
-
-            // Add error message if present
-            if let Some(error) = &progress.error_message {
-                progress_lines.push(String::new());
-                progress_lines.push(format!("Error: {error}"));
-            }
-
-            let info_text = progress_lines.join("\n");
-            let info_paragraph = Paragraph::new(info_text)
-                .block(
-                    Block::bordered()
-                        .border_type(BorderType::Rounded)
-                        .title(" Delete Progress ")
-                        .style(Style::default().fg(Color::Red).bg(Color::Black)),
-                )
-                .style(Style::default().bg(Color::Black));
-
-            info_paragraph.render(popup_area, buf);
         }
+
+        let mut progress_lines = vec!["Deleting...".to_string(), String::new()];
+
+        if !progress.current_file.is_empty() {
+            progress_lines.push(format!("Current: {}", progress.current_file));
+        }
+
+        progress_lines.push(format!(
+            "Files: {} / {}",
+            progress.files_completed, progress.total_files
+        ));
+
+        // Add error message if present
+        if let Some(error) = &progress.error_message {
+            progress_lines.push(String::new());
+            progress_lines.push(format!("Error: {error}"));
+        }
+
+        let info_text = progress_lines.join("\n");
+        let info_paragraph = Paragraph::new(info_text)
+            .block(
+                Block::bordered()
+                    .border_type(BorderType::Rounded)
+                    .title(" Delete Progress ")
+                    .style(Style::default().fg(Color::Red).bg(Color::Black)),
+            )
+            .style(Style::default().bg(Color::Black));
+
+        info_paragraph.render(popup_area, buf);
     }
 
     /// Render the preview panel for CSV, TSV, or JSON files.
@@ -1048,7 +1134,7 @@ impl App {
         );
 
         // Handle loading state
-        if self.is_loading_preview {
+        if self.ui.is_loading_preview {
             let loading = Paragraph::new(format!("{} Loading preview...", self.icons.loading))
                 .block(
                     Block::bordered()
@@ -1108,7 +1194,7 @@ impl App {
     }
 
     /// Render a table preview (for CSV, TSV, or JSON array of objects).
-    #[allow(clippy::cast_possible_truncation)]
+    #[allow(clippy::cast_possible_truncation, clippy::too_many_lines)]
     fn render_table_preview(
         &self,
         area: Rect,
