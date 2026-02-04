@@ -148,8 +148,10 @@ pub struct App {
     pub storage_account: String,
     /// Azure Storage Access Key.
     pub access_key: String,
-    /// List of available containers.
+    /// List of available containers (may be filtered during search).
     pub containers: Vec<ContainerInfo>,
+    /// Full list of all containers from Azure (never filtered).
+    pub all_containers: Vec<ContainerInfo>,
     /// Currently selected container index.
     pub selected_container_index: usize,
     /// Current async operation (loading, downloading, etc.).
@@ -213,6 +215,7 @@ impl std::fmt::Debug for App {
             .field("session", &self.session)
             .field("storage_account", &self.storage_account)
             .field("containers", &self.containers)
+            .field("all_containers", &self.all_containers)
             .field("selected_container_index", &self.selected_container_index)
             .field("async_op", &self.async_op)
             .field("error_message", &self.error_message)
@@ -244,6 +247,7 @@ impl App {
             storage_account,
             access_key,
             containers: Vec::new(),
+            all_containers: Vec::new(),
             selected_container_index: 0,
             async_op: AsyncOp::None,
             error_message: None,
@@ -574,6 +578,8 @@ impl App {
                     } else {
                         // At container root, go back to container selection
                         self.session = Session::Selecting;
+                        self.containers.clone_from(&self.all_containers);
+                        self.selected_container_index = 0;
                         self.search = Search::Inactive;
                         self.close_modal();
                     }
@@ -591,6 +597,8 @@ impl App {
                     } else {
                         // Go back to container selection
                         self.session = Session::Selecting;
+                        self.containers.clone_from(&self.all_containers);
+                        self.selected_container_index = 0;
                         self.search = Search::Inactive;
                         self.close_modal();
                     }
@@ -1626,6 +1634,9 @@ impl App {
 
         match self.list_containers().await {
             Ok(containers) => {
+                // Always store the full list
+                self.all_containers.clone_from(&containers);
+
                 let search_query = match &self.search {
                     Search::Containers { query, .. } => Some(query.clone()),
                     _ => None,
@@ -1828,9 +1839,12 @@ impl App {
 
     /// Enter container search mode.
     pub fn enter_container_search_mode(&mut self) {
+        // Always start search from the full container list
+        self.containers = self.all_containers.clone();
+        self.selected_container_index = 0;
         self.search = Search::Containers {
             query: String::new(),
-            all_containers: self.containers.clone(),
+            all_containers: self.all_containers.clone(),
         };
         self.error_message = None;
         self.success_message = None;
