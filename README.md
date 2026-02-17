@@ -56,13 +56,13 @@ cargo build --release
 Using Cargo:
 
 ```bash
-cargo run
+cargo run --release
 ```
 
 Using just:
 
 ```bash
-just run --release
+just run
 ```
 
 ## License
