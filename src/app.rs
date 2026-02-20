@@ -301,18 +301,17 @@ impl App {
                         }
                     }
                     KeyCode::Char('r') | KeyCode::F(5) => {
-                        if !self.show_blob_info_popup {
-                            if let Err(e) = self.refresh_files().await {
-                                self.error_message = Some(format!("Refresh failed: {}", e));
-                            }
+                        if !self.show_blob_info_popup
+                            && let Err(e) = self.refresh_files().await
+                        {
+                            self.error_message = Some(format!("Refresh failed: {}", e));
                         }
                     }
                     KeyCode::Char('i') => {
-                        if !self.show_blob_info_popup {
-                            if let Err(e) = self.show_blob_info().await {
-                                self.error_message =
-                                    Some(format!("Failed to get blob info: {}", e));
-                            }
+                        if !self.show_blob_info_popup
+                            && let Err(e) = self.show_blob_info().await
+                        {
+                            self.error_message = Some(format!("Failed to get blob info: {}", e));
                         }
                     }
                     KeyCode::Char('d') => {
@@ -390,10 +389,11 @@ impl App {
                             if let Err(e) = self.confirm_download().await {
                                 self.error_message = Some(format!("Download failed: {}", e));
                             }
-                        } else if !self.show_blob_info_popup && !self.show_sort_popup {
-                            if let Err(e) = self.enter_directory().await {
-                                self.error_message = Some(format!("Enter directory failed: {}", e));
-                            }
+                        } else if !self.show_blob_info_popup
+                            && !self.show_sort_popup
+                            && let Err(e) = self.enter_directory().await
+                        {
+                            self.error_message = Some(format!("Enter directory failed: {}", e));
                         }
                     }
                     KeyCode::Left | KeyCode::Char('h') => {
@@ -1263,10 +1263,10 @@ impl App {
         });
 
         // Get file metadata for total size
-        if let Ok(meta) = object_store.head(&object_path).await {
-            if let Some(progress) = &mut self.download_progress {
-                progress.total_bytes = Some(meta.size);
-            }
+        if let Ok(meta) = object_store.head(&object_path).await
+            && let Some(progress) = &mut self.download_progress
+        {
+            progress.total_bytes = Some(meta.size);
         }
 
         // Create destination file path
