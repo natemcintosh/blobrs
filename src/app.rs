@@ -12,7 +12,9 @@ use base64::{Engine as _, engine::general_purpose};
 use chrono::Utc;
 use futures::stream::StreamExt;
 use hmac::{Hmac, Mac};
-use object_store::{ObjectStore, azure::MicrosoftAzureBuilder, path::Path as ObjectPath};
+use object_store::{
+    ObjectStore, ObjectStoreExt, azure::MicrosoftAzureBuilder, path::Path as ObjectPath,
+};
 use ratatui::{
     DefaultTerminal,
     crossterm::event::{KeyCode, KeyEvent, KeyModifiers},
