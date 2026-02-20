@@ -1261,6 +1261,15 @@ impl App {
             }
         }
 
+        // Consider column type widths (for parquet table preview).
+        if let Some(column_types) = &table_data.column_types {
+            for (i, col_type) in column_types.iter().enumerate() {
+                if i < col_widths.len() {
+                    col_widths[i] = col_widths[i].max(col_type.len());
+                }
+            }
+        }
+
         // Consider data widths (sample first 50 rows for efficiency)
         for row in table_data.rows.iter().take(50) {
             for (i, cell) in row.iter().enumerate() {
@@ -1324,8 +1333,22 @@ impl App {
 
         let header_row = Row::new(header_cells).height(1);
 
+        let type_row = table_data.column_types.as_ref().map(|column_types| {
+            let type_cells: Vec<Cell> = viewport
+                .visible_indices
+                .iter()
+                .map(|idx| Cell::from(column_types.get(*idx).cloned().unwrap_or_default()))
+                .collect();
+
+            Row::new(type_cells).style(
+                Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::ITALIC),
+            )
+        });
+
         // Build data rows with scroll offset
-        let rows: Vec<Row> = table_data
+        let data_rows: Vec<Row> = table_data
             .rows
             .iter()
             .enumerate()
@@ -1346,6 +1369,12 @@ impl App {
             })
             .collect();
 
+        let mut rows = Vec::with_capacity(data_rows.len() + usize::from(type_row.is_some()));
+        if let Some(type_row) = type_row {
+            rows.push(type_row);
+        }
+        rows.extend(data_rows);
+
         // Create the table widget
         let table = Table::new(rows, constraints)
             .header(header_row)
@@ -1359,7 +1388,9 @@ impl App {
 
         // Use TableState for scrolling
         let mut table_state = TableState::default();
-        table_state.select(Some(self.preview_selected_row));
+        let selected_row =
+            self.preview_selected_row + usize::from(table_data.column_types.is_some());
+        table_state.select(Some(selected_row));
 
         ratatui::widgets::StatefulWidget::render(table, area, buf, &mut table_state);
     }

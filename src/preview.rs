@@ -227,6 +227,8 @@ pub enum PreviewData {
 pub struct TablePreview {
     /// Column headers (if available)
     pub headers: Vec<String>,
+    /// Optional column type labels aligned with headers (used by parquet table preview)
+    pub column_types: Option<Vec<String>>,
     /// Data rows (each row is a vector of cell values)
     pub rows: Vec<Vec<String>>,
     /// Total row count (may be more than displayed rows)
@@ -343,6 +345,7 @@ fn parse_delimited(
 
     Ok(PreviewData::Table(TablePreview {
         headers,
+        column_types: None,
         rows,
         total_rows,
         truncated,
@@ -510,6 +513,7 @@ fn try_json_array_as_table(arr: &[serde_json::Value]) -> Option<TablePreview> {
 
     Some(TablePreview {
         headers,
+        column_types: None,
         rows,
         total_rows,
         truncated,
@@ -670,6 +674,11 @@ pub fn parse_parquet_table(data: &[u8]) -> Result<PreviewData, String> {
 
     let schema = builder.schema().clone();
     let headers: Vec<String> = schema.fields().iter().map(|f| f.name().clone()).collect();
+    let column_types: Vec<String> = schema
+        .fields()
+        .iter()
+        .map(|f| f.data_type().to_string())
+        .collect();
 
     let mut rows = Vec::new();
     let mut reader = builder
@@ -704,6 +713,7 @@ pub fn parse_parquet_table(data: &[u8]) -> Result<PreviewData, String> {
 
     Ok(PreviewData::Table(TablePreview {
         headers,
+        column_types: Some(column_types),
         rows,
         total_rows,
         truncated: total_rows > MAX_PREVIEW_ROWS,
@@ -1032,6 +1042,10 @@ mod tests {
         let result = parse_parquet_table(&buffer).unwrap();
         if let PreviewData::Table(table) = result {
             assert_eq!(table.headers, vec!["name", "age"]);
+            assert_eq!(
+                table.column_types,
+                Some(vec!["Utf8".to_string(), "Int32".to_string()])
+            );
             assert_eq!(table.rows.len(), 2);
             assert_eq!(table.rows[0], vec!["Alice", "30"]);
             assert_eq!(table.total_rows, 2);

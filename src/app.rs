@@ -2982,6 +2982,7 @@ mod tests {
         app.parquet_preview_mode = Some(ParquetPreviewMode::Table);
         app.parquet_table_data = Some(TablePreview {
             headers: vec!["a".to_string()],
+            column_types: Some(vec!["Int32".to_string()]),
             rows: vec![vec!["1".to_string()]],
             total_rows: 1,
             truncated: false,
@@ -3033,6 +3034,7 @@ mod tests {
         let mut app = test_app();
         app.preview_data = Some(PreviewData::Table(TablePreview {
             headers: vec!["a".to_string(), "b".to_string(), "c".to_string()],
+            column_types: None,
             rows: vec![vec!["1".to_string(), "2".to_string(), "3".to_string()]],
             total_rows: 1,
             truncated: false,
