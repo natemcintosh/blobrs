@@ -9,7 +9,7 @@ use ratatui::{
     },
 };
 
-use crate::app::{App, AsyncOp, Modal, Session};
+use crate::app::{App, AsyncOp, Modal, ParquetPreviewMode, Session};
 use crate::preview::PreviewData;
 
 impl Widget for &App {
@@ -283,7 +283,11 @@ impl App {
         let instructions = if self.is_searching_files() {
             "Search Mode: Type to filter • `Enter` to confirm • `Esc` to cancel • `Ctrl+↑`/`Ctrl+↓` to navigate"
         } else if self.ui.show_preview {
-            "Preview: `↑`/`↓`/`k`/`j` to scroll rows • `←`/`→`/`h`/`l` to scroll columns • `p` or `Esc` to close preview"
+            if self.preview_file_type == Some(super::preview::PreviewFileType::Parquet) {
+                "Preview: `↑`/`↓`/`k`/`j` to scroll rows • `←`/`→`/`h`/`l` to scroll columns • `Tab` to switch table/metadata • `p` or `Esc` to close preview"
+            } else {
+                "Preview: `↑`/`↓`/`k`/`j` to scroll rows • `←`/`→`/`h`/`l` to scroll columns • `p` or `Esc` to close preview"
+            }
         } else {
             "Press `Ctrl-C` or `q` to quit • `Esc`/`←`/`h` to go back • `r`/`F5` to refresh • `↑`/`↓` or `k`/`j` to navigate • `→`/`l`/`Enter` to enter folder • `/` to search • `s` to sort • `i` for info • `p` to preview • `y` to copy path • `c` to clone • `x` to delete • `d` to download"
         };
@@ -1132,6 +1136,16 @@ impl App {
             || "Preview".to_string(),
             super::preview::PreviewFileType::display_name,
         );
+        let preview_title_name =
+            if self.preview_file_type == Some(super::preview::PreviewFileType::Parquet) {
+                match self.parquet_preview_mode {
+                    Some(ParquetPreviewMode::Table) => "Parquet Table".to_string(),
+                    Some(ParquetPreviewMode::Metadata) => "Parquet Metadata".to_string(),
+                    None => file_type_name.clone(),
+                }
+            } else {
+                file_type_name.clone()
+            };
 
         // Handle loading state
         if self.ui.is_loading_preview {
@@ -1167,7 +1181,7 @@ impl App {
         // Render based on preview data type
         match &self.preview_data {
             Some(PreviewData::Table(table)) => {
-                self.render_table_preview(area, buf, table, &file_type_name);
+                self.render_table_preview(area, buf, table, &preview_title_name);
             }
             Some(PreviewData::Json(json)) => {
                 self.render_json_preview(area, buf, json);
@@ -1202,33 +1216,32 @@ impl App {
         table_data: &crate::preview::TablePreview,
         file_type_name: &str,
     ) {
-        // Build title with row count info
-        let title = if table_data.truncated {
-            format!(
-                " {} Preview ({}/{} rows, truncated) ",
-                file_type_name,
-                table_data.rows.len(),
-                table_data.total_rows
-            )
-        } else {
-            format!(
-                " {} Preview ({} rows) ",
-                file_type_name,
-                table_data.rows.len()
-            )
-        };
-
         // Calculate column widths based on content
         let num_cols = table_data
             .headers
             .len()
             .max(table_data.rows.first().map_or(0, Vec::len));
 
+        let row_info = if table_data.truncated {
+            format!(
+                "{} Preview ({}/{} rows, truncated)",
+                file_type_name,
+                table_data.rows.len(),
+                table_data.total_rows
+            )
+        } else {
+            format!(
+                "{} Preview ({} rows)",
+                file_type_name,
+                table_data.rows.len()
+            )
+        };
+
         if num_cols == 0 {
             let empty = Paragraph::new("Empty table")
                 .block(
                     Block::bordered()
-                        .title(title)
+                        .title(format!(" {row_info} "))
                         .title_alignment(Alignment::Center)
                         .border_type(BorderType::Rounded),
                 )
@@ -1257,33 +1270,51 @@ impl App {
             }
         }
 
-        // Cap column widths and apply horizontal scroll offset
+        // Apply horizontal scroll offset and fit visible columns to viewport width.
         let col_offset = self.preview_scroll.1;
-        let visible_cols: Vec<usize> = col_widths
-            .iter()
-            .skip(col_offset)
-            .map(|w| (*w).clamp(3, 30)) // Min 3, max 30 chars per column
-            .collect();
+        let inner_width = area.width.saturating_sub(2) as usize;
+        let viewport = compute_table_column_viewport(&col_widths, col_offset, inner_width);
 
         // Build constraints for visible columns
-        let constraints: Vec<Constraint> = visible_cols
+        let constraints: Vec<Constraint> = viewport
+            .visible_indices
             .iter()
-            .map(|w| Constraint::Length((*w as u16) + 2)) // +2 for padding
+            .map(|idx| {
+                let width = col_widths.get(*idx).copied().unwrap_or(3).max(3);
+                Constraint::Length((width as u16) + 2)
+            })
             .collect();
 
+        let (start_col, end_col) = match (
+            viewport.visible_indices.first(),
+            viewport.visible_indices.last(),
+        ) {
+            (Some(start), Some(end)) => (start + 1, end + 1),
+            _ => (1, 1),
+        };
+        let mut overflow_hints: Vec<&str> = Vec::new();
+        if viewport.has_left_overflow {
+            overflow_hints.push("← more");
+        }
+        if viewport.has_right_overflow {
+            overflow_hints.push("→ more");
+        }
+        let overflow_text = if overflow_hints.is_empty() {
+            String::new()
+        } else {
+            format!(" {}", overflow_hints.join(" | "))
+        };
+        let title = format!(
+            " {} • Cols {start_col}-{end_col}/{num_cols}{overflow_text} ",
+            row_info
+        );
+
         // Build header row
-        let header_cells: Vec<Cell> = table_data
-            .headers
+        let header_cells: Vec<Cell> = viewport
+            .visible_indices
             .iter()
-            .skip(col_offset)
-            .enumerate()
-            .map(|(i, h)| {
-                let display = if h.len() > visible_cols.get(i).copied().unwrap_or(30) {
-                    format!("{}…", &h[..visible_cols.get(i).copied().unwrap_or(30) - 1])
-                } else {
-                    h.clone()
-                };
-                Cell::from(display).style(
+            .map(|idx| {
+                Cell::from(table_data.headers.get(*idx).cloned().unwrap_or_default()).style(
                     Style::default()
                         .fg(Color::Cyan)
                         .add_modifier(Modifier::BOLD),
@@ -1299,19 +1330,10 @@ impl App {
             .iter()
             .enumerate()
             .map(|(row_idx, row)| {
-                let cells: Vec<Cell> = row
+                let cells: Vec<Cell> = viewport
+                    .visible_indices
                     .iter()
-                    .skip(col_offset)
-                    .enumerate()
-                    .map(|(i, cell)| {
-                        let max_len = visible_cols.get(i).copied().unwrap_or(30);
-                        let display = if cell.len() > max_len {
-                            format!("{}…", &cell[..max_len - 1])
-                        } else {
-                            cell.clone()
-                        };
-                        Cell::from(display)
-                    })
+                    .map(|idx| Cell::from(row.get(*idx).cloned().unwrap_or_default()))
                     .collect();
 
                 let style = if row_idx == self.preview_selected_row {
@@ -1470,7 +1492,7 @@ impl App {
         buf: &mut Buffer,
         schema_data: &crate::preview::ParquetSchemaPreview,
     ) {
-        let title = format!(" Parquet Schema ({} columns) ", schema_data.fields.len());
+        let title = format!(" Parquet Metadata ({} columns) ", schema_data.fields.len());
 
         // Build metadata section
         let mut lines: Vec<Line> = Vec::new();
@@ -1486,6 +1508,14 @@ impl App {
             Span::styled("─".repeat(30), Style::default().fg(Color::DarkGray)),
         ]));
         lines.push(Line::from(""));
+
+        if let Some(note) = &schema_data.note {
+            lines.push(Line::from(vec![
+                Span::styled("  Note: ", Style::default().fg(Color::Yellow)),
+                Span::styled(note.clone(), Style::default().fg(Color::White)),
+            ]));
+            lines.push(Line::from(""));
+        }
 
         // Row count
         lines.push(Line::from(vec![
@@ -1569,6 +1599,64 @@ impl App {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TableColumnViewport {
+    visible_indices: Vec<usize>,
+    has_left_overflow: bool,
+    has_right_overflow: bool,
+}
+
+/// Compute which table columns fit within the current viewport width.
+fn compute_table_column_viewport(
+    col_widths: &[usize],
+    col_offset: usize,
+    inner_width: usize,
+) -> TableColumnViewport {
+    if col_widths.is_empty() {
+        return TableColumnViewport {
+            visible_indices: Vec::new(),
+            has_left_overflow: false,
+            has_right_overflow: false,
+        };
+    }
+
+    let start = col_offset.min(col_widths.len().saturating_sub(1));
+    let mut visible_indices = Vec::new();
+    let mut used_width = 0usize;
+
+    for (idx, width) in col_widths.iter().enumerate().skip(start) {
+        let col_width = (*width).max(3) + 2; // +2 for cell padding
+        let exceeds = used_width + col_width > inner_width;
+
+        if !visible_indices.is_empty() && exceeds {
+            break;
+        }
+
+        visible_indices.push(idx);
+        used_width += col_width;
+
+        // Always render at least one column, even if it exceeds the viewport width.
+        if visible_indices.len() == 1 && exceeds {
+            break;
+        }
+    }
+
+    if visible_indices.is_empty() {
+        visible_indices.push(start);
+    }
+
+    let has_left_overflow = start > 0;
+    let has_right_overflow = visible_indices
+        .last()
+        .is_some_and(|last| *last + 1 < col_widths.len());
+
+    TableColumnViewport {
+        visible_indices,
+        has_left_overflow,
+        has_right_overflow,
+    }
+}
+
 /// Format bytes in human-readable format
 #[allow(
     clippy::cast_possible_truncation,
@@ -1608,4 +1696,37 @@ fn format_number(n: u64) -> String {
         result.push(c);
     }
     result.chars().rev().collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::compute_table_column_viewport;
+
+    #[test]
+    fn viewport_marks_left_and_right_overflow() {
+        let widths = vec![6, 6, 6, 6, 6];
+        // Each rendered column takes width+2 = 8 chars, so only two fit into 20 chars.
+        let viewport = compute_table_column_viewport(&widths, 1, 20);
+        assert_eq!(viewport.visible_indices, vec![1, 2]);
+        assert!(viewport.has_left_overflow);
+        assert!(viewport.has_right_overflow);
+    }
+
+    #[test]
+    fn viewport_shows_single_column_when_too_narrow() {
+        let widths = vec![40, 10, 10];
+        let viewport = compute_table_column_viewport(&widths, 0, 5);
+        assert_eq!(viewport.visible_indices, vec![0]);
+        assert!(!viewport.has_left_overflow);
+        assert!(viewport.has_right_overflow);
+    }
+
+    #[test]
+    fn viewport_clamps_offset_past_end() {
+        let widths = vec![4, 4, 4];
+        let viewport = compute_table_column_viewport(&widths, 99, 20);
+        assert_eq!(viewport.visible_indices, vec![2]);
+        assert!(viewport.has_left_overflow);
+        assert!(!viewport.has_right_overflow);
+    }
 }

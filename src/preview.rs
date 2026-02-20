@@ -3,6 +3,7 @@
 use std::io::Cursor;
 
 use bytes::Bytes;
+use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::file::reader::{FileReader, SerializedFileReader};
 
 /// Maximum bytes to download for preview (50KB)
@@ -10,6 +11,9 @@ pub const MAX_PREVIEW_BYTES: usize = 50 * 1024;
 
 /// Maximum bytes to download for Parquet preview (1MB - parquet is compressed)
 pub const MAX_PARQUET_PREVIEW_BYTES: usize = 1024 * 1024;
+
+/// Maximum bytes to download for full Parquet table preview (16MB)
+pub const MAX_PARQUET_TABLE_PREVIEW_BYTES: usize = 16 * 1024 * 1024;
 
 /// Maximum rows to display in table preview
 pub const MAX_PREVIEW_ROWS: usize = 100;
@@ -272,6 +276,8 @@ pub struct ParquetSchemaPreview {
     pub file_size: Option<u64>,
     /// Created by (writer version)
     pub created_by: Option<String>,
+    /// Optional informational note shown in the preview.
+    pub note: Option<String>,
 }
 
 /// Parse CSV data from bytes
@@ -648,6 +654,60 @@ pub fn parse_parquet_schema(data: &[u8], file_size: Option<u64>) -> Result<Previ
         num_rows,
         file_size,
         created_by: file_metadata.created_by().map(ToString::to_string),
+        note: None,
+    }))
+}
+
+/// Parse Parquet data as a table preview.
+#[allow(clippy::missing_errors_doc)]
+pub fn parse_parquet_table(data: &[u8]) -> Result<PreviewData, String> {
+    let bytes = Bytes::copy_from_slice(data);
+    let mut builder = ParquetRecordBatchReaderBuilder::try_new(bytes)
+        .map_err(|e| format!("Failed to read Parquet file: {e}"))?;
+
+    let total_rows = builder.metadata().file_metadata().num_rows().max(0) as usize;
+    builder = builder.with_batch_size(MAX_PREVIEW_ROWS);
+
+    let schema = builder.schema().clone();
+    let headers: Vec<String> = schema.fields().iter().map(|f| f.name().clone()).collect();
+
+    let mut rows = Vec::new();
+    let mut reader = builder
+        .build()
+        .map_err(|e| format!("Failed to read Parquet rows: {e}"))?;
+
+    for batch_result in &mut reader {
+        let batch = batch_result.map_err(|e| format!("Failed to read Parquet batch: {e}"))?;
+        for row_idx in 0..batch.num_rows() {
+            if rows.len() >= MAX_PREVIEW_ROWS {
+                break;
+            }
+
+            let mut row = Vec::with_capacity(batch.num_columns());
+            for col_idx in 0..batch.num_columns() {
+                let column = batch.column(col_idx);
+                let value = if column.is_null(row_idx) {
+                    "null".to_string()
+                } else {
+                    arrow::util::display::array_value_to_string(column.as_ref(), row_idx)
+                        .unwrap_or_else(|_| "<error>".to_string())
+                };
+                row.push(value);
+            }
+            rows.push(row);
+        }
+
+        if rows.len() >= MAX_PREVIEW_ROWS {
+            break;
+        }
+    }
+
+    Ok(PreviewData::Table(TablePreview {
+        headers,
+        rows,
+        total_rows,
+        truncated: total_rows > MAX_PREVIEW_ROWS,
+        file_type: PreviewFileType::Parquet,
     }))
 }
 
@@ -938,8 +998,47 @@ mod tests {
             assert_eq!(schema.num_rows, 3);
             assert_eq!(schema.num_row_groups, 1);
             assert!(schema.file_size.is_some());
+            assert!(schema.note.is_none());
         } else {
             panic!("Expected ParquetSchema preview");
+        }
+    }
+
+    #[test]
+    fn test_parquet_table_parsing() {
+        use arrow::array::{Int32Array, StringArray};
+        use arrow::datatypes::{DataType, Field, Schema};
+        use arrow::record_batch::RecordBatch;
+        use parquet::arrow::ArrowWriter;
+        use std::sync::Arc;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("name", DataType::Utf8, false),
+            Field::new("age", DataType::Int32, false),
+        ]));
+
+        let names = StringArray::from(vec!["Alice", "Bob"]);
+        let ages = Int32Array::from(vec![30, 25]);
+        let batch =
+            RecordBatch::try_new(schema.clone(), vec![Arc::new(names), Arc::new(ages)]).unwrap();
+
+        let mut buffer: Vec<u8> = Vec::new();
+        {
+            let mut writer = ArrowWriter::try_new(&mut buffer, schema, None).unwrap();
+            writer.write(&batch).unwrap();
+            writer.close().unwrap();
+        }
+
+        let result = parse_parquet_table(&buffer).unwrap();
+        if let PreviewData::Table(table) = result {
+            assert_eq!(table.headers, vec!["name", "age"]);
+            assert_eq!(table.rows.len(), 2);
+            assert_eq!(table.rows[0], vec!["Alice", "30"]);
+            assert_eq!(table.total_rows, 2);
+            assert_eq!(table.file_type, PreviewFileType::Parquet);
+            assert!(!table.truncated);
+        } else {
+            panic!("Expected table preview");
         }
     }
 
