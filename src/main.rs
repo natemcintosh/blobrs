@@ -20,6 +20,11 @@ fn main() -> color_eyre::Result<()> {
             .enable_all()
             .build()?;
 
-        runtime.block_on(async { App::new(storage_account, access_key).await?.run(terminal).await })
+        runtime.block_on(async {
+            App::new(storage_account, access_key)
+                .await?
+                .run(terminal)
+                .await
+        })
     })
 }
