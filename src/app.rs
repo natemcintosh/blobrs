@@ -664,6 +664,31 @@ impl App {
         }
     }
 
+    fn selected_file_item(&self) -> Option<&FileItem> {
+        let state = self.browsing()?;
+        state.file_items.get(state.selected_index)
+    }
+
+    fn join_blob_path(current_path: &str, name: &str) -> String {
+        if current_path.is_empty() {
+            name.to_string()
+        } else if current_path.ends_with('/') {
+            format!("{current_path}{name}")
+        } else {
+            format!("{current_path}/{name}")
+        }
+    }
+
+    fn join_folder_path(current_path: &str, name: &str) -> String {
+        if current_path.is_empty() {
+            format!("{name}/")
+        } else if current_path.ends_with('/') {
+            format!("{current_path}{name}/")
+        } else {
+            format!("{current_path}/{name}/")
+        }
+    }
+
     fn is_modal_blob_info(&self) -> bool {
         matches!(self.modal, Modal::BlobInfo { .. })
     }
@@ -965,33 +990,21 @@ impl App {
     ///
     /// Returns an error if refreshing the file list fails.
     pub async fn enter_directory(&mut self) -> color_eyre::Result<()> {
-        let (selected_file, current_path) = match self.browsing() {
+        let (selected_item, current_path) = match self.browsing() {
             Some(state) => {
-                if state.files.is_empty() {
+                let Some(item) = self.selected_file_item() else {
                     return Ok(());
-                }
-                (
-                    state.files[state.selected_index].clone(),
-                    state.current_path.clone(),
-                )
+                };
+                (item.clone(), state.current_path.clone())
             }
             None => return Ok(()),
         };
 
-        if selected_file.is_empty() {
+        if selected_item.actual_name.is_empty() {
             return Ok(());
         }
-        // Check if the selected item is a directory (starts with folder icon)
-        let folder_prefix = format!("{folder} ", folder = self.icons.folder);
-        if let Some(dir_name) = selected_file.strip_prefix(&folder_prefix) {
-            let new_path = if current_path.is_empty() {
-                format!("{dir_name}/")
-            } else if current_path.ends_with('/') {
-                format!("{current_path}{dir_name}/")
-            } else {
-                format!("{current_path}/{dir_name}/")
-            };
-
+        if selected_item.kind == EntryKind::Folder {
+            let new_path = Self::join_folder_path(&current_path, &selected_item.actual_name);
             if let Some(state) = self.browsing_mut() {
                 state.current_path = new_path;
             }
@@ -1156,52 +1169,26 @@ impl App {
 
     /// Open the clone dialog for the selected item.
     pub fn open_clone_dialog(&mut self) {
-        let (selected_file, current_path) = match self.browsing() {
+        let (selected_item, current_path) = match self.browsing() {
             Some(state) => {
-                if state.files.is_empty() {
+                let Some(item) = self.selected_file_item() else {
                     return;
-                }
-                (
-                    state.files[state.selected_index].clone(),
-                    state.current_path.clone(),
-                )
+                };
+                (item.clone(), state.current_path.clone())
             }
             None => return,
         };
 
-        let selected_file = selected_file.as_str();
-        let folder_prefix = format!("{folder} ", folder = self.icons.folder);
-        let file_prefix = format!("{file} ", file = self.icons.file);
-
-        let (item_name, is_folder) = if selected_file.starts_with(&folder_prefix) {
-            let name = selected_file
-                .strip_prefix(&folder_prefix)
-                .unwrap_or(selected_file);
-            (name.to_string(), true)
+        let (item_name, is_folder) = if selected_item.kind == EntryKind::Folder {
+            (selected_item.actual_name, true)
         } else {
-            let name = selected_file
-                .strip_prefix(&file_prefix)
-                .unwrap_or(selected_file);
-            (name.to_string(), false)
+            (selected_item.actual_name, false)
         };
 
-        // Construct the full path
-        let full_path = if current_path.is_empty() {
-            if is_folder {
-                format!("{item_name}/")
-            } else {
-                item_name
-            }
-        } else if current_path.ends_with('/') {
-            if is_folder {
-                format!("{current_path}{item_name}/")
-            } else {
-                format!("{current_path}{item_name}")
-            }
-        } else if is_folder {
-            format!("{current_path}/{item_name}/")
+        let full_path = if is_folder {
+            Self::join_folder_path(&current_path, &item_name)
         } else {
-            format!("{current_path}/{item_name}")
+            Self::join_blob_path(&current_path, &item_name)
         };
 
         self.modal = Modal::Clone {
@@ -1396,52 +1383,26 @@ impl App {
 
     /// Open the delete confirmation dialog for the selected item.
     pub fn open_delete_dialog(&mut self) {
-        let (selected_file, current_path) = match self.browsing() {
+        let (selected_item, current_path) = match self.browsing() {
             Some(state) => {
-                if state.files.is_empty() {
+                let Some(item) = self.selected_file_item() else {
                     return;
-                }
-                (
-                    state.files[state.selected_index].clone(),
-                    state.current_path.clone(),
-                )
+                };
+                (item.clone(), state.current_path.clone())
             }
             None => return,
         };
 
-        let selected_file = selected_file.as_str();
-        let folder_prefix = format!("{folder} ", folder = self.icons.folder);
-        let file_prefix = format!("{file} ", file = self.icons.file);
-
-        let (item_name, is_folder) = if selected_file.starts_with(&folder_prefix) {
-            let name = selected_file
-                .strip_prefix(&folder_prefix)
-                .unwrap_or(selected_file);
-            (name.to_string(), true)
+        let (item_name, is_folder) = if selected_item.kind == EntryKind::Folder {
+            (selected_item.actual_name, true)
         } else {
-            let name = selected_file
-                .strip_prefix(&file_prefix)
-                .unwrap_or(selected_file);
-            (name.to_string(), false)
+            (selected_item.actual_name, false)
         };
 
-        // Construct the full path
-        let full_path = if current_path.is_empty() {
-            if is_folder {
-                format!("{item_name}/")
-            } else {
-                item_name.clone()
-            }
-        } else if current_path.ends_with('/') {
-            if is_folder {
-                format!("{current_path}{item_name}/")
-            } else {
-                format!("{current_path}{item_name}")
-            }
-        } else if is_folder {
-            format!("{current_path}/{item_name}/")
+        let full_path = if is_folder {
+            Self::join_folder_path(&current_path, &item_name)
         } else {
-            format!("{current_path}/{item_name}")
+            Self::join_blob_path(&current_path, &item_name)
         };
 
         self.modal = Modal::DeleteConfirm {
@@ -1940,39 +1901,16 @@ impl App {
     ///
     /// Returns an error if fetching blob/folder metadata fails.
     pub async fn show_blob_info(&mut self) -> color_eyre::Result<()> {
-        let selected_file = match self.browsing() {
-            Some(state) => {
-                if state.files.is_empty() {
-                    return Ok(());
-                }
-                state.files[state.selected_index].clone()
-            }
-            None => return Ok(()),
-        };
-
-        if selected_file.is_empty() {
+        let Some(selected_item) = self.selected_file_item().cloned() else {
             return Ok(());
-        }
-        let folder_prefix = format!("{folder} ", folder = self.icons.folder);
-        let file_prefix = format!("{file} ", file = self.icons.file);
-
-        let is_folder = selected_file.starts_with(&folder_prefix);
-        let name = if is_folder {
-            selected_file
-                .strip_prefix(&folder_prefix)
-                .unwrap_or(&selected_file)
-        } else {
-            selected_file
-                .strip_prefix(&file_prefix)
-                .unwrap_or(&selected_file)
         };
 
-        let info = if is_folder {
+        let info = if selected_item.kind == EntryKind::Folder {
             // Get folder information (blob count and total size)
-            self.get_folder_info(name).await?
+            self.get_folder_info(&selected_item.actual_name).await?
         } else {
             // Get individual blob information
-            self.get_blob_info(name).await?
+            self.get_blob_info(&selected_item.actual_name).await?
         };
 
         self.modal = Modal::BlobInfo { info };
@@ -1986,19 +1924,7 @@ impl App {
             .ok_or_else(|| color_eyre::eyre::eyre!("No container selected"))?;
         let object_store = browsing.object_store.clone();
 
-        let folder_path = if browsing.current_path.is_empty() {
-            format!("{folder_name}/")
-        } else if browsing.current_path.ends_with('/') {
-            format!(
-                "{current_path}{folder_name}/",
-                current_path = browsing.current_path
-            )
-        } else {
-            format!(
-                "{current_path}/{folder_name}/",
-                current_path = browsing.current_path
-            )
-        };
+        let folder_path = Self::join_folder_path(&browsing.current_path, folder_name);
 
         let object_path = ObjectPath::from(folder_path.as_str());
 
@@ -2028,19 +1954,7 @@ impl App {
             .ok_or_else(|| color_eyre::eyre::eyre!("No container selected"))?;
         let object_store = browsing.object_store.clone();
 
-        let blob_path = if browsing.current_path.is_empty() {
-            blob_name.to_string()
-        } else if browsing.current_path.ends_with('/') {
-            format!(
-                "{current_path}{blob_name}",
-                current_path = browsing.current_path
-            )
-        } else {
-            format!(
-                "{current_path}/{blob_name}",
-                current_path = browsing.current_path
-            )
-        };
+        let blob_path = Self::join_blob_path(&browsing.current_path, blob_name);
 
         let object_path = ObjectPath::from(blob_path.as_str());
 
@@ -2064,61 +1978,24 @@ impl App {
     ///
     /// Returns an error if clipboard access fails.
     pub fn copy_blob_path_to_clipboard(&mut self) -> color_eyre::Result<()> {
-        let (selected_file, current_path) = match self.browsing() {
+        let (selected_item, current_path) = match self.browsing() {
             Some(state) => {
-                if state.files.is_empty() {
+                let Some(item) = self.selected_file_item() else {
                     return Ok(());
-                }
-                (
-                    state.files[state.selected_index].clone(),
-                    state.current_path.clone(),
-                )
+                };
+                (item.clone(), state.current_path.clone())
             }
             None => return Ok(()),
         };
 
-        if selected_file.is_empty() {
+        if selected_item.actual_name.is_empty() {
             return Ok(());
         }
-        let folder_prefix = format!("{folder} ", folder = self.icons.folder);
-        let file_prefix = format!("{file} ", file = self.icons.file);
-        let selected_file = selected_file.as_str();
-
-        let (item_name, is_folder) = if selected_file.starts_with(&folder_prefix) {
-            // It's a folder
-            let folder_name = if let Some(name) = selected_file.strip_prefix(&folder_prefix) {
-                name
-            } else {
-                selected_file
-            };
-            (folder_name, true)
+        let is_folder = selected_item.kind == EntryKind::Folder;
+        let full_path = if is_folder {
+            Self::join_folder_path(&current_path, &selected_item.actual_name)
         } else {
-            // It's a file
-            let file_name = if let Some(name) = selected_file.strip_prefix(&file_prefix) {
-                name
-            } else {
-                selected_file
-            };
-            (file_name, false)
-        };
-
-        // Construct the full path
-        let full_path = if current_path.is_empty() {
-            if is_folder {
-                format!("{item_name}/")
-            } else {
-                item_name.to_string()
-            }
-        } else if current_path.ends_with('/') {
-            if is_folder {
-                format!("{current_path}{item_name}/")
-            } else {
-                format!("{current_path}{item_name}")
-            }
-        } else if is_folder {
-            format!("{current_path}/{item_name}/")
-        } else {
-            format!("{current_path}/{item_name}")
+            Self::join_blob_path(&current_path, &selected_item.actual_name)
         };
 
         // Copy to clipboard
@@ -2157,38 +2034,15 @@ impl App {
             _ => None,
         };
 
-        let selected_file = match self.browsing() {
-            Some(state) => {
-                if state.files.is_empty() {
-                    return Ok(());
-                }
-                state.files[state.selected_index].clone()
-            }
-            None => return Ok(()),
-        };
-
-        if selected_file.is_empty() || destination.is_none() {
+        let Some(selected_item) = self.selected_file_item().cloned() else {
             return Ok(());
-        }
+        };
 
         let Some(destination) = destination else {
             return Ok(());
         };
-        let folder_prefix = format!("{folder} ", folder = self.icons.folder);
-        let file_prefix = format!("{file} ", file = self.icons.file);
-
-        let is_folder = selected_file.starts_with(&folder_prefix);
-        let name = if is_folder {
-            selected_file
-                .strip_prefix(&folder_prefix)
-                .unwrap_or(&selected_file)
-                .to_string()
-        } else {
-            selected_file
-                .strip_prefix(&file_prefix)
-                .unwrap_or(&selected_file)
-                .to_string()
-        };
+        let is_folder = selected_item.kind == EntryKind::Folder;
+        let name = selected_item.actual_name;
 
         self.async_op = AsyncOp::Downloading(DownloadProgress {
             current_file: String::new(),
@@ -2221,19 +2075,7 @@ impl App {
             .ok_or_else(|| color_eyre::eyre::eyre!("No container selected"))?;
         let object_store = browsing.object_store.clone();
 
-        let blob_path = if browsing.current_path.is_empty() {
-            file_name.to_string()
-        } else if browsing.current_path.ends_with('/') {
-            format!(
-                "{current_path}{file_name}",
-                current_path = browsing.current_path
-            )
-        } else {
-            format!(
-                "{current_path}/{file_name}",
-                current_path = browsing.current_path
-            )
-        };
+        let blob_path = Self::join_blob_path(&browsing.current_path, file_name);
 
         let object_path = ObjectPath::from(blob_path.as_str());
 
@@ -2295,19 +2137,7 @@ impl App {
             .ok_or_else(|| color_eyre::eyre::eyre!("No container selected"))?;
         let object_store = browsing.object_store.clone();
 
-        let folder_path = if browsing.current_path.is_empty() {
-            format!("{folder_name}/")
-        } else if browsing.current_path.ends_with('/') {
-            format!(
-                "{current_path}{folder_name}/",
-                current_path = browsing.current_path
-            )
-        } else {
-            format!(
-                "{current_path}/{folder_name}/",
-                current_path = browsing.current_path
-            )
-        };
+        let folder_path = Self::join_folder_path(&browsing.current_path, folder_name);
 
         let object_path = ObjectPath::from(folder_path.as_str());
 
@@ -2431,38 +2261,31 @@ impl App {
     /// Returns an error if fetching or parsing the file fails.
     #[allow(clippy::too_many_lines)]
     pub async fn load_preview(&mut self) -> color_eyre::Result<()> {
-        let (selected_file, current_path) = match self.browsing() {
+        let (selected_item, current_path) = match self.browsing() {
             Some(state) => {
-                if state.files.is_empty() {
+                let Some(item) = self.selected_file_item() else {
                     return Ok(());
-                }
-                (
-                    state.files[state.selected_index].clone(),
-                    state.current_path.clone(),
-                )
+                };
+                (item.clone(), state.current_path.clone())
             }
             None => return Ok(()),
         };
 
-        if selected_file.is_empty() {
+        if selected_item.actual_name.is_empty() {
             return Ok(());
         }
-        let folder_prefix = format!("{folder} ", folder = self.icons.folder);
-        let file_prefix = format!("{file} ", file = self.icons.file);
 
         // Check if it's a folder
-        if selected_file.starts_with(&folder_prefix) {
+        if selected_item.kind == EntryKind::Folder {
             self.preview_error = Some("Cannot preview folders".to_string());
             self.ui.show_preview = true;
             return Ok(());
         }
 
-        let name = selected_file
-            .strip_prefix(&file_prefix)
-            .unwrap_or(&selected_file);
+        let name = selected_item.actual_name;
 
         // Check file type
-        let file_type = PreviewFileType::from_extension(name);
+        let file_type = PreviewFileType::from_extension(&name);
         if !file_type.is_supported() {
             self.preview_error = Some(
                 "Unsupported file type. Preview supports: CSV, TSV, JSON, Parquet, and text files"
@@ -2491,13 +2314,7 @@ impl App {
             .object_store
             .clone();
 
-        let blob_path = if current_path.is_empty() {
-            name.to_string()
-        } else if current_path.ends_with('/') {
-            format!("{current_path}{name}")
-        } else {
-            format!("{current_path}/{name}")
-        };
+        let blob_path = Self::join_blob_path(&current_path, &name);
 
         let object_path = ObjectPath::from(blob_path.as_str());
 
@@ -2774,7 +2591,14 @@ mod tests {
             object_store: std::sync::Arc::new(object_store::memory::InMemory::new()),
             current_path: String::new(),
             files: vec![format!("{file} file.txt", file = app.icons.file)],
-            file_items: Vec::new(),
+            file_items: vec![super::FileItem {
+                display_name: format!("{file} file.txt", file = app.icons.file),
+                actual_name: "file.txt".to_string(),
+                kind: super::EntryKind::File,
+                size: None,
+                last_modified: None,
+                created: None,
+            }],
             selected_index: 0,
         });
 
@@ -2801,7 +2625,14 @@ mod tests {
             object_store: std::sync::Arc::new(object_store::memory::InMemory::new()),
             current_path: String::new(),
             files: vec![format!("{folder} logs", folder = app.icons.folder)],
-            file_items: Vec::new(),
+            file_items: vec![super::FileItem {
+                display_name: format!("{folder} logs", folder = app.icons.folder),
+                actual_name: "logs".to_string(),
+                kind: super::EntryKind::Folder,
+                size: None,
+                last_modified: None,
+                created: None,
+            }],
             selected_index: 0,
         });
 
