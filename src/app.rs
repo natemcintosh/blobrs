@@ -296,7 +296,7 @@ impl App {
     /// # Errors
     ///
     /// Returns an error if terminal drawing or event handling fails.
-    pub async fn run(mut self, mut terminal: DefaultTerminal) -> color_eyre::Result<()> {
+    pub async fn run(mut self, terminal: &mut DefaultTerminal) -> color_eyre::Result<()> {
         while self.running {
             terminal.draw(|frame| frame.render_widget(&self, frame.area()))?;
             self.handle_events().await?;

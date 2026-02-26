@@ -6,8 +6,7 @@ pub mod preview;
 pub mod terminal_icons;
 pub mod ui;
 
-#[tokio::main]
-async fn main() -> color_eyre::Result<()> {
+fn main() -> color_eyre::Result<()> {
     color_eyre::install()?;
 
     // Initialize Azure Storage Account credentials
@@ -16,11 +15,11 @@ async fn main() -> color_eyre::Result<()> {
     let access_key = std::env::var("AZURE_STORAGE_ACCESS_KEY")
         .expect("AZURE_STORAGE_ACCESS_KEY environment variable not set");
 
-    let terminal = ratatui::init();
-    let result = App::new(storage_account, access_key)
-        .await?
-        .run(terminal)
-        .await;
-    ratatui::restore();
-    result
+    ratatui::run(|terminal| {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()?;
+
+        runtime.block_on(async { App::new(storage_account, access_key).await?.run(terminal).await })
+    })
 }
