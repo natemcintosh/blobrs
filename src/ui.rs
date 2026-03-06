@@ -1733,7 +1733,8 @@ fn format_number(n: u64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::compute_table_column_viewport;
+    use super::{App, compute_table_column_viewport, truncate_with_ellipsis};
+    use proptest::prelude::*;
 
     #[test]
     fn viewport_marks_left_and_right_overflow() {
@@ -1761,5 +1762,29 @@ mod tests {
         assert_eq!(viewport.visible_indices, vec![2]);
         assert!(viewport.has_left_overflow);
         assert!(!viewport.has_right_overflow);
+    }
+
+    proptest! {
+        #[test]
+        fn footer_height_stays_in_expected_bounds(text in ".*", width in any::<u16>()) {
+            let height = App::calculate_footer_height(&text, width);
+            prop_assert!((3..=6).contains(&height));
+            if width <= 4 {
+                prop_assert_eq!(height, 3);
+            }
+        }
+
+        #[test]
+        fn ellipsis_truncation_respects_requested_limits(input in ".*", max_chars in 0_usize..32) {
+            let truncated = truncate_with_ellipsis(&input, max_chars);
+            if input.chars().count() <= max_chars {
+                prop_assert_eq!(truncated, input);
+            } else if max_chars <= 3 {
+                prop_assert_eq!(truncated, "...");
+            } else {
+                prop_assert!(truncated.chars().count() <= max_chars);
+                prop_assert!(truncated.ends_with("..."));
+            }
+        }
     }
 }

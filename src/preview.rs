@@ -777,6 +777,25 @@ fn format_parquet_type(field: &parquet::schema::types::Type) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
+
+    fn arb_json_value() -> impl Strategy<Value = serde_json::Value> {
+        let leaf = prop_oneof![
+            Just(serde_json::Value::Null),
+            any::<bool>().prop_map(serde_json::Value::Bool),
+            any::<i64>().prop_map(|n| serde_json::Value::Number(n.into())),
+            "[ -~]{0,32}".prop_map(serde_json::Value::String),
+        ];
+
+        leaf.prop_recursive(4, 64, 8, |inner| {
+            prop_oneof![
+                prop::collection::vec(inner.clone(), 0..8).prop_map(serde_json::Value::Array),
+                prop::collection::btree_map("[A-Za-z0-9_]{1,8}", inner, 0..8).prop_map(|entries| {
+                    serde_json::Value::Object(serde_json::Map::from_iter(entries))
+                }),
+            ]
+        })
+    }
 
     #[test]
     fn test_file_type_detection() {
@@ -1064,5 +1083,53 @@ mod tests {
 
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("Failed to read Parquet"));
+    }
+
+    proptest! {
+        #[test]
+        fn make_valid_utf8_always_returns_valid_utf8(
+            data in prop::collection::vec(any::<u8>(), 0..1024)
+        ) {
+            let text = make_valid_utf8(&data);
+            prop_assert!(std::str::from_utf8(text.as_bytes()).is_ok());
+        }
+
+        #[test]
+        fn parse_json_handles_arbitrary_valid_json(value in arb_json_value()) {
+            let data = serde_json::to_vec(&value).expect("serializing generated JSON should succeed");
+            let preview = parse_json(&data).expect("valid JSON input should parse");
+
+            match preview {
+                PreviewData::Table(table) => {
+                    prop_assert_eq!(table.file_type, PreviewFileType::Json);
+                    prop_assert!(table.rows.len() <= MAX_PREVIEW_ROWS);
+                    prop_assert!(table.total_rows >= table.rows.len());
+                    prop_assert!(table.rows.iter().all(|row| row.len() == table.headers.len()));
+                }
+                PreviewData::Json(json) => {
+                    let visible_lines = json.content.lines().count();
+                    prop_assert!(json.total_lines >= visible_lines);
+                    if !json.truncated {
+                        prop_assert_eq!(json.total_lines, visible_lines);
+                    }
+                }
+                other => prop_assert!(false, "unexpected preview variant: {other:?}"),
+            }
+        }
+
+        #[test]
+        fn parse_preview_for_unknown_extension_only_yields_text_or_error(
+            data in prop::collection::vec(any::<u8>(), 0..2048)
+        ) {
+            let result = parse_preview(&data, &PreviewFileType::Unsupported);
+            match result {
+                Ok(PreviewData::Text(text)) => {
+                    prop_assert_eq!(text.extension, "TEXT");
+                    prop_assert!(std::str::from_utf8(text.content.as_bytes()).is_ok());
+                }
+                Ok(other) => prop_assert!(false, "unexpected preview variant: {other:?}"),
+                Err(_) => {}
+            }
+        }
     }
 }

@@ -2551,6 +2551,54 @@ mod tests {
     use crate::event::EventHandler;
     use crate::preview::{ParquetSchemaPreview, PreviewData, PreviewFileType, TablePreview};
     use crate::terminal_icons::detect_terminal_icons;
+    use chrono::{TimeZone, Utc};
+    use proptest::prelude::*;
+    use std::collections::BTreeMap;
+
+    fn arb_entry_kind() -> impl Strategy<Value = super::EntryKind> {
+        prop_oneof![Just(super::EntryKind::File), Just(super::EntryKind::Folder)]
+    }
+
+    fn arb_sort_criteria() -> impl Strategy<Value = SortCriteria> {
+        prop_oneof![
+            Just(SortCriteria::Name),
+            Just(SortCriteria::DateModified),
+            Just(SortCriteria::DateCreated),
+            Just(SortCriteria::Size),
+        ]
+    }
+
+    fn arb_timestamp() -> impl Strategy<Value = Option<chrono::DateTime<chrono::Utc>>> {
+        prop::option::of((-2_208_988_800_i64..4_102_444_800_i64).prop_map(|secs| {
+            Utc.timestamp_opt(secs, 0)
+                .single()
+                .expect("generated timestamp should be valid")
+        }))
+    }
+
+    fn arb_file_item() -> impl Strategy<Value = super::FileItem> {
+        (
+            "[A-Za-z0-9_./-]{1,16}",
+            arb_entry_kind(),
+            prop::option::of(0_u64..10_000),
+            arb_timestamp(),
+            arb_timestamp(),
+        )
+            .prop_map(|(actual_name, kind, size, last_modified, created)| {
+                let icon = match kind {
+                    super::EntryKind::File => "[FILE]",
+                    super::EntryKind::Folder => "[DIR]",
+                };
+                super::FileItem {
+                    display_name: format!("{icon} {actual_name}"),
+                    actual_name,
+                    kind,
+                    size,
+                    last_modified,
+                    created,
+                }
+            })
+    }
 
     fn test_app() -> App {
         App {
@@ -2879,5 +2927,136 @@ mod tests {
         }
 
         assert_eq!(app.preview_scroll.1, 2);
+    }
+
+    proptest! {
+        #[test]
+        fn apply_sort_preserves_items_and_folders_stay_first(
+            items in prop::collection::vec(arb_file_item(), 0..40),
+            criteria in arb_sort_criteria(),
+        ) {
+            let mut sorted = items.clone();
+            App::sort_file_items_static(&mut sorted, criteria);
+
+            prop_assert_eq!(sorted.len(), items.len());
+
+            type ItemKey = (
+                String,
+                String,
+                bool,
+                Option<u64>,
+                Option<chrono::DateTime<chrono::Utc>>,
+                Option<chrono::DateTime<chrono::Utc>>,
+            );
+
+            let before = items.iter().fold(BTreeMap::<ItemKey, usize>::new(), |mut acc, item| {
+                *acc.entry((
+                    item.display_name.clone(),
+                    item.actual_name.clone(),
+                    matches!(item.kind, EntryKind::Folder),
+                    item.size,
+                    item.last_modified,
+                    item.created,
+                )).or_default() += 1_usize;
+                acc
+            });
+
+            let after = sorted
+                .iter()
+                .fold(BTreeMap::<ItemKey, usize>::new(), |mut acc, item| {
+                *acc.entry((
+                    item.display_name.clone(),
+                    item.actual_name.clone(),
+                    matches!(item.kind, EntryKind::Folder),
+                    item.size,
+                    item.last_modified,
+                    item.created,
+                ))
+                .or_default() += 1_usize;
+                    acc
+                });
+
+            prop_assert_eq!(before, after);
+
+            let first_file = sorted.iter().position(|item| item.kind == EntryKind::File);
+            if let Some(first_file) = first_file {
+                prop_assert!(sorted[first_file..].iter().all(|item| item.kind == EntryKind::File));
+            }
+        }
+
+        #[test]
+        fn apply_file_search_keeps_subset_and_resets_selection(
+            items in prop::collection::vec(arb_file_item(), 0..30),
+            query in "[A-Za-z0-9_./-]{0,8}",
+        ) {
+            let mut app = test_app();
+            let all_files: Vec<String> = items.iter().map(|item| item.display_name.clone()).collect();
+
+            app.session = Session::Browsing(BrowsingState {
+                object_store: std::sync::Arc::new(object_store::memory::InMemory::new()),
+                current_path: String::new(),
+                files: all_files.clone(),
+                file_items: items.clone(),
+                selected_index: 5,
+            });
+            app.search = Search::Files {
+                query: query.clone(),
+                all_files: all_files.clone(),
+                all_file_items: items.clone(),
+            };
+
+            app.apply_file_search(&query);
+
+            let Session::Browsing(state) = &app.session else {
+                prop_assert!(false, "expected browsing session");
+                return Ok(());
+            };
+
+            prop_assert_eq!(state.selected_index, 0);
+            prop_assert_eq!(
+                state.files.clone(),
+                state.file_items.iter().map(|item| item.display_name.clone()).collect::<Vec<_>>()
+            );
+
+            if query.is_empty() {
+                prop_assert_eq!(state.file_items.len(), items.len());
+            } else {
+                let lowered = query.to_lowercase();
+                prop_assert!(state.file_items.iter().all(|item| item.actual_name.to_lowercase().contains(&lowered)));
+                prop_assert!(state.file_items.len() <= items.len());
+            }
+        }
+
+        #[test]
+        fn preview_horizontal_scroll_stays_within_table_bounds(
+            cols in 0_usize..12,
+            moves in 0_usize..32,
+        ) {
+            let mut app = test_app();
+            app.preview_data = Some(PreviewData::Table(TablePreview {
+                headers: (0..cols).map(|i| format!("col{i}")).collect(),
+                column_types: None,
+                rows: if cols == 0 {
+                    Vec::new()
+                } else {
+                    vec![(0..cols).map(|i| format!("v{i}")).collect()]
+                },
+                total_rows: 1,
+                truncated: false,
+                file_type: PreviewFileType::Csv,
+            }));
+
+            for _ in 0..moves {
+                app.preview_scroll_right();
+            }
+
+            prop_assert!(app.preview_scroll.1 <= cols.saturating_sub(1));
+
+            for _ in 0..moves {
+                app.preview_scroll_left();
+            }
+
+            prop_assert_eq!(app.preview_scroll.1, 0);
+        }
     }
 }
