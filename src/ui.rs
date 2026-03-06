@@ -558,11 +558,8 @@ impl App {
                 info_lines.push(format!("{} Folder Information", self.icons.folder));
                 info_lines.push(String::new());
 
-                let name_display = if name.len() > (popup_width as usize).saturating_sub(8) {
-                    format!("{}...", &name[0..(popup_width as usize).saturating_sub(11)])
-                } else {
-                    name.clone()
-                };
+                let name_display =
+                    truncate_with_ellipsis(name, (popup_width as usize).saturating_sub(11));
                 info_lines.push(format!("Name: {name_display}"));
                 info_lines.push(String::new());
 
@@ -578,11 +575,8 @@ impl App {
                 info_lines.push(format!("{} Blob Information", self.icons.file));
                 info_lines.push(String::new());
 
-                let name_display = if name.len() > (popup_width as usize).saturating_sub(8) {
-                    format!("{}...", &name[0..(popup_width as usize).saturating_sub(11)])
-                } else {
-                    name.clone()
-                };
+                let name_display =
+                    truncate_with_ellipsis(name, (popup_width as usize).saturating_sub(11));
                 info_lines.push(format!("Name: {name_display}"));
                 info_lines.push(String::new());
 
@@ -590,11 +584,8 @@ impl App {
                 info_lines.push(format!("Modified: {last_modified}"));
 
                 if let Some(etag) = etag {
-                    let etag_display = if etag.len() > (popup_width as usize).saturating_sub(8) {
-                        format!("{}...", &etag[0..(popup_width as usize).saturating_sub(11)])
-                    } else {
-                        etag.clone()
-                    };
+                    let etag_display =
+                        truncate_with_ellipsis(etag, (popup_width as usize).saturating_sub(11));
                     info_lines.push(format!("ETag: {etag_display}"));
                 }
             }
@@ -654,11 +645,11 @@ impl App {
             }
         }
 
-        let selected_file = if browsing.files.is_empty() {
-            "No file selected"
-        } else {
-            &browsing.files[browsing.selected_index]
-        };
+        let selected_file = browsing
+            .files
+            .get(browsing.selected_index)
+            .map(std::string::String::as_str)
+            .unwrap_or("No file selected");
 
         // Extract the name without the icon prefix
         let folder_prefix = format!("{} ", self.icons.folder);
@@ -1714,6 +1705,17 @@ fn format_bytes(bytes: u64) -> String {
     } else {
         format!("{:.1} {}", size, UNITS[unit_index])
     }
+}
+
+fn truncate_with_ellipsis(input: &str, max_chars: usize) -> String {
+    if input.chars().count() <= max_chars {
+        return input.to_string();
+    }
+    if max_chars <= 3 {
+        return "...".to_string();
+    }
+    let prefix: String = input.chars().take(max_chars - 3).collect();
+    format!("{prefix}...")
 }
 
 /// Format a number with thousand separators
