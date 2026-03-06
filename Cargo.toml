@@ -14,7 +14,7 @@ object_store = { version = "0.13", features = ["azure"] }
 tokio = { version = "1", features = ["full"] }
 url = "2.5"
 futures = "0.3"
-reqwest = { version = "0.12", features = ["json"] }
+reqwest = { version = "0.13", features = ["json"] }
 serde = { version = "1.0", features = ["derive"] }
 chrono = { version = "0.4", features = ["serde"] }
 base64 = "0.22"
@@ -29,4 +29,4 @@ csv = "1.3"
 serde_json = "1.0"
 parquet = "58"
 arrow = "58"
-bytes = "1.5"
+bytes = "1.11"
