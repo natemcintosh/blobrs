@@ -689,6 +689,10 @@ impl App {
         }
     }
 
+    fn object_path(path: &str) -> color_eyre::Result<ObjectPath> {
+        Ok(ObjectPath::parse(path.trim_end_matches('/'))?)
+    }
+
     fn is_modal_blob_info(&self) -> bool {
         matches!(self.modal, Modal::BlobInfo { .. })
     }
@@ -781,7 +785,7 @@ impl App {
         let result = if prefix.is_empty() {
             object_store.list_with_delimiter(None).await?
         } else {
-            let object_path = ObjectPath::from(prefix);
+            let object_path = Self::object_path(prefix)?;
             object_store.list_with_delimiter(Some(&object_path)).await?
         };
         let mut items = Vec::new();
@@ -1254,8 +1258,8 @@ impl App {
             .object_store
             .clone();
 
-        let source_path = ObjectPath::from(source);
-        let dest_path = ObjectPath::from(destination);
+        let source_path = Self::object_path(source)?;
+        let dest_path = Self::object_path(destination)?;
 
         // Update progress
         if let AsyncOp::Cloning(progress) = &mut self.async_op {
@@ -1282,7 +1286,7 @@ impl App {
             .object_store
             .clone();
 
-        let source_path = ObjectPath::from(source);
+        let source_path = Self::object_path(source)?;
 
         // List all files in the source folder
         let stream = object_store.list(Some(&source_path));
@@ -1314,7 +1318,7 @@ impl App {
                     }
 
                     // Copy the file
-                    let dest_object_path = ObjectPath::from(dest_file_path.as_str());
+                    let dest_object_path = Self::object_path(dest_file_path.as_str())?;
                     if let Err(e) = object_store.copy(&meta.location, &dest_object_path).await {
                         if let AsyncOp::Cloning(progress) = &mut self.async_op {
                             progress.error_message =
@@ -1463,7 +1467,7 @@ impl App {
             .object_store
             .clone();
 
-        let object_path = ObjectPath::from(path);
+        let object_path = Self::object_path(path)?;
 
         // Update progress
         if let AsyncOp::Deleting(progress) = &mut self.async_op {
@@ -1489,7 +1493,7 @@ impl App {
             .object_store
             .clone();
 
-        let prefix_path = ObjectPath::from(prefix);
+        let prefix_path = Self::object_path(prefix)?;
 
         // List all files in the folder
         let stream = object_store.list(Some(&prefix_path));
@@ -1926,7 +1930,7 @@ impl App {
 
         let folder_path = Self::join_folder_path(&browsing.current_path, folder_name);
 
-        let object_path = ObjectPath::from(folder_path.as_str());
+        let object_path = Self::object_path(folder_path.as_str())?;
 
         // List all objects in this folder (recursively)
         let mut blob_count = 0;
@@ -1956,7 +1960,7 @@ impl App {
 
         let blob_path = Self::join_blob_path(&browsing.current_path, blob_name);
 
-        let object_path = ObjectPath::from(blob_path.as_str());
+        let object_path = Self::object_path(blob_path.as_str())?;
 
         match object_store.head(&object_path).await {
             Ok(meta) => Ok(BlobInfo::File {
@@ -2077,7 +2081,7 @@ impl App {
 
         let blob_path = Self::join_blob_path(&browsing.current_path, file_name);
 
-        let object_path = ObjectPath::from(blob_path.as_str());
+        let object_path = Self::object_path(blob_path.as_str())?;
 
         // Initialize progress
         self.async_op = AsyncOp::Downloading(DownloadProgress {
@@ -2139,7 +2143,7 @@ impl App {
 
         let folder_path = Self::join_folder_path(&browsing.current_path, folder_name);
 
-        let object_path = ObjectPath::from(folder_path.as_str());
+        let object_path = Self::object_path(folder_path.as_str())?;
 
         // Create destination folder
         let folder_destination = destination.join(folder_name);
@@ -2316,7 +2320,7 @@ impl App {
 
         let blob_path = Self::join_blob_path(&current_path, &name);
 
-        let object_path = ObjectPath::from(blob_path.as_str());
+        let object_path = Self::object_path(blob_path.as_str())?;
 
         // For Parquet files, support both table and metadata views.
         if file_type == PreviewFileType::Parquet {
@@ -2552,8 +2556,10 @@ mod tests {
     use crate::preview::{ParquetSchemaPreview, PreviewData, PreviewFileType, TablePreview};
     use crate::terminal_icons::detect_terminal_icons;
     use chrono::{TimeZone, Utc};
+    use object_store::{ObjectStoreExt, path::Path as ObjectPath};
     use proptest::prelude::*;
     use std::collections::BTreeMap;
+    use std::sync::Arc;
 
     fn arb_entry_kind() -> impl Strategy<Value = super::EntryKind> {
         prop_oneof![Just(super::EntryKind::File), Just(super::EntryKind::Folder)]
@@ -2845,6 +2851,46 @@ mod tests {
             assert_eq!(state.files.len(), 2);
         }
         assert!(matches!(app.search, Search::Inactive));
+    }
+
+    #[tokio::test]
+    async fn entering_percent_encoded_folder_lists_children() -> color_eyre::Result<()> {
+        let store = object_store::memory::InMemory::new();
+        let parent_path =
+            "ducklake-data/main/model_output/reference_date=2026-06-24/output_type=sample";
+        let folder_name = "target=inc%20covid%20ed%20visits";
+        let blob_name = "part-000.parquet";
+        let blob_path = format!("{parent_path}/{folder_name}/{blob_name}");
+
+        store
+            .put(&ObjectPath::parse(&blob_path)?, "payload".into())
+            .await?;
+
+        let mut app = test_app();
+        app.session = Session::Browsing(BrowsingState {
+            object_store: Arc::new(store),
+            current_path: parent_path.to_string(),
+            files: Vec::new(),
+            file_items: Vec::new(),
+            selected_index: 0,
+        });
+
+        app.refresh_files().await?;
+
+        let state = app.browsing().expect("expected browsing session");
+        assert_eq!(state.file_items.len(), 1);
+        assert_eq!(state.file_items[0].actual_name, folder_name);
+        assert_eq!(state.file_items[0].kind, EntryKind::Folder);
+
+        app.enter_directory().await?;
+
+        let state = app.browsing().expect("expected browsing session");
+        assert_eq!(state.current_path, format!("{parent_path}/{folder_name}/"));
+        assert_eq!(state.file_items.len(), 1);
+        assert_eq!(state.file_items[0].actual_name, blob_name);
+        assert_eq!(state.file_items[0].kind, EntryKind::File);
+
+        Ok(())
     }
 
     #[test]
