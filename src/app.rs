@@ -110,16 +110,6 @@ pub enum Modal {
 }
 
 #[derive(Debug, Clone)]
-pub enum AsyncOp {
-    None,
-    LoadingContainers,
-    LoadingFiles,
-    Downloading(DownloadProgress),
-    Cloning(CloneProgress),
-    Deleting(DeleteProgress),
-}
-
-#[derive(Debug, Clone)]
 pub enum Search {
     Inactive,
     Containers {
@@ -163,8 +153,6 @@ pub struct App {
     pub all_containers: Vec<ContainerInfo>,
     /// Currently selected container index.
     pub selected_container_index: usize,
-    /// Current async operation (loading, downloading, etc.).
-    pub async_op: AsyncOp,
     /// Error message to display.
     pub error_message: Option<String>,
     /// Success message to display.
@@ -197,32 +185,6 @@ pub struct App {
     pub parquet_schema_data: Option<ParquetSchemaPreview>,
 }
 
-#[derive(Debug, Clone)]
-pub struct DeleteProgress {
-    pub current_file: String,
-    pub files_completed: usize,
-    pub total_files: usize,
-    pub error_message: Option<String>,
-}
-
-#[derive(Debug, Clone)]
-pub struct CloneProgress {
-    pub current_file: String,
-    pub files_completed: usize,
-    pub total_files: usize,
-    pub error_message: Option<String>,
-}
-
-#[derive(Debug, Clone)]
-pub struct DownloadProgress {
-    pub current_file: String,
-    pub files_completed: usize,
-    pub total_files: usize,
-    pub bytes_downloaded: u64,
-    pub total_bytes: Option<u64>,
-    pub error_message: Option<String>,
-}
-
 impl std::fmt::Debug for App {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("App")
@@ -232,7 +194,6 @@ impl std::fmt::Debug for App {
             .field("containers", &self.containers)
             .field("all_containers", &self.all_containers)
             .field("selected_container_index", &self.selected_container_index)
-            .field("async_op", &self.async_op)
             .field("error_message", &self.error_message)
             .field("success_message", &self.success_message)
             .field("search", &self.search)
@@ -265,7 +226,6 @@ impl App {
             containers: Vec::new(),
             all_containers: Vec::new(),
             selected_container_index: 0,
-            async_op: AsyncOp::None,
             error_message: None,
             success_message: None,
             search: Search::Inactive,
@@ -350,11 +310,6 @@ impl App {
             return self.handle_search_key_event(key_event);
         }
 
-        // Don't process keys while loading, cloning, or deleting
-        if self.blocks_input() {
-            return Ok(());
-        }
-
         // Global keys
         match key_event.code {
             KeyCode::Char('q') => {
@@ -421,12 +376,9 @@ impl App {
                 KeyCode::Char('p') => {
                     if !self.is_modal_blob_info()
                         && !self.is_modal_download_picker()
-                        && !self.is_downloading()
                         && !self.is_modal_sort_picker()
                         && !self.is_modal_clone_dialog()
-                        && !self.is_cloning()
                         && !self.is_modal_delete_dialog()
-                        && !self.is_deleting()
                     {
                         if self.ui.show_preview {
                             // Toggle off
@@ -447,7 +399,6 @@ impl App {
                 KeyCode::Char('d') => {
                     if !self.is_modal_blob_info()
                         && !self.is_modal_download_picker()
-                        && !self.is_downloading()
                         && !self.is_modal_sort_picker()
                     {
                         self.show_download_picker();
@@ -456,7 +407,6 @@ impl App {
                 KeyCode::Char('s') => {
                     if !self.is_modal_blob_info()
                         && !self.is_modal_download_picker()
-                        && !self.is_downloading()
                         && !self.is_modal_sort_picker()
                     {
                         self.modal = Modal::SortPicker;
@@ -495,10 +445,8 @@ impl App {
                 KeyCode::Char('y') => {
                     if !self.is_modal_blob_info()
                         && !self.is_modal_download_picker()
-                        && !self.is_downloading()
                         && !self.is_modal_sort_picker()
                         && !self.is_modal_clone_dialog()
-                        && !self.is_cloning()
                     {
                         // Copy blob path to clipboard
                         if let Err(e) = self.copy_blob_path_to_clipboard() {
@@ -509,12 +457,9 @@ impl App {
                 KeyCode::Char('c') => {
                     if !self.is_modal_blob_info()
                         && !self.is_modal_download_picker()
-                        && !self.is_downloading()
                         && !self.is_modal_sort_picker()
                         && !self.is_modal_clone_dialog()
-                        && !self.is_cloning()
                         && !self.is_modal_delete_dialog()
-                        && !self.is_deleting()
                     {
                         // Open clone dialog
                         self.open_clone_dialog();
@@ -523,12 +468,9 @@ impl App {
                 KeyCode::Char('x') | KeyCode::Delete => {
                     if !self.is_modal_blob_info()
                         && !self.is_modal_download_picker()
-                        && !self.is_downloading()
                         && !self.is_modal_sort_picker()
                         && !self.is_modal_clone_dialog()
-                        && !self.is_cloning()
                         && !self.is_modal_delete_dialog()
-                        && !self.is_deleting()
                     {
                         // Open delete dialog
                         self.open_delete_dialog();
@@ -717,14 +659,6 @@ impl App {
         self.modal = Modal::None;
     }
 
-    pub(crate) fn is_loading_containers(&self) -> bool {
-        matches!(self.async_op, AsyncOp::LoadingContainers)
-    }
-
-    pub(crate) fn is_loading_files(&self) -> bool {
-        matches!(self.async_op, AsyncOp::LoadingFiles)
-    }
-
     pub(crate) fn is_searching_containers(&self) -> bool {
         matches!(self.search, Search::Containers { .. })
     }
@@ -745,28 +679,6 @@ impl App {
             Search::Files { query, .. } => Some(query.as_str()),
             _ => None,
         }
-    }
-
-    fn is_downloading(&self) -> bool {
-        matches!(self.async_op, AsyncOp::Downloading(_))
-    }
-
-    fn is_cloning(&self) -> bool {
-        matches!(self.async_op, AsyncOp::Cloning(_))
-    }
-
-    fn is_deleting(&self) -> bool {
-        matches!(self.async_op, AsyncOp::Deleting(_))
-    }
-
-    fn blocks_input(&self) -> bool {
-        matches!(
-            self.async_op,
-            AsyncOp::LoadingContainers
-                | AsyncOp::LoadingFiles
-                | AsyncOp::Cloning(_)
-                | AsyncOp::Deleting(_)
-        )
     }
 
     /// Set running to false to quit the application.
@@ -915,7 +827,6 @@ impl App {
             None => return Ok(()),
         };
 
-        self.async_op = AsyncOp::LoadingFiles;
         self.error_message = None;
         self.success_message = None;
 
@@ -966,7 +877,6 @@ impl App {
             }
         }
 
-        self.async_op = AsyncOp::None;
         Ok(())
     }
 
@@ -1222,20 +1132,11 @@ impl App {
             new_path.push('/');
         }
 
-        self.async_op = AsyncOp::Cloning(CloneProgress {
-            current_file: String::new(),
-            files_completed: 0,
-            total_files: 0,
-            error_message: None,
-        });
-
         let result = if is_folder {
             self.clone_folder(&original_path, &new_path).await
         } else {
             self.clone_blob(&original_path, &new_path).await
         };
-
-        self.async_op = AsyncOp::None;
 
         if result.is_ok() {
             let orig = original_path.trim_end_matches('/');
@@ -1261,19 +1162,8 @@ impl App {
         let source_path = Self::object_path(source)?;
         let dest_path = Self::object_path(destination)?;
 
-        // Update progress
-        if let AsyncOp::Cloning(progress) = &mut self.async_op {
-            progress.current_file = source.to_string();
-            progress.total_files = 1;
-        }
-
         // Use copy operation (server-side copy)
         object_store.copy(&source_path, &dest_path).await?;
-
-        // Update progress
-        if let AsyncOp::Cloning(progress) = &mut self.async_op {
-            progress.files_completed = 1;
-        }
 
         Ok(())
     }
@@ -1292,54 +1182,18 @@ impl App {
         let stream = object_store.list(Some(&source_path));
         let objects: Vec<_> = stream.collect().await;
 
-        let total_files = objects.len();
+        for meta in objects.into_iter().flatten() {
+            let file_path = meta.location.as_ref();
 
-        // Update progress
-        if let AsyncOp::Cloning(progress) = &mut self.async_op {
-            progress.total_files = total_files;
-        }
+            // Calculate relative path from source
+            let relative_path = file_path.strip_prefix(source).unwrap_or(file_path);
 
-        let mut files_completed = 0;
+            // Construct destination path
+            let dest_file_path = format!("{destination}{relative_path}");
 
-        for result in objects {
-            match result {
-                Ok(meta) => {
-                    let file_path = meta.location.as_ref();
-
-                    // Calculate relative path from source
-                    let relative_path = file_path.strip_prefix(source).unwrap_or(file_path);
-
-                    // Construct destination path
-                    let dest_file_path = format!("{destination}{relative_path}");
-
-                    // Update progress
-                    if let AsyncOp::Cloning(progress) = &mut self.async_op {
-                        progress.current_file = file_path.to_string();
-                    }
-
-                    // Copy the file
-                    let dest_object_path = Self::object_path(dest_file_path.as_str())?;
-                    if let Err(e) = object_store.copy(&meta.location, &dest_object_path).await {
-                        if let AsyncOp::Cloning(progress) = &mut self.async_op {
-                            progress.error_message =
-                                Some(format!("Failed to clone {file_path}: {e}"));
-                        }
-                        // Continue with other files even if one fails
-                    } else {
-                        files_completed += 1;
-
-                        // Update progress
-                        if let AsyncOp::Cloning(progress) = &mut self.async_op {
-                            progress.files_completed = files_completed;
-                        }
-                    }
-                }
-                Err(e) => {
-                    if let AsyncOp::Cloning(progress) = &mut self.async_op {
-                        progress.error_message = Some(format!("Failed to list file: {e}"));
-                    }
-                }
-            }
+            // Copy the file, continuing if it fails.
+            let dest_object_path = Self::object_path(dest_file_path.as_str())?;
+            let _ = object_store.copy(&meta.location, &dest_object_path).await;
         }
 
         Ok(())
@@ -1432,20 +1286,11 @@ impl App {
             _ => return Ok(()),
         };
 
-        self.async_op = AsyncOp::Deleting(DeleteProgress {
-            current_file: String::new(),
-            files_completed: 0,
-            total_files: 0,
-            error_message: None,
-        });
-
         let result = if is_folder {
             self.delete_folder(&target_path).await
         } else {
             self.delete_blob(&target_path).await
         };
-
-        self.async_op = AsyncOp::None;
 
         if result.is_ok() {
             let name = target_path.trim_end_matches('/');
@@ -1469,18 +1314,7 @@ impl App {
 
         let object_path = Self::object_path(path)?;
 
-        // Update progress
-        if let AsyncOp::Deleting(progress) = &mut self.async_op {
-            progress.current_file = path.to_string();
-            progress.total_files = 1;
-        }
-
         object_store.delete(&object_path).await?;
-
-        // Update progress
-        if let AsyncOp::Deleting(progress) = &mut self.async_op {
-            progress.files_completed = 1;
-        }
 
         Ok(())
     }
@@ -1499,47 +1333,9 @@ impl App {
         let stream = object_store.list(Some(&prefix_path));
         let objects: Vec<_> = stream.collect().await;
 
-        let total_files = objects.len();
-
-        // Update progress
-        if let AsyncOp::Deleting(progress) = &mut self.async_op {
-            progress.total_files = total_files;
-        }
-
-        let mut files_completed = 0;
-
-        for result in objects {
-            match result {
-                Ok(meta) => {
-                    let file_path = meta.location.as_ref();
-
-                    // Update progress
-                    if let AsyncOp::Deleting(progress) = &mut self.async_op {
-                        progress.current_file = file_path.to_string();
-                    }
-
-                    // Delete the file
-                    if let Err(e) = object_store.delete(&meta.location).await {
-                        if let AsyncOp::Deleting(progress) = &mut self.async_op {
-                            progress.error_message =
-                                Some(format!("Failed to delete {file_path}: {e}"));
-                        }
-                        // Continue with other files even if one fails
-                    } else {
-                        files_completed += 1;
-
-                        // Update progress
-                        if let AsyncOp::Deleting(progress) = &mut self.async_op {
-                            progress.files_completed = files_completed;
-                        }
-                    }
-                }
-                Err(e) => {
-                    if let AsyncOp::Deleting(progress) = &mut self.async_op {
-                        progress.error_message = Some(format!("Failed to list file: {e}"));
-                    }
-                }
-            }
+        for meta in objects.into_iter().flatten() {
+            // Continue with other files even if one fails.
+            let _ = object_store.delete(&meta.location).await;
         }
 
         Ok(())
@@ -1617,7 +1413,6 @@ impl App {
 
     /// Load the list of containers from Azure Storage.
     async fn load_containers(&mut self) -> color_eyre::Result<()> {
-        self.async_op = AsyncOp::LoadingContainers;
         self.error_message = None;
         self.success_message = None;
 
@@ -1652,7 +1447,6 @@ impl App {
             }
         }
 
-        self.async_op = AsyncOp::None;
         Ok(())
     }
 
@@ -2048,14 +1842,6 @@ impl App {
         let is_folder = selected_item.kind == EntryKind::Folder;
         let name = selected_item.actual_name;
 
-        self.async_op = AsyncOp::Downloading(DownloadProgress {
-            current_file: String::new(),
-            files_completed: 0,
-            total_files: 0,
-            bytes_downloaded: 0,
-            total_bytes: None,
-            error_message: None,
-        });
         self.close_modal();
 
         if is_folder {
@@ -2064,7 +1850,6 @@ impl App {
             self.download_file(&name, &destination).await?;
         }
 
-        self.async_op = AsyncOp::None;
         Ok(())
     }
 
@@ -2083,23 +1868,6 @@ impl App {
 
         let object_path = Self::object_path(blob_path.as_str())?;
 
-        // Initialize progress
-        self.async_op = AsyncOp::Downloading(DownloadProgress {
-            current_file: file_name.to_string(),
-            files_completed: 0,
-            total_files: 1,
-            bytes_downloaded: 0,
-            total_bytes: None,
-            error_message: None,
-        });
-
-        // Get file metadata for total size
-        if let Ok(meta) = object_store.head(&object_path).await
-            && let AsyncOp::Downloading(progress) = &mut self.async_op
-        {
-            progress.total_bytes = Some(meta.size);
-        }
-
         // Create destination file path
         let file_destination = destination.join(file_name);
 
@@ -2113,16 +1881,8 @@ impl App {
             Ok(get_result) => {
                 let bytes = get_result.bytes().await?;
                 fs::write(&file_destination, &bytes)?;
-
-                if let AsyncOp::Downloading(progress) = &mut self.async_op {
-                    progress.bytes_downloaded = bytes.len() as u64;
-                    progress.files_completed = 1;
-                }
             }
             Err(e) => {
-                if let AsyncOp::Downloading(progress) = &mut self.async_op {
-                    progress.error_message = Some(format!("Failed to download {file_name}: {e}"));
-                }
                 return Err(color_eyre::eyre::eyre!("Download failed: {}", e));
             }
         }
@@ -2153,68 +1913,22 @@ impl App {
         let stream = object_store.list(Some(&object_path));
         let objects: Vec<_> = stream.collect().await;
 
-        let total_files = objects.len();
-        let mut files_completed = 0;
-        let mut total_bytes_downloaded = 0u64;
+        for meta in objects.into_iter().flatten() {
+            let file_path = meta.location.as_ref();
+            let relative_path = file_path.strip_prefix(&folder_path).unwrap_or(file_path);
 
-        // Initialize progress
-        self.async_op = AsyncOp::Downloading(DownloadProgress {
-            current_file: String::new(),
-            files_completed: 0,
-            total_files,
-            bytes_downloaded: 0,
-            total_bytes: None,
-            error_message: None,
-        });
+            // Create full destination path
+            let file_destination = folder_destination.join(relative_path);
 
-        for result in objects {
-            match result {
-                Ok(meta) => {
-                    let file_path = meta.location.as_ref();
-                    let relative_path = file_path.strip_prefix(&folder_path).unwrap_or(file_path);
+            // Ensure parent directory exists
+            if let Some(parent) = file_destination.parent() {
+                fs::create_dir_all(parent)?;
+            }
 
-                    // Update progress
-                    if let AsyncOp::Downloading(progress) = &mut self.async_op {
-                        progress.current_file = relative_path.to_string();
-                    }
-
-                    // Create full destination path
-                    let file_destination = folder_destination.join(relative_path);
-
-                    // Ensure parent directory exists
-                    if let Some(parent) = file_destination.parent() {
-                        fs::create_dir_all(parent)?;
-                    }
-
-                    // Download the file
-                    match object_store.get(&meta.location).await {
-                        Ok(get_result) => {
-                            let bytes = get_result.bytes().await?;
-                            fs::write(&file_destination, &bytes)?;
-
-                            files_completed += 1;
-                            total_bytes_downloaded += bytes.len() as u64;
-
-                            // Update progress
-                            if let AsyncOp::Downloading(progress) = &mut self.async_op {
-                                progress.files_completed = files_completed;
-                                progress.bytes_downloaded = total_bytes_downloaded;
-                            }
-                        }
-                        Err(e) => {
-                            if let AsyncOp::Downloading(progress) = &mut self.async_op {
-                                progress.error_message =
-                                    Some(format!("Failed to download {relative_path}: {e}"));
-                            }
-                            // Continue with other files even if one fails
-                        }
-                    }
-                }
-                Err(e) => {
-                    if let AsyncOp::Downloading(progress) = &mut self.async_op {
-                        progress.error_message = Some(format!("Failed to list file: {e}"));
-                    }
-                }
+            // Download the file, continuing if fetching it fails.
+            if let Ok(get_result) = object_store.get(&meta.location).await {
+                let bytes = get_result.bytes().await?;
+                fs::write(&file_destination, &bytes)?;
             }
         }
 
@@ -2549,8 +2263,8 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::{
-        App, AsyncOp, BrowsingState, EntryKind, Modal, ParquetPreviewMode, Search, Session,
-        SortCriteria, UiToggles,
+        App, BrowsingState, EntryKind, Modal, ParquetPreviewMode, Search, Session, SortCriteria,
+        UiToggles,
     };
     use crate::event::EventHandler;
     use crate::preview::{ParquetSchemaPreview, PreviewData, PreviewFileType, TablePreview};
@@ -2616,7 +2330,6 @@ mod tests {
             containers: Vec::new(),
             all_containers: Vec::new(),
             selected_container_index: 0,
-            async_op: AsyncOp::None,
             error_message: None,
             success_message: None,
             search: Search::Inactive,
@@ -2727,45 +2440,6 @@ mod tests {
             }
             _ => panic!("Expected download picker modal"),
         }
-    }
-
-    #[test]
-    fn async_op_helpers_reflect_state() {
-        let mut app = test_app();
-
-        app.async_op = AsyncOp::LoadingContainers;
-        assert!(app.is_loading_containers());
-        assert!(!app.is_loading_files());
-
-        app.async_op = AsyncOp::LoadingFiles;
-        assert!(app.is_loading_files());
-        assert!(!app.is_loading_containers());
-
-        app.async_op = AsyncOp::Downloading(super::DownloadProgress {
-            current_file: "a".to_string(),
-            files_completed: 0,
-            total_files: 1,
-            bytes_downloaded: 0,
-            total_bytes: None,
-            error_message: None,
-        });
-        assert!(app.is_downloading());
-
-        app.async_op = AsyncOp::Cloning(super::CloneProgress {
-            current_file: "a".to_string(),
-            files_completed: 0,
-            total_files: 1,
-            error_message: None,
-        });
-        assert!(app.is_cloning());
-
-        app.async_op = AsyncOp::Deleting(super::DeleteProgress {
-            current_file: "a".to_string(),
-            files_completed: 0,
-            total_files: 1,
-            error_message: None,
-        });
-        assert!(app.is_deleting());
     }
 
     #[test]

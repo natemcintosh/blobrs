@@ -9,7 +9,7 @@ use ratatui::{
     },
 };
 
-use crate::app::{App, AsyncOp, Modal, ParquetPreviewMode, Session};
+use crate::app::{App, Modal, ParquetPreviewMode, Session};
 use crate::preview::PreviewData;
 
 impl Widget for &App {
@@ -46,18 +46,7 @@ impl Widget for &App {
                     Modal::SortPicker => {
                         App::render_sort_popup(area, buf);
                     }
-                    Modal::None => match &self.async_op {
-                        AsyncOp::Deleting(progress) => {
-                            App::render_delete_progress_popup(area, buf, progress);
-                        }
-                        AsyncOp::Cloning(progress) => {
-                            App::render_clone_progress_popup(area, buf, progress);
-                        }
-                        AsyncOp::Downloading(progress) => {
-                            App::render_download_progress_popup(area, buf, progress);
-                        }
-                        _ => {}
-                    },
+                    Modal::None => {}
                 }
             }
         }
@@ -107,10 +96,7 @@ impl App {
         }
 
         // Add space for error or success message if present
-        if self.error_message.is_some()
-            || self.success_message.is_some()
-            || self.is_loading_containers()
-        {
+        if self.error_message.is_some() || self.success_message.is_some() {
             // Calculate height based on message length and terminal width
             #[allow(clippy::cast_possible_truncation)] // UI text lengths are always small
             let message_height = if let Some(error) = &self.error_message {
@@ -139,7 +125,7 @@ impl App {
             } else {
                 3
             };
-            constraints.push(Constraint::Length(message_height)); // Message/loading area
+            constraints.push(Constraint::Length(message_height)); // Message area
         }
 
         constraints.push(Constraint::Length(footer_height)); // Footer for instructions
@@ -150,12 +136,7 @@ impl App {
             .split(area);
 
         // Container list
-        let container_items: Vec<ListItem> = if self.is_loading_containers() {
-            vec![ListItem::new(format!(
-                "{loading} Loading containers...",
-                loading = self.icons.loading
-            ))]
-        } else if self.containers.is_empty() {
+        let container_items: Vec<ListItem> = if self.containers.is_empty() {
             let has_query = self.container_search_query().is_some_and(|q| !q.is_empty());
             if self.is_searching_containers() && has_query {
                 vec![ListItem::new(format!(
@@ -179,7 +160,7 @@ impl App {
         };
 
         let mut list_state = ListState::default();
-        if !self.is_loading_containers() && !self.containers.is_empty() {
+        if !self.containers.is_empty() {
             list_state.select(Some(self.selected_container_index));
         }
 
@@ -228,7 +209,7 @@ impl App {
             chunk_index += 1;
         }
 
-        // Error/Success/Loading message if present
+        // Error/success message if present
         if let Some(error) = &self.error_message {
             let error_widget = Paragraph::new(format!(
                 "{error_icon} {error}",
@@ -250,16 +231,6 @@ impl App {
             .wrap(ratatui::widgets::Wrap { trim: true })
             .alignment(Alignment::Left);
             success_widget.render(chunks[chunk_index], buf);
-            chunk_index += 1;
-        } else if self.is_loading_containers() {
-            let loading_widget = Paragraph::new(format!(
-                "{loading} Loading containers...",
-                loading = self.icons.loading
-            ))
-            .block(Block::bordered().border_type(BorderType::Rounded))
-            .fg(Color::Yellow)
-            .alignment(Alignment::Center);
-            loading_widget.render(chunks[chunk_index], buf);
             chunk_index += 1;
         }
 
@@ -293,7 +264,7 @@ impl App {
         };
         let footer_height = Self::calculate_footer_height(instructions, area.width);
 
-        // Create a vertical layout with main content, search (if active), error/loading, and footer
+        // Create a vertical layout with main content, search (if active), message, and footer
         let mut constraints = vec![
             Constraint::Min(0), // Main content area
         ];
@@ -304,8 +275,7 @@ impl App {
         }
 
         // Add space for error or success message if present
-        if self.error_message.is_some() || self.success_message.is_some() || self.is_loading_files()
-        {
+        if self.error_message.is_some() || self.success_message.is_some() {
             // Calculate height based on message length and terminal width
             #[allow(clippy::cast_possible_truncation)] // UI text lengths are always small
             let message_height = if let Some(error) = &self.error_message {
@@ -334,7 +304,7 @@ impl App {
             } else {
                 3
             };
-            constraints.push(Constraint::Length(message_height)); // Message/loading area
+            constraints.push(Constraint::Length(message_height)); // Message area
         }
 
         constraints.push(Constraint::Length(footer_height)); // Footer for instructions
@@ -360,12 +330,7 @@ impl App {
         };
 
         // Main block with file list
-        let file_items: Vec<ListItem> = if self.is_loading_files() {
-            vec![ListItem::new(format!(
-                "{loading} Loading...",
-                loading = self.icons.loading
-            ))]
-        } else if browsing.files.is_empty() {
+        let file_items: Vec<ListItem> = if browsing.files.is_empty() {
             let has_query = self.file_search_query().is_some_and(|q| !q.is_empty());
             if self.is_searching_files() && has_query {
                 vec![ListItem::new(format!(
@@ -387,7 +352,7 @@ impl App {
         };
 
         let mut list_state = ListState::default();
-        if !self.is_loading_files() && !browsing.files.is_empty() {
+        if !browsing.files.is_empty() {
             list_state.select(Some(browsing.selected_index));
         }
 
@@ -481,16 +446,6 @@ impl App {
             .wrap(ratatui::widgets::Wrap { trim: true })
             .alignment(Alignment::Left);
             success_widget.render(chunks[chunk_index], buf);
-            chunk_index += 1;
-        } else if self.is_loading_files() {
-            let loading_widget = Paragraph::new(format!(
-                "{loading} Loading Azure Blob Storage...",
-                loading = self.icons.loading
-            ))
-            .block(Block::bordered().border_type(BorderType::Rounded))
-            .fg(Color::Yellow)
-            .alignment(Alignment::Center);
-            loading_widget.render(chunks[chunk_index], buf);
             chunk_index += 1;
         }
 
@@ -687,84 +642,6 @@ impl App {
         info_paragraph.render(popup_area, buf);
     }
 
-    /// Render the download progress popup.
-    fn render_download_progress_popup(
-        area: Rect,
-        buf: &mut Buffer,
-        progress: &crate::app::DownloadProgress,
-    ) {
-        // Calculate popup size
-        let popup_width = (area.width * 3 / 4).min(70);
-        let popup_height = 12;
-
-        // Center the popup
-        let popup_area = Rect {
-            x: (area.width.saturating_sub(popup_width)) / 2,
-            y: (area.height.saturating_sub(popup_height)) / 2,
-            width: popup_width,
-            height: popup_height,
-        };
-
-        // Clear the popup area with a background
-        for y in popup_area.y..popup_area.y + popup_area.height {
-            for x in popup_area.x..popup_area.x + popup_area.width {
-                buf[(x, y)].set_style(Style::default().bg(Color::Black));
-            }
-        }
-
-        let mut progress_lines = vec![
-            format!("Downloading: {}", progress.current_file),
-            String::new(),
-            format!(
-                "Files: {} / {}",
-                progress.files_completed, progress.total_files
-            ),
-        ];
-
-        // Add bytes downloaded if available
-        if let Some(total_bytes) = progress.total_bytes {
-            #[allow(
-                clippy::cast_possible_truncation,
-                clippy::cast_sign_loss,
-                clippy::cast_precision_loss
-            )]
-            let percentage = if total_bytes > 0 {
-                (progress.bytes_downloaded as f64 / total_bytes as f64 * 100.0) as u8
-            } else {
-                100
-            };
-            progress_lines.push(format!(
-                "Size: {} / {} ({}%)",
-                format_bytes(progress.bytes_downloaded),
-                format_bytes(total_bytes),
-                percentage
-            ));
-        } else {
-            progress_lines.push(format!(
-                "Downloaded: {}",
-                format_bytes(progress.bytes_downloaded)
-            ));
-        }
-
-        // Add error message if present
-        if let Some(error) = &progress.error_message {
-            progress_lines.push(String::new());
-            progress_lines.push(format!("Error: {error}"));
-        }
-
-        let info_text = progress_lines.join("\n");
-        let info_paragraph = Paragraph::new(info_text)
-            .block(
-                Block::bordered()
-                    .border_type(BorderType::Rounded)
-                    .title(" Download Progress ")
-                    .style(Style::default().fg(Color::Yellow).bg(Color::Black)),
-            )
-            .style(Style::default().bg(Color::Black));
-
-        info_paragraph.render(popup_area, buf);
-    }
-
     /// Render the sort selection popup.
     fn render_sort_popup(area: Rect, buf: &mut Buffer) {
         // Calculate popup size
@@ -925,61 +802,6 @@ impl App {
         }
     }
 
-    /// Render the clone progress popup.
-    fn render_clone_progress_popup(
-        area: Rect,
-        buf: &mut Buffer,
-        progress: &crate::app::CloneProgress,
-    ) {
-        // Calculate popup size
-        let popup_width = (area.width * 3 / 4).min(70);
-        let popup_height = 10;
-
-        // Center the popup
-        let popup_area = Rect {
-            x: (area.width.saturating_sub(popup_width)) / 2,
-            y: (area.height.saturating_sub(popup_height)) / 2,
-            width: popup_width,
-            height: popup_height,
-        };
-
-        // Clear the popup area with a background
-        for y in popup_area.y..popup_area.y + popup_area.height {
-            for x in popup_area.x..popup_area.x + popup_area.width {
-                buf[(x, y)].set_style(Style::default().bg(Color::Black));
-            }
-        }
-
-        let mut progress_lines = vec!["Cloning in progress...".to_string(), String::new()];
-
-        if !progress.current_file.is_empty() {
-            progress_lines.push(format!("Current: {}", progress.current_file));
-        }
-
-        progress_lines.push(format!(
-            "Files: {} / {}",
-            progress.files_completed, progress.total_files
-        ));
-
-        // Add error message if present
-        if let Some(error) = &progress.error_message {
-            progress_lines.push(String::new());
-            progress_lines.push(format!("Error: {error}"));
-        }
-
-        let info_text = progress_lines.join("\n");
-        let info_paragraph = Paragraph::new(info_text)
-            .block(
-                Block::bordered()
-                    .border_type(BorderType::Rounded)
-                    .title(" Clone Progress ")
-                    .style(Style::default().fg(Color::Yellow).bg(Color::Black)),
-            )
-            .style(Style::default().bg(Color::Black));
-
-        info_paragraph.render(popup_area, buf);
-    }
-
     /// Render the delete confirmation dialog popup.
     fn render_delete_dialog_popup(
         area: Rect,
@@ -1063,61 +885,6 @@ impl App {
             buf[(cursor_x, input_y)].set_char('▏');
             buf[(cursor_x, input_y)].set_style(Style::default().fg(Color::White).bg(Color::Black));
         }
-    }
-
-    /// Render the delete progress popup.
-    fn render_delete_progress_popup(
-        area: Rect,
-        buf: &mut Buffer,
-        progress: &crate::app::DeleteProgress,
-    ) {
-        // Calculate popup size
-        let popup_width = (area.width * 3 / 4).min(70);
-        let popup_height = 10;
-
-        // Center the popup
-        let popup_area = Rect {
-            x: (area.width.saturating_sub(popup_width)) / 2,
-            y: (area.height.saturating_sub(popup_height)) / 2,
-            width: popup_width,
-            height: popup_height,
-        };
-
-        // Clear the popup area with a background
-        for y in popup_area.y..popup_area.y + popup_area.height {
-            for x in popup_area.x..popup_area.x + popup_area.width {
-                buf[(x, y)].set_style(Style::default().bg(Color::Black));
-            }
-        }
-
-        let mut progress_lines = vec!["Deleting...".to_string(), String::new()];
-
-        if !progress.current_file.is_empty() {
-            progress_lines.push(format!("Current: {}", progress.current_file));
-        }
-
-        progress_lines.push(format!(
-            "Files: {} / {}",
-            progress.files_completed, progress.total_files
-        ));
-
-        // Add error message if present
-        if let Some(error) = &progress.error_message {
-            progress_lines.push(String::new());
-            progress_lines.push(format!("Error: {error}"));
-        }
-
-        let info_text = progress_lines.join("\n");
-        let info_paragraph = Paragraph::new(info_text)
-            .block(
-                Block::bordered()
-                    .border_type(BorderType::Rounded)
-                    .title(" Delete Progress ")
-                    .style(Style::default().fg(Color::Red).bg(Color::Black)),
-            )
-            .style(Style::default().bg(Color::Black));
-
-        info_paragraph.render(popup_area, buf);
     }
 
     /// Render the preview panel for CSV, TSV, or JSON files.
