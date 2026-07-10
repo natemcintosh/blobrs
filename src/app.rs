@@ -1,5 +1,4 @@
 use crate::{
-    event::{AppEvent, Event, EventHandler},
     preview::{
         MAX_PARQUET_PREVIEW_BYTES, MAX_PARQUET_TABLE_PREVIEW_BYTES, MAX_PREVIEW_BYTES,
         ParquetSchemaPreview, PreviewData, PreviewFileType, TablePreview, parse_parquet_schema,
@@ -17,7 +16,7 @@ use object_store::{
 };
 use ratatui::{
     DefaultTerminal,
-    crossterm::event::{KeyCode, KeyEvent, KeyModifiers},
+    crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers},
 };
 use regex::Regex;
 use reqwest;
@@ -139,8 +138,6 @@ pub enum ParquetPreviewMode {
 pub struct App {
     /// Is the application running?
     pub running: bool,
-    /// Event handler.
-    pub events: EventHandler,
     /// Current application session.
     pub session: Session,
     /// Azure Storage Account name.
@@ -219,7 +216,6 @@ impl App {
     pub async fn new(storage_account: String, access_key: String) -> color_eyre::Result<Self> {
         let mut app = Self {
             running: true,
-            events: EventHandler::new(),
             session: Session::Selecting,
             storage_account,
             access_key,
@@ -259,27 +255,9 @@ impl App {
     pub async fn run(mut self, terminal: &mut DefaultTerminal) -> color_eyre::Result<()> {
         while self.running {
             terminal.draw(|frame| frame.render_widget(&self, frame.area()))?;
-            self.handle_events().await?;
-        }
-        Ok(())
-    }
-
-    /// Handle incoming events from the terminal.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if event reception or key handling fails.
-    pub async fn handle_events(&mut self) -> color_eyre::Result<()> {
-        match self.events.next()? {
-            Event::Tick => self.tick(),
-            Event::Crossterm(event) => {
-                if let ratatui::crossterm::event::Event::Key(key_event) = event {
-                    self.handle_key_event(key_event).await?;
-                }
+            if let Event::Key(key_event) = event::read()? {
+                self.handle_key_event(key_event).await?;
             }
-            Event::App(app_event) => match app_event {
-                AppEvent::Quit => self.quit(),
-            },
         }
         Ok(())
     }
@@ -313,11 +291,11 @@ impl App {
         // Global keys
         match key_event.code {
             KeyCode::Char('q') => {
-                self.events.send(AppEvent::Quit);
+                self.quit();
                 return Ok(());
             }
             KeyCode::Char('c' | 'C') if key_event.modifiers == KeyModifiers::CONTROL => {
-                self.events.send(AppEvent::Quit);
+                self.quit();
                 return Ok(());
             }
             _ => {}
@@ -328,7 +306,7 @@ impl App {
             match key_event.code {
                 KeyCode::Esc => {
                     // Only quit at the top level (container selection)
-                    self.events.send(AppEvent::Quit);
+                    self.quit();
                     return Ok(());
                 }
                 KeyCode::Char('/') => {
@@ -577,12 +555,6 @@ impl App {
         }
         Ok(())
     }
-
-    /// Handles the tick event of the terminal.
-    ///
-    /// The tick event is where you can update the state of your application with any logic that
-    /// needs to be updated at a fixed frame rate. E.g. polling a server, updating an animation.
-    pub fn tick(&self) {}
 
     fn is_selecting(&self) -> bool {
         matches!(self.session, Session::Selecting)
@@ -2263,10 +2235,9 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::{
-        App, BrowsingState, EntryKind, Modal, ParquetPreviewMode, Search, Session, SortCriteria,
-        UiToggles,
+        App, BrowsingState, EntryKind, KeyCode, KeyEvent, Modal, ParquetPreviewMode, Search,
+        Session, SortCriteria, UiToggles,
     };
-    use crate::event::EventHandler;
     use crate::preview::{ParquetSchemaPreview, PreviewData, PreviewFileType, TablePreview};
     use crate::terminal_icons::detect_terminal_icons;
     use chrono::{TimeZone, Utc};
@@ -2323,7 +2294,6 @@ mod tests {
     fn test_app() -> App {
         App {
             running: true,
-            events: EventHandler::new(),
             session: Session::Selecting,
             storage_account: "test-account".to_string(),
             access_key: "test-key".to_string(),
@@ -2349,6 +2319,17 @@ mod tests {
             parquet_table_data: None,
             parquet_schema_data: None,
         }
+    }
+
+    #[tokio::test]
+    async fn quit_key_stops_app() {
+        let mut app = test_app();
+
+        app.handle_key_event(KeyEvent::from(KeyCode::Char('q')))
+            .await
+            .unwrap();
+
+        assert!(!app.running);
     }
 
     #[test]

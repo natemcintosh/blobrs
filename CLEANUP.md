@@ -14,7 +14,7 @@ state-management code.
 
 Affected areas: `src/app.rs` and `src/ui.rs`.
 
-## 2. Keep only Parquet metadata previews (optional)
+## 2. Keep only Parquet metadata previews (not a desired change by users)
 
 Remove Parquet table previews while retaining the smaller metadata/schema preview. Delete Arrow row
 decoding, the table/metadata toggle, cached preview variants, and their tests, then disable unneeded
@@ -23,7 +23,7 @@ would no longer be able to inspect Parquet rows in the TUI.
 
 Affected areas: `src/app.rs`, `src/preview.rs`, `src/ui.rs`, and `Cargo.toml`.
 
-## 3. Replace the event thread with direct terminal reads
+## 3. Replace the event thread with direct terminal reads (complete)
 
 Remove the 30 FPS tick thread and event channel, then read Crossterm events directly in the main
 loop. Tick handling is empty and all current state changes are driven by terminal input, so periodic

@@ -1,7 +1,6 @@
 use crate::app::App;
 
 pub mod app;
-pub mod event;
 pub mod preview;
 pub mod terminal_icons;
 pub mod ui;
