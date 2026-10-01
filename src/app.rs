@@ -7,12 +7,12 @@ use crate::{
     terminal_icons::{IconSet, detect_terminal_icons},
 };
 use arboard::Clipboard;
-use base64::{Engine as _, engine::general_purpose};
 use chrono::Utc;
 use futures::stream::StreamExt;
-use hmac::{Hmac, Mac};
 use object_store::{
-    ObjectStore, ObjectStoreExt, azure::MicrosoftAzureBuilder, path::Path as ObjectPath,
+    ObjectStore, ObjectStoreExt,
+    azure::{AzureCredential, AzureCredentialProvider, MicrosoftAzureBuilder},
+    path::Path as ObjectPath,
 };
 use ratatui::{
     DefaultTerminal,
@@ -20,7 +20,6 @@ use ratatui::{
 };
 use regex::Regex;
 use reqwest;
-use sha2::Sha256;
 use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -142,8 +141,8 @@ pub struct App {
     pub session: Session,
     /// Azure Storage Account name.
     pub storage_account: String,
-    /// Azure Storage Access Key.
-    pub access_key: String,
+    /// Shared Azure CLI credentials, including the token refresh cache.
+    credentials: AzureCredentialProvider,
     /// List of available containers (may be filtered during search).
     pub containers: Vec<ContainerInfo>,
     /// Full list of all containers from Azure (never filtered).
@@ -213,12 +212,21 @@ impl App {
     /// # Errors
     ///
     /// Returns an error if loading containers from Azure Storage fails.
-    pub async fn new(storage_account: String, access_key: String) -> color_eyre::Result<Self> {
+    pub async fn new(storage_account: String) -> color_eyre::Result<Self> {
+        // object_store exposes its CLI provider through a container client. Building
+        // this client makes no request; $root need not exist to obtain the provider.
+        let credentials = MicrosoftAzureBuilder::new()
+            .with_account(&storage_account)
+            .with_container_name("$root")
+            .with_use_azure_cli(true)
+            .build()?
+            .credentials()
+            .clone();
         let mut app = Self {
             running: true,
             session: Session::Selecting,
             storage_account,
-            access_key,
+            credentials,
             containers: Vec::new(),
             all_containers: Vec::new(),
             selected_container_index: 0,
@@ -1425,12 +1433,7 @@ impl App {
     /// List all containers in the storage account with pagination support.
     async fn list_containers(&mut self) -> Result<Vec<ContainerInfo>, String> {
         let account_name = &self.storage_account;
-        let access_key = &self.access_key;
-
-        // Decode the base64 access key
-        let key = general_purpose::STANDARD
-            .decode(access_key)
-            .map_err(|e| format!("Failed to decode access key: {e}"))?;
+        let client = reqwest::Client::new();
 
         let mut all_containers = Vec::new();
         let mut next_marker: Option<String> = None;
@@ -1448,37 +1451,12 @@ impl App {
             let now = Utc::now();
             let date = now.format("%a, %d %b %Y %H:%M:%S GMT").to_string();
 
-            // Construct the string to sign for Azure Storage API
-            // Format: VERB + "\n" + Content-Encoding + "\n" + Content-Language + "\n" + Content-Length + "\n" +
-            //         Content-MD5 + "\n" + Content-Type + "\n" + Date + "\n" + If-Modified-Since + "\n" +
-            //         If-Match + "\n" + If-None-Match + "\n" + If-Unmodified-Since + "\n" + Range + "\n" +
-            //         CanonicalizedHeaders + CanonicalizedResource
-            let canonicalized_resource = if let Some(ref marker) = next_marker {
-                format!("/{account_name}/\ncomp:list\nmarker:{marker}\nmaxresults:5000")
-            } else {
-                format!("/{account_name}/\ncomp:list\nmaxresults:5000")
-            };
-
-            let string_to_sign = format!(
-                "GET\n\n\n\n\n\n\n\n\n\n\n\nx-ms-date:{date}\nx-ms-version:2020-08-04\n{canonicalized_resource}"
-            );
-
-            // Generate HMAC-SHA256 signature
-            let mut mac = Hmac::<Sha256>::new_from_slice(&key)
-                .map_err(|e| format!("Failed to create HMAC: {e}"))?;
-            mac.update(string_to_sign.as_bytes());
-            let signature = general_purpose::STANDARD.encode(mac.finalize().into_bytes());
-
-            // Create authorization header
-            let authorization = format!("SharedKey {account_name}:{signature}");
-
-            // Make the HTTP request
-            let client = reqwest::Client::new();
-            let response = client
-                .get(&url)
+            // Resolve credentials for each page so an expired token is refreshed.
+            let response = self
+                .container_list_request(&client, &url)
+                .await?
                 .header("x-ms-date", &date)
                 .header("x-ms-version", "2020-08-04")
-                .header("Authorization", &authorization)
                 .send()
                 .await
                 .map_err(|e| format!("HTTP request failed: {e}"))?;
@@ -1516,6 +1494,24 @@ impl App {
         }
 
         Ok(all_containers)
+    }
+
+    /// Authorize account-level requests with the same provider as blob operations.
+    async fn container_list_request(
+        &self,
+        client: &reqwest::Client,
+        url: &str,
+    ) -> Result<reqwest::RequestBuilder, String> {
+        let credential = self.credentials.get_credential().await.map_err(|e| {
+            format!(
+                "Azure CLI authentication failed. Sign in with `az login --identity` \
+                 or `az login`, then refresh: {e}"
+            )
+        })?;
+        match credential.as_ref() {
+            AzureCredential::BearerToken(token) => Ok(client.get(url).bearer_auth(token)),
+            _ => Err("Azure CLI authentication requires a bearer token".to_string()),
+        }
     }
 
     /// Parse XML response from Azure Storage list containers API with pagination marker support.
@@ -1560,7 +1556,7 @@ impl App {
         let azure_client = MicrosoftAzureBuilder::new()
             .with_account(&self.storage_account)
             .with_container_name(&selected_container.name)
-            .with_access_key(&self.access_key)
+            .with_credentials(self.credentials.clone())
             .build()?;
 
         self.session = Session::Browsing(BrowsingState {
@@ -2296,7 +2292,9 @@ mod tests {
             running: true,
             session: Session::Selecting,
             storage_account: "test-account".to_string(),
-            access_key: "test-key".to_string(),
+            credentials: Arc::new(object_store::StaticCredentialProvider::new(
+                object_store::azure::AzureCredential::BearerToken("test-token".to_string()),
+            )),
             containers: Vec::new(),
             all_containers: Vec::new(),
             selected_container_index: 0,
@@ -2319,6 +2317,41 @@ mod tests {
             parquet_table_data: None,
             parquet_schema_data: None,
         }
+    }
+
+    #[tokio::test]
+    async fn container_requests_use_bearer_auth_without_sending_a_query_token() {
+        let app = test_app();
+        let url = "https://test-account.blob.core.windows.net/?comp=list&marker=next";
+        let request = app
+            .container_list_request(&reqwest::Client::new(), url)
+            .await
+            .unwrap()
+            .build()
+            .unwrap();
+
+        assert_eq!(request.url().as_str(), url);
+        let authorization = &request.headers()[reqwest::header::AUTHORIZATION];
+        assert_eq!(authorization, "Bearer test-token");
+        assert!(authorization.is_sensitive());
+    }
+
+    #[tokio::test]
+    async fn container_requests_reject_non_bearer_credentials() {
+        let mut app = test_app();
+        app.credentials = Arc::new(object_store::StaticCredentialProvider::new(
+            object_store::azure::AzureCredential::SASToken(Vec::new()),
+        ));
+
+        let error = app
+            .container_list_request(
+                &reqwest::Client::new(),
+                "https://test-account.blob.core.windows.net/?comp=list",
+            )
+            .await
+            .unwrap_err();
+
+        assert_eq!(error, "Azure CLI authentication requires a bearer token");
     }
 
     #[tokio::test]

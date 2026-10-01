@@ -17,15 +17,42 @@ Screenshots will be added here.
 ## Prerequisites
 
 - Rust (Cargo + rustc)
+- [Azure CLI](https://learn.microsoft.com/en-us/cli/azure/install-azure-cli)
 - Azure Storage account
-- Storage account access key
 
-To get your storage account access key:
-1. Navigate to your Storage Account in the Azure Portal
-1. In the left sidebar, under "Security + networking", click **"Access keys"**
-1. You'll see two keys (key1 and key2) - you can use either one
-1. Click **"Show"** next to the key you want to use
-1. Copy the **"Key"** value (not the connection string)
+## Authentication
+
+Blobrs uses the current Azure CLI login for both container listing and blob
+operations. Storage access keys are not required or used. Tokens are cached and
+refreshed automatically while the application is running.
+
+On an Azure resource with a managed identity:
+
+```bash
+az login --identity
+```
+
+For a user-assigned managed identity, select it explicitly:
+
+```bash
+az login --identity --client-id <managed-identity-client-id>
+```
+
+For an interactive user login:
+
+```bash
+az login
+```
+
+The signed-in identity needs **Storage Blob Data Reader** to browse, preview, and
+download blobs, or **Storage Blob Data Contributor** to also clone and delete
+blobs. Assign the role at the storage account scope (or above), because Blobrs
+starts by listing the account's containers. An Azure management role such as
+Contributor alone does not grant blob data access.
+
+If authentication fails, check that `az` is on your PATH, sign in again, and
+press `r` to refresh. If Azure returns a permission error, check the identity's
+storage data role and scope.
 
 ## Environment Variables
 
@@ -33,14 +60,13 @@ Set:
 
 ```bash
 export AZURE_STORAGE_ACCOUNT="your_storage_account_name"
-export AZURE_STORAGE_ACCESS_KEY="your_access_key"
 ```
 
-Or use a `.env` file:
+When using `just run`, you can instead use a `.env` file (optional). Direct
+`cargo run` requires the variable to be exported in your shell:
 
 ```env
 AZURE_STORAGE_ACCOUNT=your_storage_account_name
-AZURE_STORAGE_ACCESS_KEY=your_access_key
 ```
 
 ## Install

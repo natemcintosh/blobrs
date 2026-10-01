@@ -1,4 +1,4 @@
-set dotenv-required := true
+set dotenv-load := true
 
 default:
     @just --list
@@ -28,9 +28,5 @@ test-all: fmt check test
 check-env:
     @if [ -z "${AZURE_STORAGE_ACCOUNT:-}" ]; then \
         echo "AZURE_STORAGE_ACCOUNT environment variable not set"; \
-        exit 1; \
-    fi
-    @if [ -z "${AZURE_STORAGE_ACCESS_KEY:-}" ]; then \
-        echo "AZURE_STORAGE_ACCESS_KEY environment variable not set"; \
         exit 1; \
     fi
