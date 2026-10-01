@@ -43,6 +43,7 @@ impl Widget for &App {
                     Modal::DownloadPicker { .. } => {
                         self.render_download_picker_popup(area, buf);
                     }
+                    Modal::UploadPicker => self.render_upload_picker_popup(area, buf),
                     Modal::SortPicker => {
                         App::render_sort_popup(area, buf);
                     }
@@ -260,7 +261,7 @@ impl App {
                 "Preview: `↑`/`↓`/`k`/`j` to scroll rows • `←`/`→`/`h`/`l` to scroll columns • `p` or `Esc` to close preview"
             }
         } else {
-            "Press `Ctrl-C` or `q` to quit • `Esc`/`←`/`h` to go back • `r`/`F5` to refresh • `↑`/`↓` or `k`/`j` to navigate • `→`/`l`/`Enter` to enter folder • `/` to search • `s` to sort • `i` for info • `p` to preview • `y` to copy path • `c` to clone • `x` to delete • `d` to download"
+            "Press `Ctrl-C` or `q` to quit • `Esc`/`←`/`h` to go back • `r`/`F5` to refresh • `↑`/`↓` or `k`/`j` to navigate • `→`/`l`/`Enter` to enter folder • `/` to search • `s` to sort • `i` for info • `p` to preview • `y` to copy path • `c` to clone • `x` to delete • `d` to download • `u` to upload"
         };
         let footer_height = Self::calculate_footer_height(instructions, area.width);
 
@@ -573,6 +574,27 @@ impl App {
             .alignment(Alignment::Center);
 
         footer_text.render(footer_area, buf);
+    }
+
+    fn render_upload_picker_popup(&self, area: Rect, buf: &mut Buffer) {
+        let Some(browsing) = self.browsing() else {
+            return;
+        };
+        let popup = Rect {
+            x: area.x + area.width.saturating_sub(64) / 2,
+            y: area.y + area.height.saturating_sub(10) / 2,
+            width: area.width.min(64),
+            height: area.height.min(10),
+        };
+        ratatui::widgets::Clear.render(popup, buf);
+        Paragraph::new(format!(
+            "Upload a local file to: /{}\n\nThe file keeps its name. Existing blobs are not replaced.\n\nPress Enter to select a file\nPress Esc to cancel",
+            browsing.current_path
+        ))
+        .block(Block::bordered().border_type(BorderType::Rounded).title(" Upload "))
+        .style(Style::default().fg(Color::Green).bg(Color::Black))
+        .wrap(Wrap { trim: false })
+        .render(popup, buf);
     }
 
     /// Render the download destination picker popup.

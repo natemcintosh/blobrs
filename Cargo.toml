@@ -30,3 +30,4 @@ bytes = "1.11"
 
 [dev-dependencies]
 proptest = "1.11"
+tempfile = "3"

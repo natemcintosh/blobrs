@@ -13,6 +13,17 @@ Screenshots will be added here.
 - Search/filter blobs by name
 - View blob/folder metadata
 - Download files and folders
+- Upload local files to the current container or folder with `u`
+
+## Uploading
+
+Open a container, navigate to the destination folder, and press `u`, then Enter
+to choose a local file. The file is uploaded using its original filename and the
+listing refreshes on success. Upload also works in empty containers. Existing
+blobs are never overwritten; rename the local file to upload it under a new name.
+Press Esc or cancel the file chooser to cancel. The desktop file chooser requires
+a working desktop portal on Linux, as does downloading. Uploads currently read
+the selected file into memory, and the TUI waits for the transfer to finish.
 
 ## Prerequisites
 
@@ -45,7 +56,7 @@ az login
 ```
 
 The signed-in identity needs **Storage Blob Data Reader** to browse, preview, and
-download blobs, or **Storage Blob Data Contributor** to also clone and delete
+download blobs, or **Storage Blob Data Contributor** to also upload, clone, and delete
 blobs. Assign the role at the storage account scope (or above), because Blobrs
 starts by listing the account's containers. An Azure management role such as
 Contributor alone does not grant blob data access.
@@ -90,6 +101,17 @@ Using just:
 ```bash
 just run
 ```
+
+## Testing
+
+Install [cargo-nextest](https://nexte.st/docs/installation/) and run the tests:
+
+```bash
+cargo install cargo-nextest --locked
+just test
+```
+
+CI also uses nextest on Linux, macOS, and Windows.
 
 ## License
 
