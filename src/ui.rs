@@ -82,7 +82,7 @@ impl App {
         let instructions = if self.is_searching_containers() {
             "Search Mode: Type to filter containers • `Enter` to confirm • `Esc` to cancel • `Ctrl+↑`/`Ctrl+↓` to navigate"
         } else {
-            "Press `Ctrl-C` or `q` or `Esc` to quit • `r`/`F5` to refresh • `↑`/`↓` or `k`/`j` to navigate • `→`/`l`/`Enter` to select container • `/` to search"
+            "Press `Ctrl-C` or `q` or `Esc` to quit • `r`/`F5` to refresh • `↑`/`↓` or `k`/`j` to navigate • `→`/`l`/`Enter` to select container • `f` to toggle favorite • `/` to search"
         };
         let footer_height = Self::calculate_footer_height(instructions, area.width);
 
@@ -155,7 +155,11 @@ impl App {
                 .iter()
                 .map(|container| {
                     let name = &container.name;
-                    ListItem::new(format!("{folder} {name}", folder = self.icons.folder))
+                    let favorite = if self.is_favorite(name) { "★" } else { " " };
+                    ListItem::new(format!(
+                        "{favorite} {folder} {name}",
+                        folder = self.icons.folder
+                    ))
                 })
                 .collect()
         };

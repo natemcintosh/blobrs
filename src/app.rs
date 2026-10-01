@@ -1,4 +1,5 @@
 use crate::{
+    favorites::Favorites,
     preview::{
         MAX_PARQUET_PREVIEW_BYTES, MAX_PARQUET_TABLE_PREVIEW_BYTES, MAX_PREVIEW_BYTES,
         ParquetSchemaPreview, PreviewData, PreviewFileType, TablePreview, parse_parquet_schema,
@@ -144,6 +145,8 @@ pub struct App {
     pub storage_account: String,
     /// Shared Azure CLI credentials, including the token refresh cache.
     credentials: AzureCredentialProvider,
+    favorites: Favorites,
+    favorites_path: Option<PathBuf>,
     /// List of available containers (may be filtered during search).
     pub containers: Vec<ContainerInfo>,
     /// Full list of all containers from Azure (never filtered).
@@ -228,6 +231,8 @@ impl App {
             session: Session::Selecting,
             storage_account,
             credentials,
+            favorites: Favorites::default(),
+            favorites_path: Favorites::path().ok(),
             containers: Vec::new(),
             all_containers: Vec::new(),
             selected_container_index: 0,
@@ -253,6 +258,7 @@ impl App {
 
         // Load container list
         app.load_containers().await?;
+
         Ok(app)
     }
 
@@ -349,6 +355,7 @@ impl App {
                     self.quit();
                     return Ok(());
                 }
+                KeyCode::Char('f') => self.toggle_favorite(),
                 KeyCode::Char('/') => {
                     self.enter_container_search_mode();
                 }
@@ -1428,13 +1435,69 @@ impl App {
         self.selected_container_index = 0;
     }
 
+    pub fn is_favorite(&self, container: &str) -> bool {
+        self.favorites.contains(&self.storage_account, container)
+    }
+
+    fn reload_favorites(&mut self) {
+        let result = self
+            .favorites_path
+            .as_deref()
+            .ok_or_else(|| std::io::Error::other("Cannot determine user data directory"))
+            .and_then(Favorites::load);
+        match result {
+            Ok(favorites) => self.favorites = favorites,
+            Err(error) => self.error_message = Some(format!("Cannot load favorites: {error}")),
+        }
+    }
+
+    fn sort_containers(&mut self) {
+        let selected = self
+            .containers
+            .get(self.selected_container_index)
+            .map(|c| c.name.clone());
+        let favorites = &self.favorites;
+        let account = &self.storage_account;
+        let key = |c: &ContainerInfo| (!favorites.contains(account, &c.name), c.name.clone());
+        self.all_containers.sort_by_key(key);
+        self.containers.sort_by_key(key);
+        if let Search::Containers { all_containers, .. } = &mut self.search {
+            all_containers.sort_by_key(key);
+        }
+        self.selected_container_index = selected
+            .and_then(|name| self.containers.iter().position(|c| c.name == name))
+            .unwrap_or(0);
+    }
+
+    fn toggle_favorite(&mut self) {
+        let Some(container) = self.containers.get(self.selected_container_index) else {
+            return;
+        };
+        let result = self
+            .favorites_path
+            .as_deref()
+            .ok_or_else(|| std::io::Error::other("Cannot determine user data directory"))
+            .and_then(|path| Favorites::toggle(path, &self.storage_account, &container.name));
+        self.success_message = None;
+        match result {
+            Ok(favorites) => {
+                self.favorites = favorites;
+                self.error_message = None;
+                self.sort_containers();
+            }
+            Err(error) => self.error_message = Some(format!("Cannot save favorites: {error}")),
+        }
+    }
+
     /// Load the list of containers from Azure Storage.
     async fn load_containers(&mut self) -> color_eyre::Result<()> {
         self.error_message = None;
         self.success_message = None;
 
         match self.list_containers().await {
-            Ok(containers) => {
+            Ok(mut containers) => {
+                self.reload_favorites();
+                containers.sort_by_key(|c| (!self.is_favorite(&c.name), c.name.clone()));
                 // Always store the full list
                 self.all_containers.clone_from(&containers);
 
@@ -2301,8 +2364,8 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::{
-        App, BrowsingState, EntryKind, KeyCode, KeyEvent, Modal, ParquetPreviewMode, Search,
-        Session, SortCriteria, UiToggles,
+        App, BrowsingState, EntryKind, KeyCode, KeyEvent, KeyModifiers, Modal, ParquetPreviewMode,
+        Search, Session, SortCriteria, UiToggles,
     };
     use crate::preview::{ParquetSchemaPreview, PreviewData, PreviewFileType, TablePreview};
     use crate::terminal_icons::detect_terminal_icons;
@@ -2362,6 +2425,8 @@ mod tests {
             running: true,
             session: Session::Selecting,
             storage_account: "test-account".to_string(),
+            favorites: crate::favorites::Favorites::default(),
+            favorites_path: None,
             credentials: Arc::new(object_store::StaticCredentialProvider::new(
                 object_store::azure::AzureCredential::BearerToken("test-token".to_string()),
             )),
@@ -2387,6 +2452,76 @@ mod tests {
             parquet_table_data: None,
             parquet_schema_data: None,
         }
+    }
+
+    #[tokio::test]
+    async fn favorite_toggle_preserves_selection_search_and_saved_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = test_app();
+        app.favorites_path = Some(dir.path().join("favorites.json"));
+        app.containers = ["alpha", "reports", "zebra"]
+            .into_iter()
+            .map(|name| super::ContainerInfo {
+                name: name.to_owned(),
+            })
+            .collect();
+        app.all_containers = app.containers.clone();
+        app.selected_container_index = 1;
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE))
+            .await
+            .unwrap();
+        assert_eq!(app.containers[0].name, "reports");
+        assert_eq!(app.selected_container_index, 0);
+        assert!(app.is_favorite("reports"));
+        app.enter_container_search_mode();
+        app.handle_container_search_key_event(KeyEvent::new(
+            KeyCode::Char('f'),
+            KeyModifiers::NONE,
+        ))
+        .unwrap();
+        assert_eq!(app.container_search_query(), Some("f"));
+        assert!(app.is_favorite("reports"));
+        app.exit_container_search_mode();
+        assert_eq!(app.containers[0].name, "reports");
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE))
+            .await
+            .unwrap();
+        assert_eq!(app.containers[app.selected_container_index].name, "reports");
+        assert_eq!(app.containers[0].name, "alpha");
+        assert!(
+            !crate::favorites::Favorites::load(app.favorites_path.as_deref().unwrap())
+                .unwrap()
+                .contains("test-account", "reports")
+        );
+        std::fs::write(app.favorites_path.as_deref().unwrap(), "invalid").unwrap();
+        app.toggle_favorite();
+        assert!(
+            app.error_message
+                .as_deref()
+                .unwrap()
+                .contains("Cannot save favorites")
+        );
+        assert!(!app.is_favorite("reports"));
+    }
+
+    /// Run in tmux to exercise rendering and input without Azure credentials.
+    #[tokio::test]
+    #[ignore = "interactive terminal required"]
+    async fn favorites_interactive_preview() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = test_app();
+        app.favorites_path = Some(dir.path().join("favorites.json"));
+        app.containers = ["alpha", "backups", "reports"]
+            .into_iter()
+            .map(|name| super::ContainerInfo {
+                name: name.to_owned(),
+            })
+            .collect();
+        app.all_containers = app.containers.clone();
+        let mut terminal = ratatui::init();
+        let result = app.run(&mut terminal).await;
+        ratatui::restore();
+        result.unwrap();
     }
 
     fn upload_test_app(prefix: &str) -> App {

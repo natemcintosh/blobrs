@@ -9,11 +9,28 @@ Screenshots will be added here.
 ## Features
 
 - Browse containers and blobs from your Azure Storage account
+- Pin favorite containers with `f`
 - Navigate blob prefixes (virtual folders)
 - Search/filter blobs by name
 - View blob/folder metadata
 - Download files and folders
 - Upload local files to the current container or folder with `u`
+
+## Favorite containers
+
+Press `f` in the container list to pin or unpin the selected container. Favorites
+show a star and sort first, alphabetically within each group. While typing a
+search, `f` remains a search character; press Enter to finish searching before
+toggling a favorite.
+
+Favorites are saved immediately for each storage account in
+`$XDG_DATA_HOME/blobrs/favorites.json`, defaulting to
+`~/.local/share/blobrs/favorites.json` on Linux. The file contains account and
+container names only. Favorites survive restarts and upgrades, and remain saved
+if a container is temporarily unavailable. Refresh with `r` to pick up changes
+from another instance. Concurrent saves use a lock file and atomic replacement.
+If loading or saving fails, the app displays an error and preserves the existing
+file.
 
 ## Uploading
 
