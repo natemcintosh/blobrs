@@ -107,6 +107,7 @@ impl App {
                     ((error.len() + format!("{error_icon} ", error_icon = self.icons.error).len())
                         as u16)
                         .div_ceil(available_width)
+                        .saturating_add(2) // Include the top and bottom borders.
                         .clamp(3, 8)
                 } else {
                     3
@@ -119,6 +120,7 @@ impl App {
                         + format!("{success_icon} ", success_icon = self.icons.success).len())
                         as u16)
                         .div_ceil(available_width)
+                        .saturating_add(2) // Include the top and bottom borders.
                         .clamp(3, 8)
                 } else {
                     3
@@ -290,6 +292,7 @@ impl App {
                     ((error.len() + format!("{error_icon} ", error_icon = self.icons.error).len())
                         as u16)
                         .div_ceil(available_width)
+                        .saturating_add(2) // Include the top and bottom borders.
                         .clamp(3, 8)
                 } else {
                     3
@@ -302,6 +305,7 @@ impl App {
                         + format!("{success_icon} ", success_icon = self.icons.success).len())
                         as u16)
                         .div_ceil(available_width)
+                        .saturating_add(2) // Include the top and bottom borders.
                         .clamp(3, 8)
                 } else {
                     3

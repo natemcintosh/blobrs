@@ -9,7 +9,6 @@ use crate::{
 };
 use arboard::Clipboard;
 use chrono::Utc;
-use futures::stream::StreamExt;
 use object_store::{
     ObjectStore, ObjectStoreExt,
     azure::{AzureCredential, AzureCredentialProvider, MicrosoftAzureBuilder},
@@ -1168,20 +1167,23 @@ impl App {
             new_path.push('/');
         }
 
+        self.success_message = None;
+        self.error_message = None;
+
         let result = if is_folder {
             self.clone_folder(&original_path, &new_path).await
         } else {
             self.clone_blob(&original_path, &new_path).await
         };
 
+        // Even a failed batch may have changed some objects.
+        if let Err(e) = self.refresh_files().await {
+            self.error_message = Some(format!("Refresh failed after clone: {e}"));
+        }
         if result.is_ok() {
             let orig = original_path.trim_end_matches('/');
             let new = new_path.trim_end_matches('/');
             self.success_message = Some(format!("Successfully cloned {orig} to {new}"));
-            // Refresh the file list
-            if let Err(e) = self.refresh_files().await {
-                self.error_message = Some(format!("Refresh failed after clone: {e}"));
-            }
         }
 
         result
@@ -1214,23 +1216,19 @@ impl App {
 
         let source_path = Self::object_path(source)?;
 
-        // List all files in the source folder
-        let stream = object_store.list(Some(&source_path));
-        let objects: Vec<_> = stream.collect().await;
-
-        for meta in objects.into_iter().flatten() {
-            let file_path = meta.location.as_ref();
-
-            // Calculate relative path from source
-            let relative_path = file_path.strip_prefix(source).unwrap_or(file_path);
-
-            // Construct destination path
-            let dest_file_path = format!("{destination}{relative_path}");
-
-            // Copy the file, continuing if it fails.
-            let dest_object_path = Self::object_path(dest_file_path.as_str())?;
-            let _ = object_store.copy(&meta.location, &dest_object_path).await;
-        }
+        crate::bulk::run(object_store.list(Some(&source_path)), |meta| {
+            let object_store = &object_store;
+            async move {
+                let file_path = meta.location.as_ref();
+                let relative_path = file_path.strip_prefix(source).ok_or_else(|| {
+                    color_eyre::eyre::eyre!("Listed object is outside source folder: {file_path}")
+                })?;
+                let dest_object_path = Self::object_path(&format!("{destination}{relative_path}"))?;
+                object_store.copy(&meta.location, &dest_object_path).await?;
+                Ok(())
+            }
+        })
+        .await?;
 
         Ok(())
     }
@@ -1322,19 +1320,22 @@ impl App {
             _ => return Ok(()),
         };
 
+        self.success_message = None;
+        self.error_message = None;
+
         let result = if is_folder {
             self.delete_folder(&target_path).await
         } else {
             self.delete_blob(&target_path).await
         };
 
+        // Even a failed batch may have changed some objects.
+        if let Err(e) = self.refresh_files().await {
+            self.error_message = Some(format!("Refresh failed after delete: {e}"));
+        }
         if result.is_ok() {
             let name = target_path.trim_end_matches('/');
             self.success_message = Some(format!("Successfully deleted {name}"));
-            // Refresh the file list
-            if let Err(e) = self.refresh_files().await {
-                self.error_message = Some(format!("Refresh failed after delete: {e}"));
-            }
         }
 
         result
@@ -1365,14 +1366,14 @@ impl App {
 
         let prefix_path = Self::object_path(prefix)?;
 
-        // List all files in the folder
-        let stream = object_store.list(Some(&prefix_path));
-        let objects: Vec<_> = stream.collect().await;
-
-        for meta in objects.into_iter().flatten() {
-            // Continue with other files even if one fails.
-            let _ = object_store.delete(&meta.location).await;
-        }
+        crate::bulk::run(object_store.list(Some(&prefix_path)), |meta| {
+            let object_store = &object_store;
+            async move {
+                object_store.delete(&meta.location).await?;
+                Ok(())
+            }
+        })
+        .await?;
 
         Ok(())
     }
@@ -1810,9 +1811,9 @@ impl App {
         let mut total_size: u64 = 0; // Explicitly type as u64
 
         let stream = object_store.list(Some(&object_path));
-        let objects: Vec<_> = stream.collect().await;
+        let objects = crate::bulk::snapshot(stream).await?;
 
-        for meta in objects.into_iter().flatten() {
+        for meta in objects {
             blob_count += 1;
             total_size += meta.size;
         }
@@ -1955,6 +1956,8 @@ impl App {
         let name = selected_item.actual_name;
 
         self.close_modal();
+        self.success_message = None;
+        self.error_message = None;
 
         if is_folder {
             self.download_folder(&name, &destination).await?;
@@ -2017,32 +2020,29 @@ impl App {
 
         let object_path = Self::object_path(folder_path.as_str())?;
 
-        // Create destination folder
         let folder_destination = destination.join(folder_name);
-        fs::create_dir_all(&folder_destination)?;
-
-        // List all files in the folder
-        let stream = object_store.list(Some(&object_path));
-        let objects: Vec<_> = stream.collect().await;
-
-        for meta in objects.into_iter().flatten() {
-            let file_path = meta.location.as_ref();
-            let relative_path = file_path.strip_prefix(&folder_path).unwrap_or(file_path);
-
-            // Create full destination path
-            let file_destination = folder_destination.join(relative_path);
-
-            // Ensure parent directory exists
-            if let Some(parent) = file_destination.parent() {
-                fs::create_dir_all(parent)?;
-            }
-
-            // Download the file, continuing if fetching it fails.
-            if let Ok(get_result) = object_store.get(&meta.location).await {
-                let bytes = get_result.bytes().await?;
+        let completed = crate::bulk::run(object_store.list(Some(&object_path)), |meta| {
+            let object_store = &object_store;
+            let folder_path = &folder_path;
+            let folder_destination = &folder_destination;
+            async move {
+                let file_path = meta.location.as_ref();
+                let relative_path = file_path.strip_prefix(folder_path).ok_or_else(|| {
+                    color_eyre::eyre::eyre!("Listed object is outside source folder: {file_path}")
+                })?;
+                let file_destination = folder_destination.join(relative_path);
+                if let Some(parent) = file_destination.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                let bytes = object_store.get(&meta.location).await?.bytes().await?;
                 fs::write(&file_destination, &bytes)?;
+                Ok(())
             }
-        }
+        })
+        .await?;
+        self.success_message = Some(format!(
+            "Successfully downloaded {completed} objects from {folder_name}"
+        ));
 
         Ok(())
     }
@@ -2908,6 +2908,207 @@ mod tests {
     fn break_navigation_store(dir: &std::path::Path) {
         std::fs::rename(dir.join("online"), dir.join("offline")).unwrap();
         std::fs::write(dir.join("online"), "listing must fail").unwrap();
+    }
+
+    #[tokio::test]
+    async fn folder_listing_failures_are_never_successful() {
+        let (dir, mut app) = navigation_test_app().await;
+        break_navigation_store(dir.path());
+        let destination = tempfile::tempdir().unwrap();
+        let results = [
+            app.clone_folder("parent/", "copy/").await,
+            app.delete_folder("parent/").await,
+            app.download_folder("child", destination.path()).await,
+            app.get_folder_info("child").await.map(|_| ()),
+        ];
+        for result in results {
+            assert!(
+                result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("Folder listing failed")
+            );
+        }
+        assert!(!destination.path().join("child").exists());
+    }
+
+    #[tokio::test]
+    async fn folder_clone_copy_failure_reaches_dialog_error() {
+        let (dir, mut app) = navigation_test_app().await;
+        std::fs::write(dir.path().join("online/store/blocked"), "not a directory").unwrap();
+        app.modal = Modal::Clone {
+            input: "blocked/".to_owned(),
+            original_path: "parent/".to_owned(),
+            is_folder: true,
+        };
+        app.success_message = Some("Previous success".to_owned());
+        app.handle_clone_dialog_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .await
+            .unwrap();
+        assert!(app.success_message.is_none());
+        assert!(
+            app.error_message
+                .as_deref()
+                .unwrap()
+                .contains("Clone failed: Failed: 0/2 objects completed")
+        );
+        assert!(matches!(app.modal, Modal::None));
+    }
+
+    #[tokio::test]
+    async fn folder_delete_listing_failure_reaches_dialog_error() {
+        let (dir, mut app) = navigation_test_app().await;
+        break_navigation_store(dir.path());
+        app.modal = Modal::DeleteConfirm {
+            input: "parent".to_owned(),
+            target_path: "parent/".to_owned(),
+            target_name: "parent".to_owned(),
+            is_folder: true,
+        };
+        app.success_message = Some("Previous success".to_owned());
+        app.handle_delete_dialog_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .await
+            .unwrap();
+        assert!(app.success_message.is_none());
+        assert!(
+            app.error_message
+                .as_deref()
+                .unwrap()
+                .contains("Delete failed: Folder listing failed")
+        );
+        assert!(matches!(app.modal, Modal::None));
+    }
+
+    #[tokio::test]
+    async fn overlapping_folder_clone_uses_original_snapshot() {
+        let mut app = upload_test_app("");
+        let store = app.browsing().unwrap().object_store.clone();
+        store
+            .put(&ObjectPath::from("source/a"), "a".into())
+            .await
+            .unwrap();
+        store
+            .put(&ObjectPath::from("source/copy/b"), "b".into())
+            .await
+            .unwrap();
+        app.modal = Modal::Clone {
+            input: "source/copy/".to_owned(),
+            original_path: "source/".to_owned(),
+            is_folder: true,
+        };
+        app.execute_clone().await.unwrap();
+        let objects = crate::bulk::snapshot(store.list(None)).await.unwrap();
+        assert_eq!(objects.len(), 4);
+        for path in [
+            "source/a",
+            "source/copy/a",
+            "source/copy/b",
+            "source/copy/copy/b",
+        ] {
+            store.head(&ObjectPath::from(path)).await.unwrap();
+        }
+        assert!(
+            app.success_message
+                .as_deref()
+                .unwrap()
+                .contains("Successfully cloned")
+        );
+        let super::BlobInfo::Folder {
+            blob_count,
+            total_size,
+            ..
+        } = app.get_folder_info("source").await.unwrap()
+        else {
+            panic!("expected folder statistics");
+        };
+        assert_eq!((blob_count, total_size), (4, 4));
+        app.modal = Modal::DeleteConfirm {
+            input: "source".to_owned(),
+            target_path: "source/".to_owned(),
+            target_name: "source".to_owned(),
+            is_folder: true,
+        };
+        app.execute_delete().await.unwrap();
+        assert!(
+            crate::bulk::snapshot(store.list(None))
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            app.success_message
+                .as_deref()
+                .unwrap()
+                .contains("Successfully deleted")
+        );
+    }
+
+    async fn partial_download_app(destination: &std::path::Path) -> App {
+        let mut app = upload_test_app("");
+        let store = app.browsing().unwrap().object_store.clone();
+        for path in ["folder/a", "folder/b", "folder/c"] {
+            store
+                .put(&ObjectPath::from(path), "payload".into())
+                .await
+                .unwrap();
+        }
+        app.refresh_files().await.unwrap();
+        // A directory at the second file's destination injects a write failure.
+        std::fs::create_dir_all(destination.join("folder/b")).unwrap();
+        app.modal = Modal::DownloadPicker {
+            destination: Some(destination.to_owned()),
+        };
+        app.success_message = Some("Previous success".to_owned());
+        let error = app.start_download().await.unwrap_err();
+        app.error_message = Some(format!("Download failed: {error}"));
+        app
+    }
+
+    #[tokio::test]
+    async fn folder_download_reports_partial_write_failure() {
+        let destination = tempfile::tempdir().unwrap();
+        let app = partial_download_app(destination.path()).await;
+        assert!(app.success_message.is_none());
+        let error = app.error_message.unwrap();
+        assert!(error.contains("Partially completed: 1/3 objects completed"));
+        assert!(error.contains("folder/b"));
+        assert_eq!(
+            std::fs::read(destination.path().join("folder/a")).unwrap(),
+            b"payload"
+        );
+        assert!(!destination.path().join("folder/c").exists());
+    }
+
+    #[test]
+    fn bulk_error_renders_wrapped_cause() {
+        use ratatui::{buffer::Buffer, layout::Rect, widgets::Widget};
+        for width in [70, 110] {
+            for browsing in [false, true] {
+                let mut app = if browsing {
+                    upload_test_app("")
+                } else {
+                    test_app()
+                };
+                app.error_message = Some("Download failed: Partially completed: 1/3 objects completed; stopped at folder/b: injected failure".to_owned());
+                let area = Rect::new(0, 0, width, 32);
+                let mut buffer = Buffer::empty(area);
+                (&app).render(area, &mut buffer);
+                let text: String = buffer.content.iter().map(|cell| cell.symbol()).collect();
+                assert!(text.contains("injected failure"));
+            }
+        }
+    }
+
+    /// Exercise the actual partial-download error with terminal input in tmux.
+    #[tokio::test]
+    #[ignore = "interactive terminal required"]
+    async fn bulk_failure_interactive_preview() {
+        let destination = tempfile::tempdir().unwrap();
+        let app = partial_download_app(destination.path()).await;
+        let mut terminal = ratatui::init();
+        let result = app.run(&mut terminal).await;
+        ratatui::restore();
+        result.unwrap();
     }
 
     fn assert_delete_target(app: &mut App, expected: &str) {
