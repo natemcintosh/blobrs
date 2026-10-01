@@ -67,14 +67,39 @@ storage data role and scope.
 
 ## Environment Variables
 
-Set:
+`AZURE_STORAGE_ACCOUNT` is the only required environment variable. Set it to the
+storage account **name**, not a URL or connection string. Credentials come from
+your Azure CLI login; no storage key or container variable is needed.
+
+For Bash or zsh, set it in your current terminal:
 
 ```bash
 export AZURE_STORAGE_ACCOUNT="your_storage_account_name"
 ```
 
-When using `just run`, you can instead use a `.env` file (optional). Direct
-`cargo run` requires the variable to be exported in your shell:
+To keep the setting across terminals, add that `export` line to `~/.bashrc`
+(Bash) or `~/.zshrc` (zsh), then open a new terminal or run `source ~/.bashrc`
+or `source ~/.zshrc`, respectively.
+
+For PowerShell:
+
+```powershell
+$env:AZURE_STORAGE_ACCOUNT = "your_storage_account_name"
+```
+
+Add that line to your PowerShell profile (`$PROFILE`) to load it in future
+sessions. If the profile does not exist, create it first:
+
+```powershell
+New-Item -ItemType File -Path $PROFILE -Force
+```
+
+Optional: set `BLOBRS_ICONS` to `unicode`, `ascii`, or `minimal` to override
+automatic terminal icon detection, for example `export BLOBRS_ICONS=ascii` in
+Bash/zsh or `$env:BLOBRS_ICONS = "ascii"` in PowerShell.
+
+The `blobrs` binary and `cargo run` do not load `.env` files. For development,
+`just run` loads the repository's `.env`; copy `.env.example` to `.env` and edit it:
 
 ```env
 AZURE_STORAGE_ACCOUNT=your_storage_account_name
@@ -82,15 +107,43 @@ AZURE_STORAGE_ACCOUNT=your_storage_account_name
 
 ## Install
 
+Install from GitHub with Cargo (no repository checkout required):
+
+```bash
+cargo install --git https://github.com/natemcintosh/blobrs.git --locked
+```
+
+Make sure Cargo's binary directory is on your `PATH`: by default `~/.cargo/bin`
+on Linux/macOS or `%USERPROFILE%\.cargo\bin` on Windows. If you use a custom
+`CARGO_HOME` or install root, use its `bin` directory instead.
+
+For Bash/zsh, add `export PATH="$HOME/.cargo/bin:$PATH"` to the same shell
+configuration file used above. On Windows, add `%USERPROFILE%\.cargo\bin` to
+your user `Path` environment variable through **Edit environment variables for
+your account**. Open a new terminal after updating `PATH`.
+
+Alternatively, install from a local checkout:
+
 ```bash
 git clone https://github.com/natemcintosh/blobrs.git
 cd blobrs
-cargo build --release
+cargo install --path . --locked
 ```
 
 ## Run
 
-Using Cargo:
+After installation, setting `AZURE_STORAGE_ACCOUNT`, and signing in with `az
+login`, run from **any directory**:
+
+```bash
+blobrs
+```
+
+You do not need the repository, `just`, or a `.env` file to run the installed
+binary. To switch accounts, set `AZURE_STORAGE_ACCOUNT` to the other account name
+before launching again.
+
+For development, run from the repository using Cargo:
 
 ```bash
 cargo run --release
