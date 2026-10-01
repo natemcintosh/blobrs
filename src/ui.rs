@@ -582,13 +582,13 @@ impl App {
         };
         let popup = Rect {
             x: area.x + area.width.saturating_sub(64) / 2,
-            y: area.y + area.height.saturating_sub(10) / 2,
+            y: area.y + area.height.saturating_sub(13) / 2,
             width: area.width.min(64),
-            height: area.height.min(10),
+            height: area.height.min(13),
         };
         ratatui::widgets::Clear.render(popup, buf);
         Paragraph::new(format!(
-            "Upload a local file to: /{}\n\nThe file keeps its name. Existing blobs are not replaced.\n\nPress Enter to select a file\nPress Esc to cancel",
+            "Upload a local file to: /{}\n\nThe file keeps its name. Existing blobs are not replaced.\n\nTo upload elsewhere, press Esc, navigate to that folder,\nthen press u again.\n\nPress Enter to select a file\nPress Esc to cancel",
             browsing.current_path
         ))
         .block(Block::bordered().border_type(BorderType::Rounded).title(" Upload "))
