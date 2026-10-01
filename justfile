@@ -5,6 +5,7 @@ alias r := run
 alias t := test-all
 alias c := check
 alias f := fmt
+alias i := install
 
 # List available commands and aliases.
 [group('help')]
@@ -15,6 +16,11 @@ default:
 [group('development')]
 build:
     cargo build --release
+
+# Reinstall the application from local source using the locked dependencies.
+[group('development')]
+install:
+    cargo install --path . --locked --force
 
 # Run the release build using the configured Azure Storage account.
 [group('development')]

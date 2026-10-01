@@ -37,10 +37,26 @@ pub enum SortCriteria {
 #[derive(Debug, Clone)]
 pub struct BrowsingState {
     pub object_store: Arc<dyn ObjectStore>,
-    pub current_path: String,
-    pub files: Vec<String>,
-    pub file_items: Vec<FileItem>,
+    directory: LoadedDirectory,
     pub selected_index: usize,
+}
+
+/// A prefix and its successfully fetched entries are installed together.
+#[derive(Debug, Clone)]
+struct LoadedDirectory {
+    current_path: String,
+    files: Vec<String>,
+    file_items: Vec<FileItem>,
+}
+
+impl BrowsingState {
+    pub(crate) fn current_path(&self) -> &str {
+        &self.directory.current_path
+    }
+
+    pub(crate) fn files(&self) -> &[String] {
+        &self.directory.files
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -565,7 +581,7 @@ impl App {
                         self.close_modal();
                     } else if self
                         .browsing()
-                        .is_some_and(|state| !state.current_path.is_empty())
+                        .is_some_and(|state| !state.directory.current_path.is_empty())
                     {
                         // Go up one directory level if not at container root
                         if let Err(e) = self.go_up_directory().await {
@@ -632,7 +648,7 @@ impl App {
 
     fn selected_file_item(&self) -> Option<&FileItem> {
         let state = self.browsing()?;
-        state.file_items.get(state.selected_index)
+        state.directory.file_items.get(state.selected_index)
     }
 
     fn join_blob_path(current_path: &str, name: &str) -> String {
@@ -711,13 +727,11 @@ impl App {
     }
 
     /// List blobs and prefixes with metadata for sorting.
-    async fn list_file_items(&self, prefix: &str) -> color_eyre::Result<Vec<FileItem>> {
-        let object_store = self
-            .browsing()
-            .ok_or_else(|| color_eyre::eyre::eyre!("No container selected"))?
-            .object_store
-            .clone();
-
+    async fn list_file_items(
+        &self,
+        object_store: &dyn ObjectStore,
+        prefix: &str,
+    ) -> color_eyre::Result<Vec<FileItem>> {
         let result = if prefix.is_empty() {
             object_store.list_with_delimiter(None).await?
         } else {
@@ -768,11 +782,12 @@ impl App {
         self.sort_criteria = criteria;
 
         if let Some(state) = self.browsing_mut()
-            && !state.file_items.is_empty()
+            && !state.directory.file_items.is_empty()
         {
-            Self::sort_file_items_static(&mut state.file_items, criteria);
+            Self::sort_file_items_static(&mut state.directory.file_items, criteria);
             // Update the display list
-            state.files = state
+            state.directory.files = state
+                .directory
                 .file_items
                 .iter()
                 .map(|item| item.display_name.clone())
@@ -846,61 +861,71 @@ impl App {
     ///
     /// Returns an error if listing blobs from Azure Storage fails.
     pub async fn refresh_files(&mut self) -> color_eyre::Result<()> {
-        let current_path = match self.browsing() {
-            Some(state) => state.current_path.clone(),
-            None => return Ok(()),
+        let Some(state) = self.browsing() else {
+            return Ok(());
         };
+        let directory = self
+            .load_directory(
+                state.object_store.as_ref(),
+                state.directory.current_path.clone(),
+            )
+            .await?;
 
+        if let Search::Files {
+            all_files,
+            all_file_items,
+            ..
+        } = &mut self.search
+        {
+            all_files.clone_from(&directory.files);
+            all_file_items.clone_from(&directory.file_items);
+        }
+        if let Some(state) = self.browsing_mut() {
+            state.directory = directory;
+            state.selected_index = 0;
+        }
+        if let Search::Files { query, .. } = &self.search {
+            let query = query.clone();
+            self.apply_file_search(&query);
+        }
         self.error_message = None;
         self.success_message = None;
+        Ok(())
+    }
 
-        match self.list_file_items(&current_path).await {
-            Ok(mut file_items) => {
-                // Apply current sorting
-                Self::sort_file_items_static(&mut file_items, self.sort_criteria);
+    async fn load_directory(
+        &self,
+        object_store: &dyn ObjectStore,
+        current_path: String,
+    ) -> color_eyre::Result<LoadedDirectory> {
+        let mut file_items = self.list_file_items(object_store, &current_path).await?;
+        Self::sort_file_items_static(&mut file_items, self.sort_criteria);
+        let files = file_items
+            .iter()
+            .map(|item| item.display_name.clone())
+            .collect();
+        Ok(LoadedDirectory {
+            current_path,
+            files,
+            file_items,
+        })
+    }
 
-                // Create display strings
-                let files: Vec<String> = file_items
-                    .iter()
-                    .map(|item| item.display_name.clone())
-                    .collect();
-
-                let search_query = match &self.search {
-                    Search::Files { query, .. } => Some(query.clone()),
-                    _ => None,
-                };
-
-                if let Search::Files {
-                    all_files,
-                    all_file_items,
-                    ..
-                } = &mut self.search
-                {
-                    all_file_items.clone_from(&file_items);
-                    all_files.clone_from(&files);
-                }
-
-                if let Some(query) = search_query {
-                    if query.is_empty() {
-                        if let Some(state) = self.browsing_mut() {
-                            state.file_items = file_items;
-                            state.files = files;
-                            state.selected_index = 0;
-                        }
-                    } else {
-                        self.apply_file_search(&query);
-                    }
-                } else if let Some(state) = self.browsing_mut() {
-                    state.file_items = file_items;
-                    state.files = files;
-                    state.selected_index = 0;
-                }
-            }
-            Err(e) => {
-                self.error_message = Some(format!("Failed to list blobs: {e}"));
-            }
+    async fn navigate_to(&mut self, path: String) -> color_eyre::Result<()> {
+        let Some(state) = self.browsing() else {
+            return Ok(());
+        };
+        // Do not change the path, selection, or search snapshot until listing succeeds.
+        let directory = self
+            .load_directory(state.object_store.as_ref(), path)
+            .await?;
+        if let Some(state) = self.browsing_mut() {
+            state.directory = directory;
+            state.selected_index = 0;
         }
-
+        self.search = Search::Inactive;
+        self.error_message = None;
+        self.success_message = None;
         Ok(())
     }
 
@@ -916,7 +941,7 @@ impl App {
     /// Move the selection down.
     pub fn move_down(&mut self) {
         if let Some(state) = self.browsing_mut()
-            && state.selected_index < state.files.len().saturating_sub(1)
+            && state.selected_index < state.directory.files.len().saturating_sub(1)
         {
             state.selected_index += 1;
         }
@@ -933,7 +958,7 @@ impl App {
                 let Some(item) = self.selected_file_item() else {
                     return Ok(());
                 };
-                (item.clone(), state.current_path.clone())
+                (item.clone(), state.directory.current_path.clone())
             }
             None => return Ok(()),
         };
@@ -943,14 +968,7 @@ impl App {
         }
         if selected_item.kind == EntryKind::Folder {
             let new_path = Self::join_folder_path(&current_path, &selected_item.actual_name);
-            if let Some(state) = self.browsing_mut() {
-                state.current_path = new_path;
-            }
-            // Exit search mode when navigating
-            if self.is_searching_files() {
-                self.search = Search::Inactive;
-            }
-            self.refresh_files().await?;
+            self.navigate_to(new_path).await?;
         }
         Ok(())
     }
@@ -962,7 +980,7 @@ impl App {
     /// Returns an error if refreshing the file list fails.
     pub async fn go_up_directory(&mut self) -> color_eyre::Result<()> {
         let current_path = match self.browsing() {
-            Some(state) => state.current_path.clone(),
+            Some(state) => state.directory.current_path.clone(),
             None => return Ok(()),
         };
 
@@ -972,27 +990,21 @@ impl App {
 
         // Remove trailing slash and go up one level
         let trimmed = current_path.trim_end_matches('/');
-        if let Some(last_slash) = trimmed.rfind('/') {
-            if let Some(state) = self.browsing_mut() {
-                let new_path = &trimmed[..last_slash];
-                state.current_path = format!("{new_path}/");
-            }
-        } else if let Some(state) = self.browsing_mut() {
-            state.current_path = String::new(); // Go to root
-        }
-
-        // Exit search mode when navigating
-        if self.is_searching_files() {
-            self.search = Search::Inactive;
-        }
-        self.refresh_files().await?;
+        let new_path = match trimmed.rfind('/') {
+            Some(last_slash) => format!("{}/", &trimmed[..last_slash]),
+            None => String::new(),
+        };
+        self.navigate_to(new_path).await?;
         Ok(())
     }
 
     /// Enter search mode.
     pub fn enter_search_mode(&mut self) {
         let (files, file_items) = match self.browsing() {
-            Some(state) => (state.files.clone(), state.file_items.clone()),
+            Some(state) => (
+                state.directory.files.clone(),
+                state.directory.file_items.clone(),
+            ),
             None => return,
         };
 
@@ -1017,8 +1029,8 @@ impl App {
         };
 
         if let Some(state) = self.browsing_mut() {
-            state.files = all_files;
-            state.file_items = all_file_items;
+            state.directory.files = all_files;
+            state.directory.file_items = all_file_items;
             state.selected_index = 0;
         }
         self.search = Search::Inactive;
@@ -1112,7 +1124,7 @@ impl App {
                 let Some(item) = self.selected_file_item() else {
                     return;
                 };
-                (item.clone(), state.current_path.clone())
+                (item.clone(), state.directory.current_path.clone())
             }
             None => return,
         };
@@ -1270,7 +1282,7 @@ impl App {
                 let Some(item) = self.selected_file_item() else {
                     return;
                 };
-                (item.clone(), state.current_path.clone())
+                (item.clone(), state.directory.current_path.clone())
             }
             None => return,
         };
@@ -1389,8 +1401,8 @@ impl App {
 
         if let Some(state) = self.browsing_mut() {
             if query.is_empty() {
-                state.files = all_files;
-                state.file_items = all_file_items;
+                state.directory.files = all_files;
+                state.directory.file_items = all_file_items;
             } else {
                 let filtered_items: Vec<FileItem> = all_file_items
                     .iter()
@@ -1402,8 +1414,8 @@ impl App {
                     .cloned()
                     .collect();
 
-                state.file_items.clone_from(&filtered_items);
-                state.files = filtered_items
+                state.directory.file_items.clone_from(&filtered_items);
+                state.directory.files = filtered_items
                     .iter()
                     .map(|item| item.display_name.clone())
                     .collect();
@@ -1659,17 +1671,16 @@ impl App {
             .with_credentials(self.credentials.clone())
             .build()?;
 
+        let directory = self.load_directory(&azure_client, String::new()).await?;
         self.session = Session::Browsing(BrowsingState {
             object_store: Arc::new(azure_client),
-            current_path: String::new(),
-            files: Vec::new(),
-            file_items: Vec::new(),
+            directory,
             selected_index: 0,
         });
         self.search = Search::Inactive;
+        self.error_message = None;
+        self.success_message = None;
 
-        // Load initial file list
-        self.refresh_files().await?;
         Ok(())
     }
 
@@ -1790,7 +1801,7 @@ impl App {
             .ok_or_else(|| color_eyre::eyre::eyre!("No container selected"))?;
         let object_store = browsing.object_store.clone();
 
-        let folder_path = Self::join_folder_path(&browsing.current_path, folder_name);
+        let folder_path = Self::join_folder_path(&browsing.directory.current_path, folder_name);
 
         let object_path = Self::object_path(folder_path.as_str())?;
 
@@ -1820,7 +1831,7 @@ impl App {
             .ok_or_else(|| color_eyre::eyre::eyre!("No container selected"))?;
         let object_store = browsing.object_store.clone();
 
-        let blob_path = Self::join_blob_path(&browsing.current_path, blob_name);
+        let blob_path = Self::join_blob_path(&browsing.directory.current_path, blob_name);
 
         let object_path = Self::object_path(blob_path.as_str())?;
 
@@ -1849,7 +1860,7 @@ impl App {
                 let Some(item) = self.selected_file_item() else {
                     return Ok(());
                 };
-                (item.clone(), state.current_path.clone())
+                (item.clone(), state.directory.current_path.clone())
             }
             None => return Ok(()),
         };
@@ -1886,7 +1897,7 @@ impl App {
             .file_name()
             .and_then(|name| name.to_str())
             .ok_or_else(|| color_eyre::eyre::eyre!("File name must be valid UTF-8"))?;
-        let destination = Self::join_blob_path(&browsing.current_path, name);
+        let destination = Self::join_blob_path(&browsing.directory.current_path, name);
         let destination = Self::object_path(&destination)?;
         let mut file = tokio::fs::File::open(source).await?;
         if !file.metadata().await?.is_file() {
@@ -1912,7 +1923,7 @@ impl App {
     /// Show the download destination picker.
     pub fn show_download_picker(&mut self) {
         if let Some(state) = self.browsing() {
-            if state.files.is_empty() {
+            if state.directory.files.is_empty() {
                 return;
             }
         } else {
@@ -1965,7 +1976,7 @@ impl App {
             .ok_or_else(|| color_eyre::eyre::eyre!("No container selected"))?;
         let object_store = browsing.object_store.clone();
 
-        let blob_path = Self::join_blob_path(&browsing.current_path, file_name);
+        let blob_path = Self::join_blob_path(&browsing.directory.current_path, file_name);
 
         let object_path = Self::object_path(blob_path.as_str())?;
 
@@ -2002,7 +2013,7 @@ impl App {
             .ok_or_else(|| color_eyre::eyre::eyre!("No container selected"))?;
         let object_store = browsing.object_store.clone();
 
-        let folder_path = Self::join_folder_path(&browsing.current_path, folder_name);
+        let folder_path = Self::join_folder_path(&browsing.directory.current_path, folder_name);
 
         let object_path = Self::object_path(folder_path.as_str())?;
 
@@ -2085,7 +2096,7 @@ impl App {
                 let Some(item) = self.selected_file_item() else {
                     return Ok(());
                 };
-                (item.clone(), state.current_path.clone())
+                (item.clone(), state.directory.current_path.clone())
             }
             None => return Ok(()),
         };
@@ -2364,8 +2375,8 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::{
-        App, BrowsingState, EntryKind, KeyCode, KeyEvent, KeyModifiers, Modal, ParquetPreviewMode,
-        Search, Session, SortCriteria, UiToggles,
+        App, BrowsingState, EntryKind, KeyCode, KeyEvent, KeyModifiers, LoadedDirectory, Modal,
+        ParquetPreviewMode, Search, Session, SortCriteria, UiToggles,
     };
     use crate::preview::{ParquetSchemaPreview, PreviewData, PreviewFileType, TablePreview};
     use crate::terminal_icons::detect_terminal_icons;
@@ -2528,9 +2539,11 @@ mod tests {
         let mut app = test_app();
         app.session = Session::Browsing(BrowsingState {
             object_store: Arc::new(object_store::memory::InMemory::new()),
-            current_path: prefix.to_owned(),
-            files: Vec::new(),
-            file_items: Vec::new(),
+            directory: LoadedDirectory {
+                current_path: prefix.to_owned(),
+                files: Vec::new(),
+                file_items: Vec::new(),
+            },
             selected_index: 0,
         });
         app
@@ -2555,8 +2568,8 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(uploaded.as_ref(), contents);
-            assert_eq!(state.file_items.len(), 1);
-            assert_eq!(state.file_items[0].actual_name, "résumé 100%.bin");
+            assert_eq!(state.directory.file_items.len(), 1);
+            assert_eq!(state.directory.file_items[0].actual_name, "résumé 100%.bin");
             assert!(
                 app.success_message
                     .as_ref()
@@ -2626,7 +2639,7 @@ mod tests {
             .await
             .unwrap();
         assert!(matches!(app.modal, Modal::None));
-        assert!(app.browsing().unwrap().file_items.is_empty());
+        assert!(app.browsing().unwrap().directory.file_items.is_empty());
         app.modal = Modal::SortPicker;
         app.handle_key_event(KeyEvent::from(KeyCode::Char('u')))
             .await
@@ -2690,16 +2703,18 @@ mod tests {
         let mut app = test_app();
         app.session = Session::Browsing(BrowsingState {
             object_store: std::sync::Arc::new(object_store::memory::InMemory::new()),
-            current_path: String::new(),
-            files: vec![format!("{file} file.txt", file = app.icons.file)],
-            file_items: vec![super::FileItem {
-                display_name: format!("{file} file.txt", file = app.icons.file),
-                actual_name: "file.txt".to_string(),
-                kind: super::EntryKind::File,
-                size: None,
-                last_modified: None,
-                created: None,
-            }],
+            directory: LoadedDirectory {
+                current_path: String::new(),
+                files: vec![format!("{file} file.txt", file = app.icons.file)],
+                file_items: vec![super::FileItem {
+                    display_name: format!("{file} file.txt", file = app.icons.file),
+                    actual_name: "file.txt".to_string(),
+                    kind: super::EntryKind::File,
+                    size: None,
+                    last_modified: None,
+                    created: None,
+                }],
+            },
             selected_index: 0,
         });
 
@@ -2724,16 +2739,18 @@ mod tests {
         let mut app = test_app();
         app.session = Session::Browsing(BrowsingState {
             object_store: std::sync::Arc::new(object_store::memory::InMemory::new()),
-            current_path: String::new(),
-            files: vec![format!("{folder} logs", folder = app.icons.folder)],
-            file_items: vec![super::FileItem {
-                display_name: format!("{folder} logs", folder = app.icons.folder),
-                actual_name: "logs".to_string(),
-                kind: super::EntryKind::Folder,
-                size: None,
-                last_modified: None,
-                created: None,
-            }],
+            directory: LoadedDirectory {
+                current_path: String::new(),
+                files: vec![format!("{folder} logs", folder = app.icons.folder)],
+                file_items: vec![super::FileItem {
+                    display_name: format!("{folder} logs", folder = app.icons.folder),
+                    actual_name: "logs".to_string(),
+                    kind: super::EntryKind::Folder,
+                    size: None,
+                    last_modified: None,
+                    created: None,
+                }],
+            },
             selected_index: 0,
         });
 
@@ -2760,9 +2777,11 @@ mod tests {
         let mut app = test_app();
         app.session = Session::Browsing(BrowsingState {
             object_store: std::sync::Arc::new(object_store::memory::InMemory::new()),
-            current_path: String::new(),
-            files: vec![format!("{file} report.csv", file = app.icons.file)],
-            file_items: Vec::new(),
+            directory: LoadedDirectory {
+                current_path: String::new(),
+                files: vec![format!("{file} report.csv", file = app.icons.file)],
+                file_items: Vec::new(),
+            },
             selected_index: 0,
         });
 
@@ -2812,9 +2831,11 @@ mod tests {
         let mut app = test_app();
         app.session = Session::Browsing(BrowsingState {
             object_store: std::sync::Arc::new(object_store::memory::InMemory::new()),
-            current_path: String::new(),
-            files: Vec::new(),
-            file_items: Vec::new(),
+            directory: LoadedDirectory {
+                current_path: String::new(),
+                files: Vec::new(),
+                file_items: Vec::new(),
+            },
             selected_index: 0,
         });
         let file_items = vec![
@@ -2836,8 +2857,9 @@ mod tests {
             },
         ];
         if let Session::Browsing(state) = &mut app.session {
-            state.file_items = file_items.clone();
-            state.files = state
+            state.directory.file_items = file_items.clone();
+            state.directory.files = state
+                .directory
                 .file_items
                 .iter()
                 .map(|item| item.display_name.clone())
@@ -2851,14 +2873,162 @@ mod tests {
         app.apply_file_search("a");
 
         if let Session::Browsing(state) = &app.session {
-            assert_eq!(state.files, vec!["file_a".to_string()]);
+            assert_eq!(state.directory.files, vec!["file_a".to_string()]);
         }
 
         app.exit_search_mode();
         if let Session::Browsing(state) = &app.session {
-            assert_eq!(state.files.len(), 2);
+            assert_eq!(state.directory.files.len(), 2);
         }
         assert!(matches!(app.search, Search::Inactive));
+    }
+
+    // Replacing an ancestor directory with a file forces real listing failures,
+    // without Azure credentials, network access, or permission-dependent fixtures.
+    async fn navigation_test_app() -> (tempfile::TempDir, App) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("online/store");
+        std::fs::create_dir_all(root.join("parent/child")).unwrap();
+        std::fs::write(root.join("parent/child/data.txt"), "payload").unwrap();
+        std::fs::write(root.join("parent/a.txt"), "payload").unwrap();
+        let store = object_store::local::LocalFileSystem::new_with_prefix(root).unwrap();
+        let mut app = test_app();
+        let directory = app
+            .load_directory(&store, "parent/".to_owned())
+            .await
+            .unwrap();
+        app.session = Session::Browsing(BrowsingState {
+            object_store: Arc::new(store),
+            directory,
+            selected_index: 0,
+        });
+        (dir, app)
+    }
+
+    fn break_navigation_store(dir: &std::path::Path) {
+        std::fs::rename(dir.join("online"), dir.join("offline")).unwrap();
+        std::fs::write(dir.join("online"), "listing must fail").unwrap();
+    }
+
+    fn assert_delete_target(app: &mut App, expected: &str) {
+        app.open_delete_dialog();
+        let Modal::DeleteConfirm { target_path, .. } = &app.modal else {
+            panic!("expected a delete confirmation");
+        };
+        assert_eq!(target_path, expected);
+        app.close_modal();
+    }
+
+    #[tokio::test]
+    async fn failed_navigation_preserves_directory_and_action_targets() {
+        for go_up in [false, true] {
+            let (dir, mut app) = navigation_test_app().await;
+            if go_up {
+                app.enter_directory().await.unwrap();
+            }
+            let before = app.browsing().unwrap().clone();
+            break_navigation_store(dir.path());
+            let result = if go_up {
+                app.go_up_directory().await
+            } else {
+                app.enter_directory().await
+            };
+            assert!(result.is_err());
+            let state = app.browsing().unwrap();
+            assert_eq!(state.current_path(), before.current_path());
+            assert_eq!(state.files(), before.files());
+            assert_eq!(state.selected_index, before.selected_index);
+            assert_delete_target(
+                &mut app,
+                if go_up {
+                    "parent/child/data.txt"
+                } else {
+                    "parent/child/"
+                },
+            );
+
+            // The actual keyboard handler must surface the error in the UI.
+            app.handle_key_event(KeyEvent::from(if go_up {
+                KeyCode::Left
+            } else {
+                KeyCode::Enter
+            }))
+            .await
+            .unwrap();
+            assert!(app.error_message.as_deref().unwrap().contains("failed"));
+            assert_eq!(
+                app.browsing().unwrap().current_path(),
+                before.current_path()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_refresh_and_navigation_preserve_search_and_selection() {
+        let (dir, mut app) = navigation_test_app().await;
+        app.enter_search_mode();
+        app.browsing_mut().unwrap().selected_index = 1;
+        let before = app.browsing().unwrap().clone();
+        break_navigation_store(dir.path());
+        assert!(app.refresh_files().await.is_err());
+        assert!(app.go_up_directory().await.is_err());
+        let state = app.browsing().unwrap();
+        assert_eq!(state.current_path(), before.current_path());
+        assert_eq!(state.files(), before.files());
+        assert_eq!(state.selected_index, 1);
+        let Search::Files {
+            query,
+            all_files,
+            all_file_items,
+        } = &app.search
+        else {
+            panic!("failed navigation must preserve search");
+        };
+        assert!(query.is_empty());
+        assert_eq!(all_files, before.files());
+        assert_eq!(
+            all_file_items
+                .iter()
+                .map(|item| &item.actual_name)
+                .collect::<Vec<_>>(),
+            before
+                .directory
+                .file_items
+                .iter()
+                .map(|item| &item.actual_name)
+                .collect::<Vec<_>>()
+        );
+        assert_delete_target(&mut app, "parent/a.txt");
+    }
+
+    #[tokio::test]
+    async fn successful_navigation_replaces_directory_and_resets_search() {
+        let (_dir, mut app) = navigation_test_app().await;
+        app.enter_search_mode();
+        app.enter_directory().await.unwrap();
+        assert!(matches!(app.search, Search::Inactive));
+        assert_eq!(app.browsing().unwrap().current_path(), "parent/child/");
+        assert_delete_target(&mut app, "parent/child/data.txt");
+        app.go_up_directory().await.unwrap();
+        assert_eq!(app.browsing().unwrap().current_path(), "parent/");
+        assert_eq!(app.browsing().unwrap().selected_index, 0);
+        assert_eq!(app.browsing().unwrap().directory.file_items.len(), 2);
+        assert_delete_target(&mut app, "parent/child/");
+        app.go_up_directory().await.unwrap();
+        assert_eq!(app.browsing().unwrap().current_path(), "");
+        assert_delete_target(&mut app, "parent/");
+    }
+
+    /// Interactive reproduction of a listing failure with a populated browser.
+    #[tokio::test]
+    #[ignore = "interactive terminal required"]
+    async fn navigation_failure_interactive_preview() {
+        let (dir, app) = navigation_test_app().await;
+        break_navigation_store(dir.path());
+        let mut terminal = ratatui::init();
+        let result = app.run(&mut terminal).await;
+        ratatui::restore();
+        result.unwrap();
     }
 
     #[tokio::test]
@@ -2877,26 +3047,31 @@ mod tests {
         let mut app = test_app();
         app.session = Session::Browsing(BrowsingState {
             object_store: Arc::new(store),
-            current_path: parent_path.to_string(),
-            files: Vec::new(),
-            file_items: Vec::new(),
+            directory: LoadedDirectory {
+                current_path: parent_path.to_string(),
+                files: Vec::new(),
+                file_items: Vec::new(),
+            },
             selected_index: 0,
         });
 
         app.refresh_files().await?;
 
         let state = app.browsing().expect("expected browsing session");
-        assert_eq!(state.file_items.len(), 1);
-        assert_eq!(state.file_items[0].actual_name, folder_name);
-        assert_eq!(state.file_items[0].kind, EntryKind::Folder);
+        assert_eq!(state.directory.file_items.len(), 1);
+        assert_eq!(state.directory.file_items[0].actual_name, folder_name);
+        assert_eq!(state.directory.file_items[0].kind, EntryKind::Folder);
 
         app.enter_directory().await?;
 
         let state = app.browsing().expect("expected browsing session");
-        assert_eq!(state.current_path, format!("{parent_path}/{folder_name}/"));
-        assert_eq!(state.file_items.len(), 1);
-        assert_eq!(state.file_items[0].actual_name, blob_name);
-        assert_eq!(state.file_items[0].kind, EntryKind::File);
+        assert_eq!(
+            state.directory.current_path,
+            format!("{parent_path}/{folder_name}/")
+        );
+        assert_eq!(state.directory.file_items.len(), 1);
+        assert_eq!(state.directory.file_items[0].actual_name, blob_name);
+        assert_eq!(state.directory.file_items[0].kind, EntryKind::File);
 
         Ok(())
     }
@@ -3048,9 +3223,11 @@ mod tests {
 
             app.session = Session::Browsing(BrowsingState {
                 object_store: std::sync::Arc::new(object_store::memory::InMemory::new()),
-                current_path: String::new(),
-                files: all_files.clone(),
-                file_items: items.clone(),
+                directory: LoadedDirectory {
+                    current_path: String::new(),
+                    files: all_files.clone(),
+                    file_items: items.clone(),
+                },
                 selected_index: 5,
             });
             app.search = Search::Files {
@@ -3068,16 +3245,16 @@ mod tests {
 
             prop_assert_eq!(state.selected_index, 0);
             prop_assert_eq!(
-                state.files.clone(),
-                state.file_items.iter().map(|item| item.display_name.clone()).collect::<Vec<_>>()
+                state.directory.files.clone(),
+                state.directory.file_items.iter().map(|item| item.display_name.clone()).collect::<Vec<_>>()
             );
 
             if query.is_empty() {
-                prop_assert_eq!(state.file_items.len(), items.len());
+                prop_assert_eq!(state.directory.file_items.len(), items.len());
             } else {
                 let lowered = query.to_lowercase();
-                prop_assert!(state.file_items.iter().all(|item| item.actual_name.to_lowercase().contains(&lowered)));
-                prop_assert!(state.file_items.len() <= items.len());
+                prop_assert!(state.directory.file_items.iter().all(|item| item.actual_name.to_lowercase().contains(&lowered)));
+                prop_assert!(state.directory.file_items.len() <= items.len());
             }
         }
 

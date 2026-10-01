@@ -335,7 +335,7 @@ impl App {
         };
 
         // Main block with file list
-        let file_items: Vec<ListItem> = if browsing.files.is_empty() {
+        let file_items: Vec<ListItem> = if browsing.files().is_empty() {
             let has_query = self.file_search_query().is_some_and(|q| !q.is_empty());
             if self.is_searching_files() && has_query {
                 vec![ListItem::new(format!(
@@ -350,23 +350,23 @@ impl App {
             }
         } else {
             browsing
-                .files
+                .files()
                 .iter()
                 .map(|file| ListItem::new(file.as_str()))
                 .collect()
         };
 
         let mut list_state = ListState::default();
-        if !browsing.files.is_empty() {
+        if !browsing.files().is_empty() {
             list_state.select(Some(browsing.selected_index));
         }
 
-        let current_path_display = if browsing.current_path.is_empty() {
+        let current_path_display = if browsing.current_path().is_empty() {
             "/ (root)".to_string()
         } else {
             format!(
                 "/{path}",
-                path = browsing.current_path.trim_end_matches('/')
+                path = browsing.current_path().trim_end_matches('/')
             )
         };
 
@@ -382,14 +382,14 @@ impl App {
                 " Container: {container} - {path} [SEARCH] ({count} shown) ",
                 container = container_name,
                 path = current_path_display,
-                count = browsing.files.len()
+                count = browsing.files().len()
             )
         } else {
             format!(
                 " Container: {container} - {path} ({count} items) ",
                 container = container_name,
                 path = current_path_display,
-                count = browsing.files.len()
+                count = browsing.files().len()
             )
         };
 
@@ -593,7 +593,7 @@ impl App {
         ratatui::widgets::Clear.render(popup, buf);
         Paragraph::new(format!(
             "Upload a local file to: /{}\n\nThe file keeps its name. Existing blobs are not replaced.\n\nTo upload elsewhere, press Esc, navigate to that folder,\nthen press u again.\n\nPress Enter to select a file\nPress Esc to cancel",
-            browsing.current_path
+            browsing.current_path()
         ))
         .block(Block::bordered().border_type(BorderType::Rounded).title(" Upload "))
         .style(Style::default().fg(Color::Green).bg(Color::Black))
@@ -627,7 +627,7 @@ impl App {
         }
 
         let selected_file = browsing
-            .files
+            .files()
             .get(browsing.selected_index)
             .map(std::string::String::as_str)
             .unwrap_or("No file selected");
