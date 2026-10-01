@@ -93,6 +93,7 @@ pub enum Modal {
     DownloadPicker {
         destination: Option<PathBuf>,
     },
+    UploadPicker,
     SortPicker,
     Clone {
         input: String,
@@ -310,6 +311,37 @@ impl App {
         }
 
         // State-specific key handling
+        if matches!(self.modal, Modal::UploadPicker) {
+            match key_event.code {
+                KeyCode::Esc | KeyCode::Backspace | KeyCode::Left | KeyCode::Char('h') => {
+                    self.close_modal();
+                }
+                KeyCode::Enter => {
+                    self.close_modal();
+                    self.error_message = None;
+                    self.success_message = None;
+                    let result = async {
+                        let path = tokio::task::spawn_blocking(|| {
+                            rfd::FileDialog::new()
+                                .set_title("Select file to upload")
+                                .pick_file()
+                        })
+                        .await?;
+                        if let Some(path) = path {
+                            self.upload_file(&path).await?;
+                        }
+                        Ok::<_, color_eyre::Report>(())
+                    }
+                    .await;
+                    if let Err(error) = result {
+                        self.error_message = Some(format!("Upload failed: {error}"));
+                    }
+                }
+                _ => {}
+            }
+            return Ok(());
+        }
+
         if self.is_selecting() {
             match key_event.code {
                 KeyCode::Esc => {
@@ -381,6 +413,11 @@ impl App {
                     if self.ui.show_preview {
                         self.toggle_parquet_preview_mode();
                     }
+                }
+                KeyCode::Char('u')
+                    if matches!(self.modal, Modal::None) && !self.ui.show_preview =>
+                {
+                    self.modal = Modal::UploadPicker;
                 }
                 KeyCode::Char('d') => {
                     if !self.is_modal_blob_info()
@@ -1776,6 +1813,39 @@ impl App {
         Ok(())
     }
 
+    /// Upload a local file into the current prefix without replacing an existing blob.
+    async fn upload_file(&mut self, source: &Path) -> color_eyre::Result<()> {
+        let browsing = self
+            .browsing()
+            .ok_or_else(|| color_eyre::eyre::eyre!("No container selected"))?;
+        let store = browsing.object_store.clone();
+        let name = source
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| color_eyre::eyre::eyre!("File name must be valid UTF-8"))?;
+        let destination = Self::join_blob_path(&browsing.current_path, name);
+        let destination = Self::object_path(&destination)?;
+        let mut file = tokio::fs::File::open(source).await?;
+        if !file.metadata().await?.is_file() {
+            color_eyre::eyre::bail!("Select a regular file to upload");
+        }
+        let mut contents = Vec::new();
+        tokio::io::AsyncReadExt::read_to_end(&mut file, &mut contents).await?;
+        store
+            .put_opts(
+                &destination,
+                contents.into(),
+                object_store::PutMode::Create.into(),
+            )
+            .await?;
+
+        if let Err(error) = self.refresh_files().await {
+            self.error_message = Some(format!("Refresh failed after upload: {error}"));
+        }
+        self.success_message = Some(format!("Successfully uploaded {destination}"));
+        Ok(())
+    }
+
     /// Show the download destination picker.
     pub fn show_download_picker(&mut self) {
         if let Some(state) = self.browsing() {
@@ -2317,6 +2387,121 @@ mod tests {
             parquet_table_data: None,
             parquet_schema_data: None,
         }
+    }
+
+    fn upload_test_app(prefix: &str) -> App {
+        let mut app = test_app();
+        app.session = Session::Browsing(BrowsingState {
+            object_store: Arc::new(object_store::memory::InMemory::new()),
+            current_path: prefix.to_owned(),
+            files: Vec::new(),
+            file_items: Vec::new(),
+            selected_index: 0,
+        });
+        app
+    }
+
+    #[tokio::test]
+    async fn upload_preserves_contents_and_names_and_refreshes_listing() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("résumé 100%.bin");
+        for (prefix, contents) in [("", b"\0\xffbinary".as_slice()), ("nested/folder/", b"")] {
+            std::fs::write(&source, contents).unwrap();
+            let mut app = upload_test_app(prefix);
+            app.upload_file(&source).await.unwrap();
+            let state = app.browsing().unwrap();
+            let path = ObjectPath::parse(format!("{prefix}résumé 100%.bin")).unwrap();
+            let uploaded = state
+                .object_store
+                .get(&path)
+                .await
+                .unwrap()
+                .bytes()
+                .await
+                .unwrap();
+            assert_eq!(uploaded.as_ref(), contents);
+            assert_eq!(state.file_items.len(), 1);
+            assert_eq!(state.file_items[0].actual_name, "résumé 100%.bin");
+            assert!(
+                app.success_message
+                    .as_ref()
+                    .unwrap()
+                    .contains(path.as_ref())
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn upload_does_not_replace_existing_blob() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("existing.txt");
+        std::fs::write(&source, b"replacement").unwrap();
+        let mut app = upload_test_app("");
+        let store = app.browsing().unwrap().object_store.clone();
+        let destination = ObjectPath::from("existing.txt");
+        store.put(&destination, "original".into()).await.unwrap();
+        assert!(app.upload_file(&source).await.is_err());
+        assert_eq!(
+            store
+                .get(&destination)
+                .await
+                .unwrap()
+                .bytes()
+                .await
+                .unwrap()
+                .as_ref(),
+            b"original"
+        );
+        assert!(app.success_message.is_none());
+    }
+
+    #[tokio::test]
+    async fn upload_rejects_missing_files_and_directories() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = upload_test_app("");
+        assert!(app.upload_file(&dir.path().join("missing")).await.is_err());
+        assert!(app.upload_file(dir.path()).await.is_err());
+        assert!(
+            app.browsing()
+                .unwrap()
+                .object_store
+                .list_with_delimiter(None)
+                .await
+                .unwrap()
+                .objects
+                .is_empty()
+        );
+        assert!(app.success_message.is_none());
+    }
+
+    #[tokio::test]
+    async fn upload_picker_works_in_empty_container_and_is_modal() {
+        let mut app = upload_test_app("");
+        app.handle_key_event(KeyEvent::from(KeyCode::Char('u')))
+            .await
+            .unwrap();
+        assert!(matches!(app.modal, Modal::UploadPicker));
+        for key in ['c', 'x', 'd', '/', 'r'] {
+            app.handle_key_event(KeyEvent::from(KeyCode::Char(key)))
+                .await
+                .unwrap();
+            assert!(matches!(app.modal, Modal::UploadPicker));
+        }
+        app.handle_key_event(KeyEvent::from(KeyCode::Esc))
+            .await
+            .unwrap();
+        assert!(matches!(app.modal, Modal::None));
+        assert!(app.browsing().unwrap().file_items.is_empty());
+        app.modal = Modal::SortPicker;
+        app.handle_key_event(KeyEvent::from(KeyCode::Char('u')))
+            .await
+            .unwrap();
+        assert!(matches!(app.modal, Modal::SortPicker));
+        let mut app = test_app();
+        app.handle_key_event(KeyEvent::from(KeyCode::Char('u')))
+            .await
+            .unwrap();
+        assert!(matches!(app.modal, Modal::None));
     }
 
     #[tokio::test]
