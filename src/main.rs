@@ -4,6 +4,7 @@ pub mod app;
 mod bulk;
 mod favorites;
 pub mod preview;
+mod task;
 pub mod terminal_icons;
 pub mod ui;
 

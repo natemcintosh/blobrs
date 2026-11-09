@@ -8,7 +8,7 @@ repository = "https://github.com/natemcintosh/blobrs"
 edition = "2024"
 
 [dependencies]
-crossterm = "0.29.0"
+crossterm = { version = "0.29.0", features = ["event-stream"] }
 ratatui = "0.30.0"
 color-eyre = "0.6.3"
 object_store = { version = "0.14", features = ["azure"] }
@@ -31,4 +31,5 @@ bytes = "1.11"
 tempfile = "3"
 
 [dev-dependencies]
+async-trait = "0.1"
 proptest = "1.11"
