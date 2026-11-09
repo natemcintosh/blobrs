@@ -9,6 +9,7 @@ use crate::{
 };
 use arboard::Clipboard;
 use chrono::Utc;
+use futures::TryStreamExt;
 use object_store::{
     ObjectStore, ObjectStoreExt,
     azure::{AzureCredential, AzureCredentialProvider, MicrosoftAzureBuilder},
@@ -20,6 +21,7 @@ use ratatui::{
 };
 use regex::Regex;
 use reqwest;
+use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -31,6 +33,14 @@ pub enum SortCriteria {
     DateModified,
     DateCreated,
     Size,
+}
+
+impl SortCriteria {
+    /// Blob storage keeps no metadata for folders, so every criterion except name
+    /// needs a recursive scan of each folder's blobs.
+    fn needs_folder_stats(self) -> bool {
+        !matches!(self, Self::Name)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -46,6 +56,8 @@ struct LoadedDirectory {
     current_path: String,
     files: Vec<String>,
     file_items: Vec<FileItem>,
+    /// Whether folder items carry their newest blob time and total blob size.
+    has_folder_stats: bool,
 }
 
 impl BrowsingState {
@@ -98,6 +110,13 @@ pub struct FileItem {
     pub size: Option<u64>,
     pub last_modified: Option<chrono::DateTime<chrono::Utc>>,
     pub created: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// Blob storage keeps no metadata for folders, so this is aggregated from their blobs.
+#[derive(Debug, Clone, Copy)]
+struct FolderStats {
+    size: u64,
+    last_modified: chrono::DateTime<chrono::Utc>,
 }
 
 #[derive(Debug, Clone)]
@@ -457,7 +476,7 @@ impl App {
                         self.modal = Modal::SortPicker;
                     } else if self.is_modal_sort_picker() {
                         // Handle sort selection
-                        if let Err(e) = self.apply_sort(SortCriteria::Size) {
+                        if let Err(e) = self.apply_sort(SortCriteria::Size).await {
                             self.error_message = Some(format!("Failed to sort: {e}"));
                         }
                         self.close_modal();
@@ -465,7 +484,7 @@ impl App {
                 }
                 KeyCode::Char('n') => {
                     if self.is_modal_sort_picker() {
-                        if let Err(e) = self.apply_sort(SortCriteria::Name) {
+                        if let Err(e) = self.apply_sort(SortCriteria::Name).await {
                             self.error_message = Some(format!("Failed to sort: {e}"));
                         }
                         self.close_modal();
@@ -473,7 +492,7 @@ impl App {
                 }
                 KeyCode::Char('m') => {
                     if self.is_modal_sort_picker() {
-                        if let Err(e) = self.apply_sort(SortCriteria::DateModified) {
+                        if let Err(e) = self.apply_sort(SortCriteria::DateModified).await {
                             self.error_message = Some(format!("Failed to sort: {e}"));
                         }
                         self.close_modal();
@@ -481,7 +500,7 @@ impl App {
                 }
                 KeyCode::Char('t') => {
                     if self.is_modal_sort_picker() {
-                        if let Err(e) = self.apply_sort(SortCriteria::DateCreated) {
+                        if let Err(e) = self.apply_sort(SortCriteria::DateCreated).await {
                             self.error_message = Some(format!("Failed to sort: {e}"));
                         }
                         self.close_modal();
@@ -730,13 +749,12 @@ impl App {
         &self,
         object_store: &dyn ObjectStore,
         prefix: &str,
+        with_folder_stats: bool,
     ) -> color_eyre::Result<Vec<FileItem>> {
-        let result = if prefix.is_empty() {
-            object_store.list_with_delimiter(None).await?
-        } else {
-            let object_path = Self::object_path(prefix)?;
-            object_store.list_with_delimiter(Some(&object_path)).await?
-        };
+        let prefix_path = Self::prefix_path(prefix)?;
+        let result = object_store
+            .list_with_delimiter(prefix_path.as_ref())
+            .await?;
         let mut items = Vec::new();
 
         // Add "directories" (common prefixes)
@@ -769,15 +787,96 @@ impl App {
             }
         }
 
+        if with_folder_stats && items.iter().any(|item| item.kind == EntryKind::Folder) {
+            let stats = Self::folder_stats(object_store, prefix_path.as_ref()).await?;
+            Self::set_folder_stats(&mut items, &stats);
+        }
+
         Ok(items)
+    }
+
+    /// Container roots have no object path.
+    fn prefix_path(prefix: &str) -> color_eyre::Result<Option<ObjectPath>> {
+        if prefix.is_empty() {
+            Ok(None)
+        } else {
+            Self::object_path(prefix).map(Some)
+        }
+    }
+
+    /// Aggregate each child folder of `prefix` from the blobs beneath it, at any depth.
+    async fn folder_stats(
+        object_store: &dyn ObjectStore,
+        prefix: Option<&ObjectPath>,
+    ) -> color_eyre::Result<HashMap<String, FolderStats>> {
+        let mut stats: HashMap<String, FolderStats> = HashMap::new();
+
+        // One recursive listing of the prefix covers every folder, and streaming it
+        // avoids holding a large container's full listing in memory.
+        let root = ObjectPath::default();
+        let mut objects = object_store.list(prefix);
+        while let Some(meta) = objects.try_next().await? {
+            let Some(mut parts) = meta.location.prefix_match(prefix.unwrap_or(&root)) else {
+                continue;
+            };
+            // Blobs directly under the prefix are files, not folder contents.
+            let (Some(folder), Some(_)) = (parts.next(), parts.next()) else {
+                continue;
+            };
+            match stats.get_mut(folder.as_ref()) {
+                Some(folder_stats) => {
+                    folder_stats.size += meta.size;
+                    folder_stats.last_modified = folder_stats.last_modified.max(meta.last_modified);
+                }
+                None => {
+                    stats.insert(
+                        folder.as_ref().to_owned(),
+                        FolderStats {
+                            size: meta.size,
+                            last_modified: meta.last_modified,
+                        },
+                    );
+                }
+            }
+        }
+        Ok(stats)
+    }
+
+    fn set_folder_stats(items: &mut [FileItem], stats: &HashMap<String, FolderStats>) {
+        for item in items
+            .iter_mut()
+            .filter(|item| item.kind == EntryKind::Folder)
+        {
+            if let Some(folder_stats) = stats.get(&item.actual_name) {
+                item.size = Some(folder_stats.size);
+                item.last_modified = Some(folder_stats.last_modified);
+            }
+        }
     }
 
     /// Apply sorting to the current file list.
     ///
     /// # Errors
     ///
-    /// This function currently does not return errors but uses `Result` for API consistency.
-    pub fn apply_sort(&mut self, criteria: SortCriteria) -> color_eyre::Result<()> {
+    /// Returns an error if listing folder contents for a date or size sort fails;
+    /// the sort is left unchanged in that case.
+    pub async fn apply_sort(&mut self, criteria: SortCriteria) -> color_eyre::Result<()> {
+        // Merge stats into the current items rather than relisting, which would drop
+        // a confirmed search filter.
+        if criteria.needs_folder_stats()
+            && let Some(state) = self.browsing()
+            && !state.directory.has_folder_stats
+        {
+            let prefix = Self::prefix_path(state.current_path())?;
+            let stats = Self::folder_stats(state.object_store.as_ref(), prefix.as_ref()).await?;
+            if let Some(state) = self.browsing_mut() {
+                Self::set_folder_stats(&mut state.directory.file_items, &stats);
+                state.directory.has_folder_stats = true;
+            }
+            if let Search::Files { all_file_items, .. } = &mut self.search {
+                Self::set_folder_stats(all_file_items, &stats);
+            }
+        }
         self.sort_criteria = criteria;
 
         if let Some(state) = self.browsing_mut()
@@ -897,7 +996,10 @@ impl App {
         object_store: &dyn ObjectStore,
         current_path: String,
     ) -> color_eyre::Result<LoadedDirectory> {
-        let mut file_items = self.list_file_items(object_store, &current_path).await?;
+        let has_folder_stats = self.sort_criteria.needs_folder_stats();
+        let mut file_items = self
+            .list_file_items(object_store, &current_path, has_folder_stats)
+            .await?;
         Self::sort_file_items_static(&mut file_items, self.sort_criteria);
         let files = file_items
             .iter()
@@ -907,6 +1009,7 @@ impl App {
             current_path,
             files,
             file_items,
+            has_folder_stats,
         })
     }
 
@@ -2544,6 +2647,7 @@ mod tests {
                 current_path: prefix.to_owned(),
                 files: Vec::new(),
                 file_items: Vec::new(),
+                has_folder_stats: false,
             },
             selected_index: 0,
         });
@@ -2714,6 +2818,7 @@ mod tests {
                     last_modified: None,
                     created: None,
                 }],
+                has_folder_stats: false,
             },
             selected_index: 0,
         });
@@ -2750,6 +2855,7 @@ mod tests {
                     last_modified: None,
                     created: None,
                 }],
+                has_folder_stats: false,
             },
             selected_index: 0,
         });
@@ -2781,6 +2887,7 @@ mod tests {
                 current_path: String::new(),
                 files: vec![format!("{file} report.csv", file = app.icons.file)],
                 file_items: Vec::new(),
+                has_folder_stats: false,
             },
             selected_index: 0,
         });
@@ -2835,6 +2942,7 @@ mod tests {
                 current_path: String::new(),
                 files: Vec::new(),
                 file_items: Vec::new(),
+                has_folder_stats: false,
             },
             selected_index: 0,
         });
@@ -3252,6 +3360,7 @@ mod tests {
                 current_path: parent_path.to_string(),
                 files: Vec::new(),
                 file_items: Vec::new(),
+                has_folder_stats: false,
             },
             selected_index: 0,
         });
@@ -3359,6 +3468,97 @@ mod tests {
         assert_eq!(app.preview_scroll.1, 2);
     }
 
+    // Folders a < b < c by name, b > c > a by newest blob (b's is nested and
+    // newer than its sibling), and c > b > a by total size. The root file is
+    // newest and largest but still follows the folders.
+    async fn folder_sort_test_app(base: &str) -> (tempfile::TempDir, App) {
+        let dir = tempfile::tempdir().unwrap();
+        for (path, size, year) in [
+            ("a/x", 1, 2020),
+            ("b/deep/y", 1, 2024),
+            ("b/z", 1, 2019),
+            ("c/w", 50, 2022),
+            ("f.txt", 1000, 2025),
+        ] {
+            let path = dir.path().join(base).join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, vec![0_u8; size]).unwrap();
+            let modified = Utc.with_ymd_and_hms(year, 1, 1, 0, 0, 0).unwrap();
+            std::fs::File::options()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_modified(modified.into())
+                .unwrap();
+        }
+        let store = object_store::local::LocalFileSystem::new_with_prefix(dir.path()).unwrap();
+        let mut app = test_app();
+        let directory = app.load_directory(&store, base.to_owned()).await.unwrap();
+        app.session = Session::Browsing(BrowsingState {
+            object_store: Arc::new(store),
+            directory,
+            selected_index: 0,
+        });
+        (dir, app)
+    }
+
+    fn item_names(app: &App) -> Vec<&str> {
+        let state = app.browsing().expect("expected browsing session");
+        state
+            .directory
+            .file_items
+            .iter()
+            .map(|item| item.actual_name.as_str())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn folders_sort_by_newest_blob_and_total_size() -> color_eyre::Result<()> {
+        for base in ["", "nested/"] {
+            let (_dir, mut app) = folder_sort_test_app(base).await;
+
+            for (criteria, expected) in [
+                (SortCriteria::DateModified, ["b", "c", "a", "f.txt"]),
+                (SortCriteria::DateCreated, ["b", "c", "a", "f.txt"]),
+                (SortCriteria::Size, ["c", "b", "a", "f.txt"]),
+                (SortCriteria::Name, ["a", "b", "c", "f.txt"]),
+            ] {
+                app.apply_sort(criteria).await?;
+                assert_eq!(item_names(&app), expected, "{criteria:?} under {base:?}");
+            }
+
+            // Listing while date-sorted, as when navigating, also loads folder stats.
+            app.apply_sort(SortCriteria::DateModified).await?;
+            app.refresh_files().await?;
+            assert_eq!(item_names(&app), ["b", "c", "a", "f.txt"], "{base:?}");
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn date_sort_keeps_confirmed_search_filter() -> color_eyre::Result<()> {
+        let (_dir, mut app) = folder_sort_test_app("").await;
+        for code in [KeyCode::Char('/'), KeyCode::Char('b'), KeyCode::Enter] {
+            app.handle_key_event(KeyEvent::from(code)).await?;
+        }
+
+        app.apply_sort(SortCriteria::DateModified).await?;
+
+        assert_eq!(item_names(&app), ["b"]);
+        let state = app.browsing().expect("expected browsing session");
+        assert!(state.directory.file_items[0].last_modified.is_some());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn failed_folder_scan_keeps_previous_sort() {
+        let (dir, mut app) = navigation_test_app().await;
+        break_navigation_store(dir.path());
+
+        assert!(app.apply_sort(SortCriteria::DateModified).await.is_err());
+        assert_eq!(app.sort_criteria, SortCriteria::Name);
+    }
+
     proptest! {
         #[test]
         fn apply_sort_preserves_items_and_folders_stay_first(
@@ -3428,6 +3628,7 @@ mod tests {
                     current_path: String::new(),
                     files: all_files.clone(),
                     file_items: items.clone(),
+                    has_folder_stats: false,
                 },
                 selected_index: 5,
             });

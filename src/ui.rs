@@ -675,7 +675,7 @@ impl App {
     fn render_sort_popup(area: Rect, buf: &mut Buffer) {
         // Calculate popup size
         let popup_width = 50;
-        let popup_height = 10;
+        let popup_height = 11;
 
         // Center the popup
         let popup_area = Rect {
@@ -700,6 +700,7 @@ impl App {
             "t - Sort by Date Created".to_string(),
             "s - Sort by Size".to_string(),
             String::new(),
+            "Date/size sorts scan all blobs in folders".to_string(),
             "Press Esc to cancel".to_string(),
         ];
 
