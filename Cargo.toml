@@ -29,6 +29,7 @@ parquet = "58"
 arrow = "58"
 bytes = "1.11"
 tempfile = "3"
+tokio-util = "0.7"
 
 [dev-dependencies]
 async-trait = "0.1"

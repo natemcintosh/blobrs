@@ -5,7 +5,7 @@ use crate::{
         ParquetSchemaPreview, PreviewData, PreviewFileType, TablePreview, parse_parquet_schema,
         parse_parquet_table, parse_preview,
     },
-    task::{TaskMessage, Tasks},
+    task::{Reporter, TaskMessage, Tasks},
     terminal_icons::{IconSet, detect_terminal_icons},
 };
 use arboard::Clipboard;
@@ -29,6 +29,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
+use tokio_util::sync::CancellationToken;
 
 /// How often the spinner advances while an operation runs.
 const SPINNER_TICK: Duration = Duration::from_millis(100);
@@ -130,7 +131,44 @@ pub(crate) enum LoadPurpose {
     /// Carries the message prefix to use if the listing fails.
     Navigate(&'static str),
     Refresh,
+    /// Show what the operation left behind, keeping its outcome message.
+    AfterOperation(Operation),
     OpenContainer(Arc<dyn ObjectStore>),
+}
+
+/// An operation on blobs whose outcome is reported as a message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Operation {
+    Clone,
+    Delete,
+    Download,
+    Upload,
+}
+
+impl Operation {
+    fn failure(self) -> &'static str {
+        match self {
+            Self::Clone => "Clone failed",
+            Self::Delete => "Delete failed",
+            Self::Download => "Download failed",
+            Self::Upload => "Upload failed",
+        }
+    }
+
+    fn refresh_failure(self) -> &'static str {
+        match self {
+            Self::Clone => "Refresh failed after clone",
+            Self::Delete => "Refresh failed after delete",
+            Self::Download => "Refresh failed after download",
+            Self::Upload => "Refresh failed after upload",
+        }
+    }
+
+    /// Whether the container may differ afterward, even if the operation failed
+    /// or was canceled partway.
+    fn changes_container(self) -> bool {
+        !matches!(self, Self::Download)
+    }
 }
 
 /// The result of a background task, applied to [`App`] on the event loop.
@@ -145,6 +183,15 @@ pub(crate) enum TaskEvent {
     },
     PreviewLoaded(Box<LoadedPreview>),
     BlobInfo(color_eyre::Result<BlobInfo>),
+    ContainersLoaded(Result<Vec<ContainerInfo>, String>),
+    /// The native dialog closed; `None` means it was dismissed.
+    DownloadDestinationPicked(Result<Option<PathBuf>, tokio::task::JoinError>),
+    UploadSourcePicked(Result<Option<PathBuf>, tokio::task::JoinError>),
+    /// Carries the success message to show.
+    OperationFinished {
+        operation: Operation,
+        result: color_eyre::Result<String>,
+    },
 }
 
 /// Everything a preview fetch produces, installed together when it finishes.
@@ -284,12 +331,14 @@ impl std::fmt::Debug for App {
 }
 
 impl App {
-    /// Constructs a new instance of [`App`].
+    /// Constructs a new instance of [`App`] and starts loading its containers.
+    ///
+    /// Must be called from within a Tokio runtime.
     ///
     /// # Errors
     ///
-    /// Returns an error if loading containers from Azure Storage fails.
-    pub async fn new(storage_account: String) -> color_eyre::Result<Self> {
+    /// Returns an error if the Azure client cannot be configured.
+    pub fn new(storage_account: String) -> color_eyre::Result<Self> {
         // object_store exposes its CLI provider through a container client. Building
         // this client makes no request; $root need not exist to obtain the provider.
         let credentials = MicrosoftAzureBuilder::new()
@@ -329,8 +378,7 @@ impl App {
             tasks: Tasks::new(),
         };
 
-        // Load container list
-        app.load_containers().await?;
+        app.load_containers();
 
         Ok(app)
     }
@@ -361,7 +409,7 @@ impl App {
             terminal.draw(|frame| frame.render_widget(&*self, frame.area()))?;
             tokio::select! {
                 event = events.next() => match event {
-                    Some(Ok(Event::Key(key_event))) => self.handle_key_event(key_event).await?,
+                    Some(Ok(Event::Key(key_event))) => self.handle_key_event(key_event)?,
                     Some(Ok(_)) => {}
                     Some(Err(error)) => return Err(error.into()),
                     None => break,
@@ -395,6 +443,27 @@ impl App {
             TaskEvent::BlobInfo(Err(e)) => {
                 self.error_message = Some(format!("Failed to get blob info: {e}"));
             }
+            TaskEvent::ContainersLoaded(result) => self.finish_load_containers(result),
+            TaskEvent::DownloadDestinationPicked(Ok(Some(path))) => {
+                self.modal = Modal::DownloadPicker {
+                    destination: Some(path),
+                };
+                self.start_download();
+            }
+            // User cancelled the dialog
+            TaskEvent::DownloadDestinationPicked(Ok(None)) => self.close_modal(),
+            TaskEvent::DownloadDestinationPicked(Err(e)) => {
+                self.close_modal();
+                self.error_message = Some(format!("Failed to open file dialog: {e}"));
+            }
+            TaskEvent::UploadSourcePicked(Ok(Some(path))) => self.upload_file(path),
+            TaskEvent::UploadSourcePicked(Ok(None)) => {}
+            TaskEvent::UploadSourcePicked(Err(e)) => {
+                self.error_message = Some(format!("Upload failed: {e}"));
+            }
+            TaskEvent::OperationFinished { operation, result } => {
+                self.finish_operation(operation, result);
+            }
         }
     }
 
@@ -412,11 +481,14 @@ impl App {
 
     /// Handles the key events and updates the state of [`App`].
     ///
+    /// Never waits on the network: operations are started here and their results
+    /// arrive through [`Self::apply_task_message`].
+    ///
     /// # Errors
     ///
-    /// Returns an error if an async operation triggered by a key event fails.
+    /// This function currently does not return errors but uses `Result` for API consistency.
     #[allow(clippy::too_many_lines)]
-    pub async fn handle_key_event(&mut self, key_event: KeyEvent) -> color_eyre::Result<()> {
+    pub fn handle_key_event(&mut self, key_event: KeyEvent) -> color_eyre::Result<()> {
         // One operation runs at a time, so only cancel and quit are accepted until it ends.
         if self.tasks.is_running() {
             match key_event.code {
@@ -432,12 +504,12 @@ impl App {
 
         // Handle delete dialog separately
         if self.is_modal_delete_dialog() {
-            return self.handle_delete_dialog_key_event(key_event).await;
+            return self.handle_delete_dialog_key_event(key_event);
         }
 
         // Handle clone dialog separately
         if self.is_modal_clone_dialog() {
-            return self.handle_clone_dialog_key_event(key_event).await;
+            return self.handle_clone_dialog_key_event(key_event);
         }
 
         // Handle search mode separately
@@ -472,22 +544,17 @@ impl App {
                     self.close_modal();
                     self.error_message = None;
                     self.success_message = None;
-                    let result = async {
-                        let path = tokio::task::spawn_blocking(|| {
-                            rfd::FileDialog::new()
-                                .set_title("Select file to upload")
-                                .pick_file()
-                        })
-                        .await?;
-                        if let Some(path) = path {
-                            self.upload_file(&path).await?;
-                        }
-                        Ok::<_, color_eyre::Report>(())
-                    }
-                    .await;
-                    if let Err(error) = result {
-                        self.error_message = Some(format!("Upload failed: {error}"));
-                    }
+                    // The dialog blocks its thread until it closes.
+                    self.tasks.spawn("Waiting for file selection", async {
+                        TaskEvent::UploadSourcePicked(
+                            tokio::task::spawn_blocking(|| {
+                                rfd::FileDialog::new()
+                                    .set_title("Select file to upload")
+                                    .pick_file()
+                            })
+                            .await,
+                        )
+                    });
                 }
                 _ => {}
             }
@@ -513,9 +580,7 @@ impl App {
                     }
                 }
                 KeyCode::Char('r') | KeyCode::F(5) => {
-                    if let Err(e) = self.load_containers().await {
-                        self.error_message = Some(format!("Refresh failed: {e}"));
-                    }
+                    self.load_containers();
                 }
                 _ => {
                     self.error_message = None;
@@ -652,9 +717,7 @@ impl App {
                 }
                 KeyCode::Right | KeyCode::Char('l') | KeyCode::Enter => {
                     if self.is_modal_download_picker() {
-                        if let Err(e) = self.confirm_download().await {
-                            self.error_message = Some(format!("Download failed: {e}"));
-                        }
+                        self.confirm_download();
                     } else if !self.is_modal_blob_info() && !self.is_modal_sort_picker() {
                         self.enter_directory();
                     }
@@ -1078,22 +1141,6 @@ impl App {
         );
     }
 
-    /// Refresh and wait for the listing, for operations not yet run as tasks.
-    async fn refresh_files_now(&mut self) -> color_eyre::Result<()> {
-        let Some(state) = self.browsing() else {
-            return Ok(());
-        };
-        let directory = Self::load_directory(
-            state.object_store.as_ref(),
-            &self.icons,
-            self.sort_criteria,
-            state.directory.current_path.clone(),
-        )
-        .await?;
-        self.install_refreshed(directory);
-        Ok(())
-    }
-
     fn install_refreshed(&mut self, directory: LoadedDirectory) {
         if let Search::Files {
             all_files,
@@ -1112,8 +1159,6 @@ impl App {
             let query = query.clone();
             self.apply_file_search(&query);
         }
-        self.error_message = None;
-        self.success_message = None;
     }
 
     async fn load_directory(
@@ -1164,13 +1209,21 @@ impl App {
                     LoadPurpose::Navigate(failure) => failure,
                     LoadPurpose::Refresh => "Refresh failed",
                     LoadPurpose::OpenContainer(_) => "Failed to select container",
+                    // The operation's own failure is the more useful message.
+                    LoadPurpose::AfterOperation(_) if self.error_message.is_some() => return,
+                    LoadPurpose::AfterOperation(operation) => operation.refresh_failure(),
                 };
                 self.error_message = Some(format!("{failure}: {e}"));
                 return;
             }
         };
         match purpose {
-            LoadPurpose::Refresh => self.install_refreshed(directory),
+            LoadPurpose::Refresh => {
+                self.install_refreshed(directory);
+                self.error_message = None;
+                self.success_message = None;
+            }
+            LoadPurpose::AfterOperation(_) => self.install_refreshed(directory),
             LoadPurpose::Navigate(_) => {
                 if let Some(state) = self.browsing_mut() {
                     state.directory = directory;
@@ -1342,11 +1395,8 @@ impl App {
     ///
     /// # Errors
     ///
-    /// Returns an error if the clone operation fails.
-    pub async fn handle_clone_dialog_key_event(
-        &mut self,
-        key_event: KeyEvent,
-    ) -> color_eyre::Result<()> {
+    /// This function currently does not return errors but uses `Result` for API consistency.
+    pub fn handle_clone_dialog_key_event(&mut self, key_event: KeyEvent) -> color_eyre::Result<()> {
         let Modal::Clone {
             input,
             original_path,
@@ -1363,9 +1413,7 @@ impl App {
             KeyCode::Enter => {
                 // Only allow confirm if name is different from original
                 if input != original_path && !input.is_empty() {
-                    if let Err(e) = self.execute_clone().await {
-                        self.error_message = Some(format!("Clone failed: {e}"));
-                    }
+                    self.execute_clone();
                     self.close_modal();
                 }
             }
@@ -1411,20 +1459,20 @@ impl App {
         };
     }
 
-    /// Execute the clone operation.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the clone or subsequent file refresh fails.
-    pub async fn execute_clone(&mut self) -> color_eyre::Result<()> {
+    /// Start the clone described by the open dialog.
+    pub fn execute_clone(&mut self) {
         let (mut new_path, original_path, is_folder) = match &self.modal {
             Modal::Clone {
                 input,
                 original_path,
                 is_folder,
             } => (input.clone(), original_path.clone(), *is_folder),
-            _ => return Ok(()),
+            _ => return,
         };
+        let Some(state) = self.browsing() else {
+            return;
+        };
+        let object_store = state.object_store.clone();
 
         // Ensure folder paths end with /
         if is_folder && !new_path.ends_with('/') {
@@ -1434,33 +1482,57 @@ impl App {
         self.success_message = None;
         self.error_message = None;
 
-        let result = if is_folder {
-            self.clone_folder(&original_path, &new_path).await
-        } else {
-            self.clone_blob(&original_path, &new_path).await
-        };
+        let label = format!("Cloning {}", original_path.trim_end_matches('/'));
+        self.tasks
+            .spawn_stoppable(label, move |reporter, cancel| async move {
+                let result = if is_folder {
+                    Self::clone_folder(
+                        object_store.as_ref(),
+                        &original_path,
+                        &new_path,
+                        &cancel,
+                        &reporter,
+                    )
+                    .await
+                } else {
+                    Self::clone_blob(object_store.as_ref(), &original_path, &new_path).await
+                };
+                let orig = original_path.trim_end_matches('/');
+                let new = new_path.trim_end_matches('/');
+                TaskEvent::OperationFinished {
+                    operation: Operation::Clone,
+                    result: result.map(|()| format!("Successfully cloned {orig} to {new}")),
+                }
+            });
+    }
 
-        // Even a failed batch may have changed some objects.
-        if let Err(e) = self.refresh_files_now().await {
-            self.error_message = Some(format!("Refresh failed after clone: {e}"));
+    /// Show an operation's outcome, then relist if it may have changed the container.
+    fn finish_operation(&mut self, operation: Operation, result: color_eyre::Result<String>) {
+        match result {
+            Ok(message) => self.success_message = Some(message),
+            Err(e) => self.error_message = Some(format!("{}: {e}", operation.failure())),
         }
-        if result.is_ok() {
-            let orig = original_path.trim_end_matches('/');
-            let new = new_path.trim_end_matches('/');
-            self.success_message = Some(format!("Successfully cloned {orig} to {new}"));
+        // Even a failed or canceled batch may have changed some objects.
+        if operation.changes_container()
+            && let Some(state) = self.browsing()
+        {
+            let object_store = state.object_store.clone();
+            let path = state.directory.current_path.clone();
+            self.start_load(
+                object_store,
+                path,
+                "Refreshing".to_owned(),
+                LoadPurpose::AfterOperation(operation),
+            );
         }
-
-        result
     }
 
     /// Clone a single blob.
-    async fn clone_blob(&mut self, source: &str, destination: &str) -> color_eyre::Result<()> {
-        let object_store = self
-            .browsing()
-            .ok_or_else(|| color_eyre::eyre::eyre!("No container selected"))?
-            .object_store
-            .clone();
-
+    async fn clone_blob(
+        object_store: &dyn ObjectStore,
+        source: &str,
+        destination: &str,
+    ) -> color_eyre::Result<()> {
         let source_path = Self::object_path(source)?;
         let dest_path = Self::object_path(destination)?;
 
@@ -1471,18 +1543,20 @@ impl App {
     }
 
     /// Clone all blobs in a folder (prefix).
-    async fn clone_folder(&mut self, source: &str, destination: &str) -> color_eyre::Result<()> {
-        let object_store = self
-            .browsing()
-            .ok_or_else(|| color_eyre::eyre::eyre!("No container selected"))?
-            .object_store
-            .clone();
-
+    async fn clone_folder(
+        object_store: &dyn ObjectStore,
+        source: &str,
+        destination: &str,
+        cancel: &CancellationToken,
+        reporter: &Reporter,
+    ) -> color_eyre::Result<()> {
         let source_path = Self::object_path(source)?;
 
-        crate::bulk::run(object_store.list(Some(&source_path)), |meta| {
-            let object_store = &object_store;
-            async move {
+        crate::bulk::run(
+            object_store.list(Some(&source_path)),
+            cancel,
+            |completed, total| reporter.progress(completed, total),
+            |meta| async move {
                 let file_path = meta.location.as_ref();
                 let relative_path = file_path.strip_prefix(source).ok_or_else(|| {
                     color_eyre::eyre::eyre!("Listed object is outside source folder: {file_path}")
@@ -1490,8 +1564,8 @@ impl App {
                 let dest_object_path = Self::object_path(&format!("{destination}{relative_path}"))?;
                 object_store.copy(&meta.location, &dest_object_path).await?;
                 Ok(())
-            }
-        })
+            },
+        )
         .await?;
 
         Ok(())
@@ -1501,8 +1575,8 @@ impl App {
     ///
     /// # Errors
     ///
-    /// Returns an error if the delete operation fails.
-    pub async fn handle_delete_dialog_key_event(
+    /// This function currently does not return errors but uses `Result` for API consistency.
+    pub fn handle_delete_dialog_key_event(
         &mut self,
         key_event: KeyEvent,
     ) -> color_eyre::Result<()> {
@@ -1520,9 +1594,7 @@ impl App {
             KeyCode::Enter => {
                 // Only allow confirm if the typed name matches the target name
                 if input == target_name {
-                    if let Err(e) = self.execute_delete().await {
-                        self.error_message = Some(format!("Delete failed: {e}"));
-                    }
+                    self.execute_delete();
                     self.close_modal();
                 }
             }
@@ -1569,50 +1641,43 @@ impl App {
         };
     }
 
-    /// Execute the delete operation.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the delete or subsequent file refresh fails.
-    pub async fn execute_delete(&mut self) -> color_eyre::Result<()> {
+    /// Start the delete described by the open dialog.
+    pub fn execute_delete(&mut self) {
         let (target_path, is_folder) = match &self.modal {
             Modal::DeleteConfirm {
                 target_path,
                 is_folder,
                 ..
             } => (target_path.clone(), *is_folder),
-            _ => return Ok(()),
+            _ => return,
         };
+        let Some(state) = self.browsing() else {
+            return;
+        };
+        let object_store = state.object_store.clone();
 
         self.success_message = None;
         self.error_message = None;
 
-        let result = if is_folder {
-            self.delete_folder(&target_path).await
-        } else {
-            self.delete_blob(&target_path).await
-        };
-
-        // Even a failed batch may have changed some objects.
-        if let Err(e) = self.refresh_files_now().await {
-            self.error_message = Some(format!("Refresh failed after delete: {e}"));
-        }
-        if result.is_ok() {
-            let name = target_path.trim_end_matches('/');
-            self.success_message = Some(format!("Successfully deleted {name}"));
-        }
-
-        result
+        let label = format!("Deleting {}", target_path.trim_end_matches('/'));
+        self.tasks
+            .spawn_stoppable(label, move |reporter, cancel| async move {
+                let result = if is_folder {
+                    Self::delete_folder(object_store.as_ref(), &target_path, &cancel, &reporter)
+                        .await
+                } else {
+                    Self::delete_blob(object_store.as_ref(), &target_path).await
+                };
+                let name = target_path.trim_end_matches('/');
+                TaskEvent::OperationFinished {
+                    operation: Operation::Delete,
+                    result: result.map(|()| format!("Successfully deleted {name}")),
+                }
+            });
     }
 
     /// Delete a single blob.
-    async fn delete_blob(&mut self, path: &str) -> color_eyre::Result<()> {
-        let object_store = self
-            .browsing()
-            .ok_or_else(|| color_eyre::eyre::eyre!("No container selected"))?
-            .object_store
-            .clone();
-
+    async fn delete_blob(object_store: &dyn ObjectStore, path: &str) -> color_eyre::Result<()> {
         let object_path = Self::object_path(path)?;
 
         object_store.delete(&object_path).await?;
@@ -1621,22 +1686,23 @@ impl App {
     }
 
     /// Delete all blobs in a folder (prefix).
-    async fn delete_folder(&mut self, prefix: &str) -> color_eyre::Result<()> {
-        let object_store = self
-            .browsing()
-            .ok_or_else(|| color_eyre::eyre::eyre!("No container selected"))?
-            .object_store
-            .clone();
-
+    async fn delete_folder(
+        object_store: &dyn ObjectStore,
+        prefix: &str,
+        cancel: &CancellationToken,
+        reporter: &Reporter,
+    ) -> color_eyre::Result<()> {
         let prefix_path = Self::object_path(prefix)?;
 
-        crate::bulk::run(object_store.list(Some(&prefix_path)), |meta| {
-            let object_store = &object_store;
-            async move {
+        crate::bulk::run(
+            object_store.list(Some(&prefix_path)),
+            cancel,
+            |completed, total| reporter.progress(completed, total),
+            |meta| async move {
                 object_store.delete(&meta.location).await?;
                 Ok(())
-            }
-        })
+            },
+        )
         .await?;
 
         Ok(())
@@ -1768,11 +1834,19 @@ impl App {
     }
 
     /// Load the list of containers from Azure Storage.
-    async fn load_containers(&mut self) -> color_eyre::Result<()> {
+    fn load_containers(&mut self) {
         self.error_message = None;
         self.success_message = None;
 
-        match self.list_containers().await {
+        let account = self.storage_account.clone();
+        let credentials = self.credentials.clone();
+        self.tasks.spawn("Loading containers", async move {
+            TaskEvent::ContainersLoaded(Self::list_containers(&account, &credentials).await)
+        });
+    }
+
+    fn finish_load_containers(&mut self, result: Result<Vec<ContainerInfo>, String>) {
+        match result {
             Ok(mut containers) => {
                 self.reload_favorites();
                 containers.sort_by_key(|c| (!self.is_favorite(&c.name), c.name.clone()));
@@ -1804,13 +1878,13 @@ impl App {
                 self.error_message = Some(format!("Failed to list containers: {e}"));
             }
         }
-
-        Ok(())
     }
 
     /// List all containers in the storage account with pagination support.
-    async fn list_containers(&mut self) -> Result<Vec<ContainerInfo>, String> {
-        let account_name = &self.storage_account;
+    async fn list_containers(
+        account_name: &str,
+        credentials: &AzureCredentialProvider,
+    ) -> Result<Vec<ContainerInfo>, String> {
         let client = reqwest::Client::new();
 
         let mut all_containers = Vec::new();
@@ -1830,8 +1904,7 @@ impl App {
             let date = now.format("%a, %d %b %Y %H:%M:%S GMT").to_string();
 
             // Resolve credentials for each page so an expired token is refreshed.
-            let response = self
-                .container_list_request(&client, &url)
+            let response = Self::container_list_request(credentials, &client, &url)
                 .await?
                 .header("x-ms-date", &date)
                 .header("x-ms-version", "2020-08-04")
@@ -1876,11 +1949,11 @@ impl App {
 
     /// Authorize account-level requests with the same provider as blob operations.
     async fn container_list_request(
-        &self,
+        credentials: &AzureCredentialProvider,
         client: &reqwest::Client,
         url: &str,
     ) -> Result<reqwest::RequestBuilder, String> {
-        let credential = self.credentials.get_credential().await.map_err(|e| {
+        let credential = credentials.get_credential().await.map_err(|e| {
             format!(
                 "Azure CLI authentication failed. Sign in with `az login --identity` \
                  or `az login`, then refresh: {e}"
@@ -2150,16 +2223,40 @@ impl App {
     }
 
     /// Upload a local file into the current prefix without replacing an existing blob.
-    async fn upload_file(&mut self, source: &Path) -> color_eyre::Result<()> {
-        let browsing = self
-            .browsing()
-            .ok_or_else(|| color_eyre::eyre::eyre!("No container selected"))?;
-        let store = browsing.object_store.clone();
+    fn upload_file(&mut self, source: PathBuf) {
+        let Some(state) = self.browsing() else {
+            return;
+        };
+        let object_store = state.object_store.clone();
+        let current_path = state.directory.current_path.clone();
+        let label = format!("Uploading {}", source.display());
+        self.tasks
+            .spawn_stoppable(label, move |_reporter, cancel| async move {
+                // The put is atomic, so abandoning it leaves the blob whole or absent.
+                let result = tokio::select! {
+                    biased;
+                    () = cancel.cancelled() => Err(color_eyre::eyre::eyre!("canceled")),
+                    result = Self::put_file(object_store.as_ref(), &current_path, &source) => result,
+                };
+                TaskEvent::OperationFinished {
+                    operation: Operation::Upload,
+                    result: result
+                        .map(|destination| format!("Successfully uploaded {destination}")),
+                }
+            });
+    }
+
+    /// Create the blob for `source` under `current_path`, returning its path.
+    async fn put_file(
+        store: &dyn ObjectStore,
+        current_path: &str,
+        source: &Path,
+    ) -> color_eyre::Result<ObjectPath> {
         let name = source
             .file_name()
             .and_then(|name| name.to_str())
             .ok_or_else(|| color_eyre::eyre::eyre!("File name must be valid UTF-8"))?;
-        let destination = Self::join_blob_path(&browsing.directory.current_path, name);
+        let destination = Self::join_blob_path(current_path, name);
         let destination = Self::object_path(&destination)?;
         let mut file = tokio::fs::File::open(source).await?;
         if !file.metadata().await?.is_file() {
@@ -2174,12 +2271,7 @@ impl App {
                 object_store::PutMode::Create.into(),
             )
             .await?;
-
-        if let Err(error) = self.refresh_files_now().await {
-            self.error_message = Some(format!("Refresh failed after upload: {error}"));
-        }
-        self.success_message = Some(format!("Successfully uploaded {destination}"));
-        Ok(())
+        Ok(destination)
     }
 
     /// Show the download destination picker.
@@ -2195,52 +2287,73 @@ impl App {
         self.modal = Modal::DownloadPicker { destination: None };
     }
 
-    /// Start the download process for the selected file or folder.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the download operation fails.
-    pub async fn start_download(&mut self) -> color_eyre::Result<()> {
+    /// Start downloading the selected file or folder to the picked destination.
+    pub fn start_download(&mut self) {
         let destination = match &self.modal {
             Modal::DownloadPicker { destination } => destination.clone(),
             _ => None,
         };
 
-        let Some(selected_item) = self.selected_file_item().cloned() else {
-            return Ok(());
+        let Some(state) = self.browsing() else {
+            return;
+        };
+        let Some(selected_item) = self.selected_file_item() else {
+            return;
         };
 
         let Some(destination) = destination else {
-            return Ok(());
+            return;
         };
         let is_folder = selected_item.kind == EntryKind::Folder;
-        let name = selected_item.actual_name;
+        let name = selected_item.actual_name.clone();
+        let object_store = state.object_store.clone();
+        let current_path = state.directory.current_path.clone();
 
         self.close_modal();
         self.success_message = None;
         self.error_message = None;
 
+        let label = format!("Downloading {name}");
         if is_folder {
-            self.download_folder(&name, &destination).await?;
+            self.tasks
+                .spawn_stoppable(label, move |reporter, cancel| async move {
+                    let result = Self::download_folder(
+                        object_store.as_ref(),
+                        &current_path,
+                        &name,
+                        &destination,
+                        &cancel,
+                        &reporter,
+                    )
+                    .await;
+                    TaskEvent::OperationFinished {
+                        operation: Operation::Download,
+                        result: result.map(|completed| {
+                            format!("Successfully downloaded {completed} objects from {name}")
+                        }),
+                    }
+                });
         } else {
-            self.download_file(&name, &destination).await?;
+            self.tasks.spawn(label, async move {
+                let result =
+                    Self::download_file(object_store.as_ref(), &current_path, &name, &destination)
+                        .await;
+                TaskEvent::OperationFinished {
+                    operation: Operation::Download,
+                    result: result.map(|()| format!("Successfully downloaded {name}")),
+                }
+            });
         }
-
-        Ok(())
     }
 
     /// Download a single file.
     async fn download_file(
-        &mut self,
+        object_store: &dyn ObjectStore,
+        current_path: &str,
         file_name: &str,
         destination: &Path,
     ) -> color_eyre::Result<()> {
-        let browsing = self
-            .browsing()
-            .ok_or_else(|| color_eyre::eyre::eyre!("No container selected"))?;
-        let object_store = browsing.object_store.clone();
-
-        let blob_path = Self::join_blob_path(&browsing.directory.current_path, file_name);
+        let blob_path = Self::join_blob_path(current_path, file_name);
 
         let object_path = Self::object_path(blob_path.as_str())?;
 
@@ -2266,79 +2379,59 @@ impl App {
         Ok(())
     }
 
-    /// Download all files in a folder.
+    /// Download all files in a folder, returning how many there were.
     async fn download_folder(
-        &mut self,
+        object_store: &dyn ObjectStore,
+        current_path: &str,
         folder_name: &str,
         destination: &Path,
-    ) -> color_eyre::Result<()> {
-        let browsing = self
-            .browsing()
-            .ok_or_else(|| color_eyre::eyre::eyre!("No container selected"))?;
-        let object_store = browsing.object_store.clone();
-
-        let folder_path = Self::join_folder_path(&browsing.directory.current_path, folder_name);
+        cancel: &CancellationToken,
+        reporter: &Reporter,
+    ) -> color_eyre::Result<usize> {
+        let folder_path = Self::join_folder_path(current_path, folder_name);
 
         let object_path = Self::object_path(folder_path.as_str())?;
 
         let folder_destination = destination.join(folder_name);
-        let completed = crate::bulk::run(object_store.list(Some(&object_path)), |meta| {
-            let object_store = &object_store;
-            let folder_path = &folder_path;
-            let folder_destination = &folder_destination;
-            async move {
-                let file_path = meta.location.as_ref();
-                let relative_path = file_path.strip_prefix(folder_path).ok_or_else(|| {
-                    color_eyre::eyre::eyre!("Listed object is outside source folder: {file_path}")
-                })?;
-                let file_destination = folder_destination.join(relative_path);
-                if let Some(parent) = file_destination.parent() {
-                    fs::create_dir_all(parent)?;
+        let completed = crate::bulk::run(
+            object_store.list(Some(&object_path)),
+            cancel,
+            |completed, total| reporter.progress(completed, total),
+            |meta| {
+                let folder_path = &folder_path;
+                let folder_destination = &folder_destination;
+                async move {
+                    let file_path = meta.location.as_ref();
+                    let relative_path = file_path.strip_prefix(folder_path).ok_or_else(|| {
+                        color_eyre::eyre::eyre!(
+                            "Listed object is outside source folder: {file_path}"
+                        )
+                    })?;
+                    let file_destination = folder_destination.join(relative_path);
+                    if let Some(parent) = file_destination.parent() {
+                        fs::create_dir_all(parent)?;
+                    }
+                    let bytes = object_store.get(&meta.location).await?.bytes().await?;
+                    fs::write(&file_destination, &bytes)?;
+                    Ok(())
                 }
-                let bytes = object_store.get(&meta.location).await?.bytes().await?;
-                fs::write(&file_destination, &bytes)?;
-                Ok(())
-            }
-        })
+            },
+        )
         .await?;
-        self.success_message = Some(format!(
-            "Successfully downloaded {completed} objects from {folder_name}"
-        ));
 
-        Ok(())
+        Ok(completed)
     }
 
-    /// Handle Enter key when download picker is shown.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the file dialog or download fails.
-    pub async fn confirm_download(&mut self) -> color_eyre::Result<()> {
+    /// Ask for a destination folder once the download picker is confirmed.
+    pub fn confirm_download(&mut self) {
         if self.is_modal_download_picker() {
-            // Use the file dialog to pick a destination folder
-            let file_dialog = rfd::FileDialog::new();
-
-            // Run the file dialog in a spawn_blocking since it's blocking
-            let path_result = tokio::task::spawn_blocking(move || file_dialog.pick_folder()).await;
-
-            match path_result {
-                Ok(Some(path)) => {
-                    self.modal = Modal::DownloadPicker {
-                        destination: Some(path),
-                    };
-                    self.start_download().await?;
-                }
-                Ok(None) => {
-                    // User cancelled the dialog
-                    self.close_modal();
-                }
-                Err(e) => {
-                    self.close_modal();
-                    self.error_message = Some(format!("Failed to open file dialog: {e}"));
-                }
-            }
+            // The dialog blocks its thread until it closes.
+            self.tasks.spawn("Waiting for folder selection", async {
+                TaskEvent::DownloadDestinationPicked(
+                    tokio::task::spawn_blocking(|| rfd::FileDialog::new().pick_folder()).await,
+                )
+            });
         }
-        Ok(())
     }
 
     // ========================================
@@ -2754,7 +2847,6 @@ mod tests {
         app.all_containers = app.containers.clone();
         app.selected_container_index = 1;
         app.handle_key_event(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE))
-            .await
             .unwrap();
         assert_eq!(app.containers[0].name, "reports");
         assert_eq!(app.selected_container_index, 0);
@@ -2770,7 +2862,6 @@ mod tests {
         app.exit_container_search_mode();
         assert_eq!(app.containers[0].name, "reports");
         app.handle_key_event(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE))
-            .await
             .unwrap();
         assert_eq!(app.containers[app.selected_container_index].name, "reports");
         assert_eq!(app.containers[0].name, "alpha");
@@ -2832,7 +2923,9 @@ mod tests {
         for (prefix, contents) in [("", b"\0\xffbinary".as_slice()), ("nested/folder/", b"")] {
             std::fs::write(&source, contents).unwrap();
             let mut app = upload_test_app(prefix);
-            app.upload_file(&source).await.unwrap();
+            app.upload_file(source.clone());
+            settle(&mut app).await;
+            assert!(app.error_message.is_none());
             let state = app.browsing().unwrap();
             let path = ObjectPath::parse(format!("{prefix}résumé 100%.bin")).unwrap();
             let uploaded = state
@@ -2864,7 +2957,9 @@ mod tests {
         let store = app.browsing().unwrap().object_store.clone();
         let destination = ObjectPath::from("existing.txt");
         store.put(&destination, "original".into()).await.unwrap();
-        assert!(app.upload_file(&source).await.is_err());
+        app.upload_file(source);
+        settle(&mut app).await;
+        assert!(app.error_message.unwrap().contains("Upload failed"));
         assert_eq!(
             store
                 .get(&destination)
@@ -2883,8 +2978,11 @@ mod tests {
     async fn upload_rejects_missing_files_and_directories() {
         let dir = tempfile::tempdir().unwrap();
         let mut app = upload_test_app("");
-        assert!(app.upload_file(&dir.path().join("missing")).await.is_err());
-        assert!(app.upload_file(dir.path()).await.is_err());
+        for source in [dir.path().join("missing"), dir.path().to_owned()] {
+            app.upload_file(source);
+            settle(&mut app).await;
+            assert!(app.error_message.take().unwrap().contains("Upload failed"));
+        }
         let objects = app
             .browsing()
             .unwrap()
@@ -2901,28 +2999,22 @@ mod tests {
     async fn upload_picker_works_in_empty_container_and_is_modal() {
         let mut app = upload_test_app("");
         app.handle_key_event(KeyEvent::from(KeyCode::Char('u')))
-            .await
             .unwrap();
         assert!(matches!(app.modal, Modal::UploadPicker));
         for key in ['c', 'x', 'd', '/', 'r'] {
             app.handle_key_event(KeyEvent::from(KeyCode::Char(key)))
-                .await
                 .unwrap();
             assert!(matches!(app.modal, Modal::UploadPicker));
         }
-        app.handle_key_event(KeyEvent::from(KeyCode::Esc))
-            .await
-            .unwrap();
+        app.handle_key_event(KeyEvent::from(KeyCode::Esc)).unwrap();
         assert!(matches!(app.modal, Modal::None));
         assert!(app.browsing().unwrap().directory.file_items.is_empty());
         app.modal = Modal::SortPicker;
         app.handle_key_event(KeyEvent::from(KeyCode::Char('u')))
-            .await
             .unwrap();
         assert!(matches!(app.modal, Modal::SortPicker));
         let mut app = test_app();
         app.handle_key_event(KeyEvent::from(KeyCode::Char('u')))
-            .await
             .unwrap();
         assert!(matches!(app.modal, Modal::None));
     }
@@ -2931,8 +3023,7 @@ mod tests {
     async fn container_requests_use_bearer_auth_without_sending_a_query_token() {
         let app = test_app();
         let url = "https://test-account.blob.core.windows.net/?comp=list&marker=next";
-        let request = app
-            .container_list_request(&reqwest::Client::new(), url)
+        let request = App::container_list_request(&app.credentials, &reqwest::Client::new(), url)
             .await
             .unwrap()
             .build()
@@ -2946,18 +3037,18 @@ mod tests {
 
     #[tokio::test]
     async fn container_requests_reject_non_bearer_credentials() {
-        let mut app = test_app();
-        app.credentials = Arc::new(object_store::StaticCredentialProvider::new(
-            object_store::azure::AzureCredential::SASToken(Vec::new()),
-        ));
+        let credentials: object_store::azure::AzureCredentialProvider =
+            Arc::new(object_store::StaticCredentialProvider::new(
+                object_store::azure::AzureCredential::SASToken(Vec::new()),
+            ));
 
-        let error = app
-            .container_list_request(
-                &reqwest::Client::new(),
-                "https://test-account.blob.core.windows.net/?comp=list",
-            )
-            .await
-            .unwrap_err();
+        let error = App::container_list_request(
+            &credentials,
+            &reqwest::Client::new(),
+            "https://test-account.blob.core.windows.net/?comp=list",
+        )
+        .await
+        .unwrap_err();
 
         assert_eq!(error, "Azure CLI authentication requires a bearer token");
     }
@@ -2967,7 +3058,6 @@ mod tests {
         let mut app = test_app();
 
         app.handle_key_event(KeyEvent::from(KeyCode::Char('q')))
-            .await
             .unwrap();
 
         assert!(!app.running);
@@ -3194,23 +3284,41 @@ mod tests {
         let (dir, mut app) = navigation_test_app().await;
         break_navigation_store(dir.path());
         let destination = tempfile::tempdir().unwrap();
-        let results = [
-            app.clone_folder("parent/", "copy/").await,
-            app.delete_folder("parent/").await,
-            app.download_folder("child", destination.path()).await,
-            App::folder_info(
-                app.browsing().unwrap().object_store.as_ref(),
-                "parent/child/",
-                "child",
-            )
-            .await
-            .map(|_| ()),
+        let starts: [fn(&mut App, &std::path::Path); 4] = [
+            |app, _| {
+                app.modal = Modal::Clone {
+                    input: "copy/".to_owned(),
+                    original_path: "parent/".to_owned(),
+                    is_folder: true,
+                };
+                app.execute_clone();
+            },
+            |app, _| {
+                app.modal = Modal::DeleteConfirm {
+                    input: "parent".to_owned(),
+                    target_path: "parent/".to_owned(),
+                    target_name: "parent".to_owned(),
+                    is_folder: true,
+                };
+                app.execute_delete();
+            },
+            |app, destination| {
+                app.modal = Modal::DownloadPicker {
+                    destination: Some(destination.to_owned()),
+                };
+                app.start_download();
+            },
+            |app, _| app.show_blob_info(),
         ];
-        for result in results {
+        for start in starts {
+            app.close_modal();
+            start(&mut app, destination.path());
+            settle(&mut app).await;
+            assert!(app.success_message.is_none());
             assert!(
-                result
-                    .unwrap_err()
-                    .to_string()
+                app.error_message
+                    .take()
+                    .unwrap()
                     .contains("Folder listing failed")
             );
         }
@@ -3228,8 +3336,9 @@ mod tests {
         };
         app.success_message = Some("Previous success".to_owned());
         app.handle_clone_dialog_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
-            .await
             .unwrap();
+        assert!(matches!(app.modal, Modal::None));
+        settle(&mut app).await;
         assert!(app.success_message.is_none());
         assert!(
             app.error_message
@@ -3252,8 +3361,9 @@ mod tests {
         };
         app.success_message = Some("Previous success".to_owned());
         app.handle_delete_dialog_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
-            .await
             .unwrap();
+        assert!(matches!(app.modal, Modal::None));
+        settle(&mut app).await;
         assert!(app.success_message.is_none());
         assert!(
             app.error_message
@@ -3281,7 +3391,8 @@ mod tests {
             original_path: "source/".to_owned(),
             is_folder: true,
         };
-        app.execute_clone().await.unwrap();
+        app.execute_clone();
+        settle(&mut app).await;
         let objects = crate::bulk::snapshot(store.list(None)).await.unwrap();
         assert_eq!(objects.len(), 4);
         for path in [
@@ -3315,7 +3426,8 @@ mod tests {
             target_name: "source".to_owned(),
             is_folder: true,
         };
-        app.execute_delete().await.unwrap();
+        app.execute_delete();
+        settle(&mut app).await;
         let remaining = crate::bulk::snapshot(store.list(None)).await.unwrap();
         assert_eq!(remaining, Vec::<object_store::ObjectMeta>::new());
         assert!(
@@ -3335,15 +3447,16 @@ mod tests {
                 .await
                 .unwrap();
         }
-        app.refresh_files_now().await.unwrap();
+        app.refresh_files();
+        settle(&mut app).await;
         // A directory at the second file's destination injects a write failure.
         std::fs::create_dir_all(destination.join("folder/b")).unwrap();
         app.modal = Modal::DownloadPicker {
             destination: Some(destination.to_owned()),
         };
         app.success_message = Some("Previous success".to_owned());
-        let error = app.start_download().await.unwrap_err();
-        app.error_message = Some(format!("Download failed: {error}"));
+        app.start_download();
+        settle(&mut app).await;
         app
     }
 
@@ -3443,7 +3556,6 @@ mod tests {
             } else {
                 KeyCode::Enter
             }))
-            .await
             .unwrap();
             settle(&mut app).await;
             assert!(app.error_message.as_deref().unwrap().contains("failed"));
@@ -3665,18 +3777,14 @@ mod tests {
         app.browsing_mut().unwrap().selected_index = 1;
         let press = |code| KeyEvent::new(code, KeyModifiers::NONE);
 
-        app.handle_key_event(press(KeyCode::Char('p')))
-            .await
-            .unwrap();
+        app.handle_key_event(press(KeyCode::Char('p'))).unwrap();
         settle(&mut app).await;
         assert!(app.ui.show_preview);
         assert!(app.preview_data.is_some());
 
         // None of the file-list actions may reach the list hidden behind the preview.
         for key in ['r', '/', 'd', 'x', 'c', 's', 'u', 'i', 'y'] {
-            app.handle_key_event(press(KeyCode::Char(key)))
-                .await
-                .unwrap();
+            app.handle_key_event(press(KeyCode::Char(key))).unwrap();
             assert!(app.ui.show_preview, "`{key}` closed the preview");
             assert!(
                 matches!(app.modal, Modal::None),
@@ -3691,9 +3799,7 @@ mod tests {
         }
 
         // Backspace closes the preview rather than leaving the container with it open.
-        app.handle_key_event(press(KeyCode::Backspace))
-            .await
-            .unwrap();
+        app.handle_key_event(press(KeyCode::Backspace)).unwrap();
         assert!(!app.ui.show_preview);
         assert_eq!(app.browsing().unwrap().current_path(), "parent/");
     }
@@ -3773,7 +3879,7 @@ mod tests {
     async fn date_sort_keeps_confirmed_search_filter() -> color_eyre::Result<()> {
         let (_dir, mut app) = folder_sort_test_app("").await;
         for code in [KeyCode::Char('/'), KeyCode::Char('b'), KeyCode::Enter] {
-            app.handle_key_event(KeyEvent::from(code)).await?;
+            app.handle_key_event(KeyEvent::from(code))?;
         }
 
         app.apply_sort(SortCriteria::DateModified);
@@ -3931,7 +4037,7 @@ mod tests {
 
             app.enter_directory();
             assert!(app.tasks.is_running());
-            app.handle_key_event(cancel).await.unwrap();
+            app.handle_key_event(cancel).unwrap();
 
             assert!(!app.tasks.is_running());
             assert!(app.running, "canceling must not quit");
@@ -3953,7 +4059,6 @@ mod tests {
         app.enter_directory();
         for key in ['j', 'x', 'c', 'd', 'u', 's', 'i', 'p', 'r', '/', 'l', 'h'] {
             app.handle_key_event(KeyEvent::from(KeyCode::Char(key)))
-                .await
                 .unwrap();
             assert!(app.tasks.is_running(), "`{key}` stopped the operation");
             assert!(matches!(app.modal, Modal::None), "`{key}` opened a modal");
@@ -3962,7 +4067,6 @@ mod tests {
             assert!(!app.ui.show_preview);
         }
         app.handle_key_event(KeyEvent::from(KeyCode::Char('q')))
-            .await
             .unwrap();
         assert!(!app.running);
     }
@@ -4039,9 +4143,7 @@ mod tests {
 
         app.load_preview();
         assert!(rendered(&app).contains("Loading preview"));
-        app.handle_key_event(KeyEvent::from(KeyCode::Esc))
-            .await
-            .unwrap();
+        app.handle_key_event(KeyEvent::from(KeyCode::Esc)).unwrap();
         assert!(!app.ui.show_preview);
         assert!(!app.tasks.is_running());
 
@@ -4089,6 +4191,95 @@ mod tests {
             app.error_message
                 .unwrap()
                 .contains("Failed to get blob info: Folder listing failed")
+        );
+    }
+
+    #[tokio::test]
+    async fn canceled_folder_clone_reports_progress_and_refreshes() {
+        let (gate, mut app) = gated_app().await;
+        app.modal = Modal::Clone {
+            input: "parent/copy/".to_owned(),
+            original_path: "parent/".to_owned(),
+            is_folder: true,
+        };
+        app.handle_clone_dialog_key_event(KeyEvent::from(KeyCode::Enter))
+            .unwrap();
+        // Let the listing through, leaving the first copy blocked.
+        gate.add_permits(1);
+        while !app.tasks.status().unwrap().contains("(0/2)") {
+            let message = app.tasks.recv().await.unwrap();
+            app.apply_task_message(message);
+        }
+        assert!(rendered(&app).contains("Cloning parent (0/2)"));
+
+        app.handle_key_event(KeyEvent::from(KeyCode::Esc)).unwrap();
+        // The copy in flight is allowed to finish; nothing after it starts.
+        assert!(app.tasks.status().unwrap().contains("stopping"));
+        gate.add_permits(100);
+        settle(&mut app).await;
+
+        let error = app.error_message.as_deref().unwrap();
+        assert!(error.contains("Clone failed: Partially completed: 1/2 objects completed"));
+        assert!(error.contains("canceled"));
+        assert!(app.success_message.is_none());
+        assert_eq!(item_names(&app), ["child", "copy", "a.txt"]);
+    }
+
+    #[tokio::test]
+    async fn canceled_upload_reports_and_leaves_no_blob() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("new.txt");
+        std::fs::write(&source, "payload").unwrap();
+        let (gate, mut app) = gated_app().await;
+        app.upload_file(source);
+        app.handle_key_event(KeyEvent::from(KeyCode::Esc)).unwrap();
+        gate.add_permits(100);
+        settle(&mut app).await;
+        assert!(
+            app.error_message
+                .take()
+                .unwrap()
+                .contains("Upload failed: canceled")
+        );
+        assert_eq!(item_names(&app), ["child", "a.txt"]);
+    }
+
+    #[tokio::test]
+    async fn single_file_download_reports_success() {
+        let destination = tempfile::tempdir().unwrap();
+        let (gate, mut app) = gated_app().await;
+        gate.add_permits(100);
+        app.browsing_mut().unwrap().selected_index = 1;
+        app.modal = Modal::DownloadPicker {
+            destination: Some(destination.path().to_owned()),
+        };
+        app.start_download();
+        settle(&mut app).await;
+        assert!(app.success_message.unwrap().contains("downloaded a.txt"));
+        assert_eq!(
+            std::fs::read(destination.path().join("a.txt")).unwrap(),
+            b"payload"
+        );
+    }
+
+    #[tokio::test]
+    async fn container_listing_result_is_applied_when_it_arrives() {
+        let mut app = test_app();
+        let names =
+            |app: &App| -> Vec<String> { app.containers.iter().map(|c| c.name.clone()).collect() };
+        app.finish_load_containers(Ok(["zebra", "alpha"]
+            .into_iter()
+            .map(|name| super::ContainerInfo {
+                name: name.to_owned(),
+            })
+            .collect()));
+        assert_eq!(names(&app), ["alpha", "zebra"]);
+        app.finish_load_containers(Err("offline".to_owned()));
+        assert_eq!(names(&app), ["alpha", "zebra"]);
+        assert!(
+            app.error_message
+                .unwrap()
+                .contains("Failed to list containers: offline")
         );
     }
 
