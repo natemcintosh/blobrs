@@ -143,6 +143,18 @@ pub(crate) enum TaskEvent {
         criteria: SortCriteria,
         result: color_eyre::Result<HashMap<String, FolderStats>>,
     },
+    PreviewLoaded(Box<LoadedPreview>),
+    BlobInfo(color_eyre::Result<BlobInfo>),
+}
+
+/// Everything a preview fetch produces, installed together when it finishes.
+#[derive(Default)]
+pub(crate) struct LoadedPreview {
+    data: Option<PreviewData>,
+    error: Option<String>,
+    parquet_mode: Option<ParquetPreviewMode>,
+    parquet_table: Option<TablePreview>,
+    parquet_schema: Option<ParquetSchemaPreview>,
 }
 
 #[derive(Debug, Clone)]
@@ -186,7 +198,6 @@ pub enum Search {
 #[derive(Debug, Clone)]
 pub struct UiToggles {
     pub show_preview: bool,
-    pub is_loading_preview: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -305,7 +316,6 @@ impl App {
             modal: Modal::None,
             ui: UiToggles {
                 show_preview: false,
-                is_loading_preview: false,
             },
             sort_criteria: SortCriteria::Name,
             preview_data: None,
@@ -373,6 +383,18 @@ impl App {
             TaskEvent::FolderStats { criteria, result } => {
                 self.finish_folder_stats(criteria, result);
             }
+            TaskEvent::PreviewLoaded(preview) => {
+                let preview = *preview;
+                self.preview_data = preview.data;
+                self.preview_error = preview.error;
+                self.parquet_preview_mode = preview.parquet_mode;
+                self.parquet_table_data = preview.parquet_table;
+                self.parquet_schema_data = preview.parquet_schema;
+            }
+            TaskEvent::BlobInfo(Ok(info)) => self.modal = Modal::BlobInfo { info },
+            TaskEvent::BlobInfo(Err(e)) => {
+                self.error_message = Some(format!("Failed to get blob info: {e}"));
+            }
         }
     }
 
@@ -381,6 +403,10 @@ impl App {
             && self.error_message.is_none()
         {
             self.success_message = Some(format!("Canceled: {label}"));
+        }
+        // An open preview takes every key, so only its own load can be running.
+        if self.ui.show_preview {
+            self.close_preview();
         }
     }
 
@@ -525,10 +551,8 @@ impl App {
                     }
                 }
                 KeyCode::Char('i') => {
-                    if !self.is_modal_blob_info()
-                        && let Err(e) = self.show_blob_info().await
-                    {
-                        self.error_message = Some(format!("Failed to get blob info: {e}"));
+                    if !self.is_modal_blob_info() {
+                        self.show_blob_info();
                     }
                 }
                 KeyCode::Char('p') => {
@@ -537,9 +561,8 @@ impl App {
                         && !self.is_modal_sort_picker()
                         && !self.is_modal_clone_dialog()
                         && !self.is_modal_delete_dialog()
-                        && let Err(e) = self.load_preview().await
                     {
-                        self.error_message = Some(format!("Preview failed: {e}"));
+                        self.load_preview();
                     }
                 }
                 KeyCode::Char('u') if matches!(self.modal, Modal::None) => {
@@ -2010,38 +2033,42 @@ impl App {
         self.apply_container_search(&query);
     }
 
-    /// Show information about the currently selected blob or folder.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if fetching blob/folder metadata fails.
-    pub async fn show_blob_info(&mut self) -> color_eyre::Result<()> {
-        let Some(selected_item) = self.selected_file_item().cloned() else {
-            return Ok(());
+    /// Fetch information about the selected blob or folder, then show it.
+    pub fn show_blob_info(&mut self) {
+        let Some(state) = self.browsing() else {
+            return;
         };
-
-        let info = if selected_item.kind == EntryKind::Folder {
-            // Get folder information (blob count and total size)
-            self.get_folder_info(&selected_item.actual_name).await?
+        let Some(selected_item) = self.selected_file_item() else {
+            return;
+        };
+        let object_store = state.object_store.clone();
+        let name = selected_item.actual_name.clone();
+        let current_path = &state.directory.current_path;
+        if selected_item.kind == EntryKind::Folder {
+            let folder_path = Self::join_folder_path(current_path, &name);
+            self.tasks.spawn(format!("Measuring {name}"), async move {
+                TaskEvent::BlobInfo(
+                    Self::folder_info(object_store.as_ref(), &folder_path, &name).await,
+                )
+            });
         } else {
-            // Get individual blob information
-            self.get_blob_info(&selected_item.actual_name).await?
-        };
-
-        self.modal = Modal::BlobInfo { info };
-        Ok(())
+            let blob_path = Self::join_blob_path(current_path, &name);
+            self.tasks
+                .spawn(format!("Fetching info for {name}"), async move {
+                    TaskEvent::BlobInfo(
+                        Self::blob_info(object_store.as_ref(), &blob_path, &name).await,
+                    )
+                });
+        }
     }
 
     /// Get information about a folder (blob count and total size).
-    async fn get_folder_info(&self, folder_name: &str) -> color_eyre::Result<BlobInfo> {
-        let browsing = self
-            .browsing()
-            .ok_or_else(|| color_eyre::eyre::eyre!("No container selected"))?;
-        let object_store = browsing.object_store.clone();
-
-        let folder_path = Self::join_folder_path(&browsing.directory.current_path, folder_name);
-
-        let object_path = Self::object_path(folder_path.as_str())?;
+    async fn folder_info(
+        object_store: &dyn ObjectStore,
+        folder_path: &str,
+        folder_name: &str,
+    ) -> color_eyre::Result<BlobInfo> {
+        let object_path = Self::object_path(folder_path)?;
 
         // List all objects in this folder (recursively)
         let mut blob_count = 0;
@@ -2063,15 +2090,12 @@ impl App {
     }
 
     /// Get information about a specific blob.
-    async fn get_blob_info(&self, blob_name: &str) -> color_eyre::Result<BlobInfo> {
-        let browsing = self
-            .browsing()
-            .ok_or_else(|| color_eyre::eyre::eyre!("No container selected"))?;
-        let object_store = browsing.object_store.clone();
-
-        let blob_path = Self::join_blob_path(&browsing.directory.current_path, blob_name);
-
-        let object_path = Self::object_path(blob_path.as_str())?;
+    async fn blob_info(
+        object_store: &dyn ObjectStore,
+        blob_path: &str,
+        blob_name: &str,
+    ) -> color_eyre::Result<BlobInfo> {
+        let object_path = Self::object_path(blob_path)?;
 
         match object_store.head(&object_path).await {
             Ok(meta) => Ok(BlobInfo::File {
@@ -2321,32 +2345,31 @@ impl App {
     // Preview Panel Methods
     // ========================================
 
-    /// Load preview for the currently selected file.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if fetching or parsing the file fails.
-    #[allow(clippy::too_many_lines)]
-    pub async fn load_preview(&mut self) -> color_eyre::Result<()> {
-        let (selected_item, current_path) = match self.browsing() {
+    /// Open the preview panel and fetch the selected file's preview.
+    pub fn load_preview(&mut self) {
+        let (selected_item, current_path, object_store) = match self.browsing() {
             Some(state) => {
                 let Some(item) = self.selected_file_item() else {
-                    return Ok(());
+                    return;
                 };
-                (item.clone(), state.directory.current_path.clone())
+                (
+                    item.clone(),
+                    state.directory.current_path.clone(),
+                    state.object_store.clone(),
+                )
             }
-            None => return Ok(()),
+            None => return,
         };
 
         if selected_item.actual_name.is_empty() {
-            return Ok(());
+            return;
         }
 
         // Check if it's a folder
         if selected_item.kind == EntryKind::Folder {
             self.preview_error = Some("Cannot preview folders".to_string());
             self.ui.show_preview = true;
-            return Ok(());
+            return;
         }
 
         let name = selected_item.actual_name;
@@ -2360,11 +2383,18 @@ impl App {
             );
             self.preview_file_type = Some(file_type);
             self.ui.show_preview = true;
-            return Ok(());
+            return;
         }
 
+        let object_path = match Self::object_path(&Self::join_blob_path(&current_path, &name)) {
+            Ok(object_path) => object_path,
+            Err(e) => {
+                self.error_message = Some(format!("Preview failed: {e}"));
+                return;
+            }
+        };
+
         self.preview_file_type = Some(file_type.clone());
-        self.ui.is_loading_preview = true;
         self.ui.show_preview = true;
         self.preview_error = None;
         self.preview_data = None;
@@ -2374,26 +2404,31 @@ impl App {
         self.parquet_table_data = None;
         self.parquet_schema_data = None;
 
-        // Fetch file content (up to MAX_PREVIEW_BYTES)
-        let object_store = self
-            .browsing()
-            .ok_or_else(|| color_eyre::eyre::eyre!("No container selected"))?
-            .object_store
-            .clone();
+        self.tasks
+            .spawn(format!("Loading preview of {name}"), async move {
+                TaskEvent::PreviewLoaded(Box::new(
+                    Self::fetch_preview(object_store.as_ref(), &object_path, &file_type).await,
+                ))
+            });
+    }
 
-        let blob_path = Self::join_blob_path(&current_path, &name);
-
-        let object_path = Self::object_path(blob_path.as_str())?;
+    /// Fetch and parse a preview (up to `MAX_PREVIEW_BYTES` for non-Parquet files).
+    #[allow(clippy::too_many_lines)]
+    async fn fetch_preview(
+        object_store: &dyn ObjectStore,
+        object_path: &ObjectPath,
+        file_type: &PreviewFileType,
+    ) -> LoadedPreview {
+        let mut preview = LoadedPreview::default();
 
         // For Parquet files, support both table and metadata views.
-        if file_type == PreviewFileType::Parquet {
-            let head_result = object_store.head(&object_path).await;
+        if *file_type == PreviewFileType::Parquet {
+            let head_result = object_store.head(object_path).await;
             match head_result {
                 Ok(meta) => {
                     let file_size = meta.size;
                     if file_size <= MAX_PARQUET_TABLE_PREVIEW_BYTES as u64 {
-                        let get_result = object_store.get_range(&object_path, 0..file_size).await;
-                        self.ui.is_loading_preview = false;
+                        let get_result = object_store.get_range(object_path, 0..file_size).await;
 
                         match get_result {
                             Ok(bytes) => {
@@ -2403,9 +2438,9 @@ impl App {
 
                                 match table_result {
                                     Ok(PreviewData::Table(table)) => {
-                                        self.parquet_table_data = Some(table.clone());
-                                        self.preview_data = Some(PreviewData::Table(table));
-                                        self.parquet_preview_mode = Some(ParquetPreviewMode::Table);
+                                        preview.parquet_table = Some(table.clone());
+                                        preview.data = Some(PreviewData::Table(table));
+                                        preview.parquet_mode = Some(ParquetPreviewMode::Table);
                                     }
                                     Ok(_) => {
                                         table_error = Some(
@@ -2419,44 +2454,42 @@ impl App {
 
                                 match schema_result {
                                     Ok(PreviewData::ParquetSchema(mut schema)) => {
-                                        if self.preview_data.is_none() && table_error.is_some() {
+                                        if preview.data.is_none() && table_error.is_some() {
                                             schema.note.clone_from(&table_error);
                                         }
-                                        self.parquet_schema_data = Some(schema);
+                                        preview.parquet_schema = Some(schema);
                                     }
                                     Ok(_) => {
-                                        self.preview_error = Some(
+                                        preview.error = Some(
                                             "Unexpected Parquet metadata preview format"
                                                 .to_string(),
                                         );
                                     }
                                     Err(e) => {
-                                        self.preview_error = Some(e);
+                                        preview.error = Some(e);
                                     }
                                 }
 
-                                if self.preview_data.is_none() {
-                                    if let Some(schema) = &self.parquet_schema_data {
-                                        self.preview_data =
+                                if preview.data.is_none() {
+                                    if let Some(schema) = &preview.parquet_schema {
+                                        preview.data =
                                             Some(PreviewData::ParquetSchema(schema.clone()));
-                                        self.parquet_preview_mode =
-                                            Some(ParquetPreviewMode::Metadata);
-                                        self.preview_error = None;
-                                    } else if self.preview_error.is_none() {
-                                        self.preview_error = table_error;
+                                        preview.parquet_mode = Some(ParquetPreviewMode::Metadata);
+                                        preview.error = None;
+                                    } else if preview.error.is_none() {
+                                        preview.error = table_error;
                                     }
                                 }
                             }
                             Err(e) => {
-                                self.preview_error = Some(format!("Failed to fetch file: {e}"));
+                                preview.error = Some(format!("Failed to fetch file: {e}"));
                             }
                         }
                     } else {
                         // Large parquet files: read only footer metadata.
                         let start = file_size.saturating_sub(MAX_PARQUET_PREVIEW_BYTES as u64);
                         let get_result =
-                            object_store.get_range(&object_path, start..file_size).await;
-                        self.ui.is_loading_preview = false;
+                            object_store.get_range(object_path, start..file_size).await;
 
                         match get_result {
                             Ok(bytes) => match parse_parquet_schema(&bytes, Some(file_size)) {
@@ -2465,58 +2498,55 @@ impl App {
                                         "Table preview unavailable for files larger than 16 MB"
                                             .to_string(),
                                     );
-                                    self.parquet_schema_data = Some(schema.clone());
-                                    self.preview_data = Some(PreviewData::ParquetSchema(schema));
-                                    self.parquet_preview_mode = Some(ParquetPreviewMode::Metadata);
+                                    preview.parquet_schema = Some(schema.clone());
+                                    preview.data = Some(PreviewData::ParquetSchema(schema));
+                                    preview.parquet_mode = Some(ParquetPreviewMode::Metadata);
                                 }
                                 Ok(_) => {
-                                    self.preview_error = Some(
+                                    preview.error = Some(
                                         "Unexpected Parquet metadata preview format".to_string(),
                                     );
                                 }
                                 Err(e) => {
-                                    self.preview_error = Some(e);
+                                    preview.error = Some(e);
                                 }
                             },
                             Err(e) => {
-                                self.preview_error = Some(format!("Failed to fetch file: {e}"));
+                                preview.error = Some(format!("Failed to fetch file: {e}"));
                             }
                         }
                     }
                 }
                 Err(e) => {
-                    self.ui.is_loading_preview = false;
-                    self.preview_error = Some(format!("Failed to get file info: {e}"));
+                    preview.error = Some(format!("Failed to get file info: {e}"));
                 }
             }
-            return Ok(());
+            return preview;
         }
 
         // For other file types, fetch from the beginning
         let get_result = object_store
-            .get_range(&object_path, 0..(MAX_PREVIEW_BYTES as u64))
+            .get_range(object_path, 0..(MAX_PREVIEW_BYTES as u64))
             .await;
-
-        self.ui.is_loading_preview = false;
 
         match get_result {
             Ok(bytes) => {
                 // Parse the data
-                match parse_preview(&bytes, &file_type) {
+                match parse_preview(&bytes, file_type) {
                     Ok(data) => {
-                        self.preview_data = Some(data);
+                        preview.data = Some(data);
                     }
                     Err(e) => {
-                        self.preview_error = Some(e);
+                        preview.error = Some(e);
                     }
                 }
             }
             Err(e) => {
-                self.preview_error = Some(format!("Failed to fetch file: {e}"));
+                preview.error = Some(format!("Failed to fetch file: {e}"));
             }
         }
 
-        Ok(())
+        preview
     }
 
     /// Close the preview panel.
@@ -2527,7 +2557,6 @@ impl App {
         self.preview_error = None;
         self.preview_scroll = (0, 0);
         self.preview_selected_row = 0;
-        self.ui.is_loading_preview = false;
         self.parquet_preview_mode = None;
         self.parquet_table_data = None;
         self.parquet_schema_data = None;
@@ -2689,7 +2718,6 @@ mod tests {
             modal: Modal::None,
             ui: UiToggles {
                 show_preview: false,
-                is_loading_preview: false,
             },
             sort_criteria: SortCriteria::Name,
             preview_data: None,
@@ -3170,7 +3198,13 @@ mod tests {
             app.clone_folder("parent/", "copy/").await,
             app.delete_folder("parent/").await,
             app.download_folder("child", destination.path()).await,
-            app.get_folder_info("child").await.map(|_| ()),
+            App::folder_info(
+                app.browsing().unwrap().object_store.as_ref(),
+                "parent/child/",
+                "child",
+            )
+            .await
+            .map(|_| ()),
         ];
         for result in results {
             assert!(
@@ -3268,7 +3302,9 @@ mod tests {
             blob_count,
             total_size,
             ..
-        } = app.get_folder_info("source").await.unwrap()
+        } = App::folder_info(store.as_ref(), "source/", "source")
+            .await
+            .unwrap()
         else {
             panic!("expected folder statistics");
         };
@@ -3632,7 +3668,9 @@ mod tests {
         app.handle_key_event(press(KeyCode::Char('p')))
             .await
             .unwrap();
+        settle(&mut app).await;
         assert!(app.ui.show_preview);
+        assert!(app.preview_data.is_some());
 
         // None of the file-list actions may reach the list hidden behind the preview.
         for key in ['r', '/', 'd', 'x', 'c', 's', 'u', 'i', 'y'] {
@@ -3992,6 +4030,66 @@ mod tests {
         assert_eq!(app.browsing().unwrap().current_path(), "parent/");
         assert_eq!(app.browsing().unwrap().selected_index, 0);
         assert!(app.success_message.as_deref().unwrap().contains("Canceled"));
+    }
+
+    #[tokio::test]
+    async fn preview_load_shows_progress_and_cancel_closes_the_panel() {
+        let (gate, mut app) = gated_app().await;
+        app.browsing_mut().unwrap().selected_index = 1;
+
+        app.load_preview();
+        assert!(rendered(&app).contains("Loading preview"));
+        app.handle_key_event(KeyEvent::from(KeyCode::Esc))
+            .await
+            .unwrap();
+        assert!(!app.ui.show_preview);
+        assert!(!app.tasks.is_running());
+
+        gate.add_permits(10);
+        app.load_preview();
+        settle(&mut app).await;
+        assert!(app.ui.show_preview);
+        assert!(matches!(app.preview_data, Some(PreviewData::Text(_))));
+    }
+
+    #[tokio::test]
+    async fn blob_info_arrives_as_a_modal_or_an_error() {
+        let (gate, mut app) = gated_app().await;
+        gate.add_permits(10);
+        app.show_blob_info();
+        settle(&mut app).await;
+        assert!(matches!(
+            app.modal,
+            Modal::BlobInfo {
+                info: super::BlobInfo::Folder {
+                    blob_count: 1,
+                    total_size: 7,
+                    ..
+                }
+            }
+        ));
+
+        app.close_modal();
+        app.browsing_mut().unwrap().selected_index = 1;
+        app.show_blob_info();
+        settle(&mut app).await;
+        assert!(matches!(
+            app.modal,
+            Modal::BlobInfo {
+                info: super::BlobInfo::File { size: 7, .. }
+            }
+        ));
+
+        let (dir, mut app) = navigation_test_app().await;
+        break_navigation_store(dir.path());
+        app.show_blob_info();
+        settle(&mut app).await;
+        assert!(matches!(app.modal, Modal::None));
+        assert!(
+            app.error_message
+                .unwrap()
+                .contains("Failed to get blob info: Folder listing failed")
+        );
     }
 
     proptest! {

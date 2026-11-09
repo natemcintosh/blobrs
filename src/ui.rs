@@ -937,8 +937,9 @@ impl App {
                 file_type_name.clone()
             };
 
-        // Handle loading state
-        if self.ui.is_loading_preview {
+        // Handle loading state; an open preview takes every key, so only its
+        // own load can be running
+        if self.tasks.is_running() {
             let loading = Paragraph::new(format!("{} Loading preview...", self.icons.loading))
                 .block(
                     Block::bordered()
