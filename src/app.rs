@@ -178,6 +178,8 @@ pub(crate) enum TaskEvent {
         result: color_eyre::Result<LoadedDirectory>,
     },
     FolderStats {
+        /// The prefix that was scanned.
+        path: String,
         criteria: SortCriteria,
         result: color_eyre::Result<HashMap<String, FolderStats>>,
     },
@@ -303,6 +305,9 @@ pub struct App {
     pub parquet_schema_data: Option<ParquetSchemaPreview>,
     /// The running background operation, if any, and its result channel.
     pub(crate) tasks: Tasks,
+    /// Folder scans of the open container by prefix, kept so a date or size sort
+    /// does not rescan on every visit. Dropped on refresh and after any change.
+    folder_stats_cache: HashMap<String, HashMap<String, FolderStats>>,
 }
 
 impl std::fmt::Debug for App {
@@ -376,6 +381,7 @@ impl App {
             parquet_table_data: None,
             parquet_schema_data: None,
             tasks: Tasks::new(),
+            folder_stats_cache: HashMap::new(),
         };
 
         app.load_containers();
@@ -428,9 +434,11 @@ impl App {
         };
         match event {
             TaskEvent::DirectoryLoaded { purpose, result } => self.finish_load(purpose, result),
-            TaskEvent::FolderStats { criteria, result } => {
-                self.finish_folder_stats(criteria, result);
-            }
+            TaskEvent::FolderStats {
+                path,
+                criteria,
+                result,
+            } => self.finish_folder_stats(path, criteria, result),
             TaskEvent::PreviewLoaded(preview) => {
                 let preview = *preview;
                 self.preview_data = preview.data;
@@ -896,7 +904,6 @@ impl App {
         object_store: &dyn ObjectStore,
         icons: &IconSet,
         prefix: &str,
-        with_folder_stats: bool,
     ) -> color_eyre::Result<Vec<FileItem>> {
         let prefix_path = Self::prefix_path(prefix)?;
         let result = object_store
@@ -932,11 +939,6 @@ impl App {
                     created: None, // Azure Blob Storage doesn't provide creation time in list operation
                 });
             }
-        }
-
-        if with_folder_stats && items.iter().any(|item| item.kind == EntryKind::Folder) {
-            let stats = Self::folder_stats(object_store, prefix_path.as_ref()).await?;
-            Self::set_folder_stats(&mut items, &stats);
         }
 
         Ok(items)
@@ -1003,52 +1005,80 @@ impl App {
 
     /// Apply sorting to the current file list.
     ///
-    /// Date and size sorts first scan the folders in the background; the sort is
-    /// left unchanged if that scan fails or is canceled.
+    /// Date and size sorts need each folder's stats. If they are not cached, the
+    /// folders are scanned in the background and the sort is applied when the
+    /// scan arrives; it is left unchanged if the scan fails or is canceled.
     pub fn apply_sort(&mut self, criteria: SortCriteria) {
         if criteria.needs_folder_stats()
             && let Some(state) = self.browsing()
             && !state.directory.has_folder_stats
         {
-            let prefix = match Self::prefix_path(state.current_path()) {
-                Ok(prefix) => prefix,
-                Err(e) => {
-                    self.error_message = Some(format!("Failed to sort: {e}"));
-                    return;
-                }
-            };
-            let object_store = state.object_store.clone();
-            self.tasks.spawn("Scanning folders", async move {
-                let result = Self::folder_stats(object_store.as_ref(), prefix.as_ref()).await;
-                TaskEvent::FolderStats { criteria, result }
-            });
-            return;
+            let path = state.current_path().to_owned();
+            let is_folder = |item: &FileItem| item.kind == EntryKind::Folder;
+            let has_folders = state.directory.file_items.iter().any(is_folder)
+                || matches!(&self.search, Search::Files { all_file_items, .. }
+                    if all_file_items.iter().any(is_folder));
+            if let Some(stats) = self.folder_stats_cache.get(&path).cloned() {
+                self.merge_folder_stats(&stats);
+            } else if has_folders {
+                let prefix = match Self::prefix_path(&path) {
+                    Ok(prefix) => prefix,
+                    Err(e) => {
+                        self.error_message = Some(format!("Failed to sort: {e}"));
+                        return;
+                    }
+                };
+                let object_store = state.object_store.clone();
+                self.tasks.spawn("Scanning folders", async move {
+                    let result = Self::folder_stats(object_store.as_ref(), prefix.as_ref()).await;
+                    TaskEvent::FolderStats {
+                        path,
+                        criteria,
+                        result,
+                    }
+                });
+                return;
+            } else {
+                self.merge_folder_stats(&HashMap::new());
+            }
         }
         self.sort_by(criteria);
     }
 
     fn finish_folder_stats(
         &mut self,
+        path: String,
         criteria: SortCriteria,
         result: color_eyre::Result<HashMap<String, FolderStats>>,
     ) {
-        let stats = match result {
-            Ok(stats) => stats,
-            Err(e) => {
-                self.error_message = Some(format!("Failed to sort: {e}"));
-                return;
+        match result {
+            Ok(stats) => {
+                self.merge_folder_stats(&stats);
+                self.folder_stats_cache.insert(path, stats);
+                self.sort_by(criteria);
             }
-        };
-        // Merge stats into the current items rather than relisting, which would drop
-        // a confirmed search filter.
+            Err(e) => self.error_message = Some(format!("Failed to sort: {e}")),
+        }
+    }
+
+    /// Merge stats into the current items rather than relisting, which would drop
+    /// a confirmed search filter.
+    fn merge_folder_stats(&mut self, stats: &HashMap<String, FolderStats>) {
         if let Some(state) = self.browsing_mut() {
-            Self::set_folder_stats(&mut state.directory.file_items, &stats);
+            Self::set_folder_stats(&mut state.directory.file_items, stats);
             state.directory.has_folder_stats = true;
         }
         if let Search::Files { all_file_items, .. } = &mut self.search {
-            Self::set_folder_stats(all_file_items, &stats);
+            Self::set_folder_stats(all_file_items, stats);
         }
-        self.sort_by(criteria);
+    }
+
+    /// A listing arrives without folder stats so it can be shown at once; fetch
+    /// them now if the current sort depends on them.
+    fn sort_new_listing(&mut self) {
+        if self.sort_criteria.needs_folder_stats() {
+            self.apply_sort(self.sort_criteria);
+        }
     }
 
     fn sort_by(&mut self, criteria: SortCriteria) {
@@ -1133,6 +1163,7 @@ impl App {
         };
         let object_store = state.object_store.clone();
         let path = state.directory.current_path.clone();
+        self.folder_stats_cache.remove(&path);
         self.start_load(
             object_store,
             path,
@@ -1167,9 +1198,7 @@ impl App {
         sort_criteria: SortCriteria,
         current_path: String,
     ) -> color_eyre::Result<LoadedDirectory> {
-        let has_folder_stats = sort_criteria.needs_folder_stats();
-        let mut file_items =
-            Self::list_file_items(object_store, icons, &current_path, has_folder_stats).await?;
+        let mut file_items = Self::list_file_items(object_store, icons, &current_path).await?;
         Self::sort_file_items_static(&mut file_items, sort_criteria);
         let files = file_items
             .iter()
@@ -1179,7 +1208,7 @@ impl App {
             current_path,
             files,
             file_items,
-            has_folder_stats,
+            has_folder_stats: false,
         })
     }
 
@@ -1239,11 +1268,13 @@ impl App {
                     directory,
                     selected_index: 0,
                 });
+                self.folder_stats_cache.clear();
                 self.search = Search::Inactive;
                 self.error_message = None;
                 self.success_message = None;
             }
         }
+        self.sort_new_listing();
     }
 
     fn navigate_to(&mut self, path: String, failure: &'static str) {
@@ -1518,6 +1549,7 @@ impl App {
         {
             let object_store = state.object_store.clone();
             let path = state.directory.current_path.clone();
+            self.folder_stats_cache.clear();
             self.start_load(
                 object_store,
                 path,
@@ -2822,13 +2854,18 @@ mod tests {
             parquet_table_data: None,
             parquet_schema_data: None,
             tasks: super::Tasks::new(),
+            folder_stats_cache: std::collections::HashMap::new(),
         }
     }
 
     /// Apply task results until no operation is running.
     async fn settle(app: &mut App) {
         while app.tasks.is_running() {
-            let message = app.tasks.recv().await.expect("task channel closed");
+            let message =
+                tokio::time::timeout(std::time::Duration::from_secs(10), app.tasks.recv())
+                    .await
+                    .expect("operation did not finish")
+                    .expect("task channel closed");
             app.apply_task_message(message);
         }
     }
@@ -4280,6 +4317,75 @@ mod tests {
             app.error_message
                 .unwrap()
                 .contains("Failed to list containers: offline")
+        );
+    }
+
+    #[tokio::test]
+    async fn listing_is_shown_before_its_folder_scan_and_scans_are_cached() {
+        let (gate, mut app) = gated_app().await;
+        let child_size = |app: &App| app.browsing().unwrap().directory.file_items[0].size;
+
+        // One permit: the scan.
+        gate.add_permits(1);
+        app.apply_sort(SortCriteria::Size);
+        settle(&mut app).await;
+        assert_eq!(child_size(&app), Some(7));
+
+        // Two permits: one listing each way. The child has no folders to scan,
+        // and coming back uses the cached scan.
+        gate.add_permits(2);
+        app.enter_directory();
+        settle(&mut app).await;
+        assert_eq!(app.browsing().unwrap().current_path(), "parent/child/");
+        app.go_up_directory();
+        settle(&mut app).await;
+        assert_eq!(child_size(&app), Some(7));
+
+        // Refreshing rescans, but shows the listing while the scan is running.
+        app.handle_key_event(KeyEvent::from(KeyCode::Char('r')))
+            .unwrap();
+        gate.add_permits(1);
+        let listing = app.tasks.recv().await.unwrap();
+        app.apply_task_message(listing);
+        assert_eq!(item_names(&app), ["child", "a.txt"]);
+        assert_eq!(child_size(&app), None);
+        assert!(app.tasks.status().unwrap().contains("Scanning folders"));
+
+        // Canceling the scan keeps the listing usable.
+        app.handle_key_event(KeyEvent::from(KeyCode::Esc)).unwrap();
+        assert_eq!(item_names(&app), ["child", "a.txt"]);
+        assert_eq!(app.sort_criteria, SortCriteria::Size);
+
+        // Choosing the sort again retries the scan.
+        gate.add_permits(1);
+        app.apply_sort(SortCriteria::Size);
+        settle(&mut app).await;
+        assert_eq!(child_size(&app), Some(7));
+    }
+
+    #[tokio::test]
+    async fn changing_the_container_drops_cached_folder_scans() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("new.txt");
+        std::fs::write(&source, "payload").unwrap();
+        let (gate, mut app) = gated_app().await;
+        gate.add_permits(100);
+        app.apply_sort(SortCriteria::Size);
+        settle(&mut app).await;
+        assert!(app.folder_stats_cache.contains_key("parent/"));
+
+        app.browsing_mut().unwrap().selected_index = 0;
+        app.enter_directory();
+        settle(&mut app).await;
+        app.upload_file(source);
+        settle(&mut app).await;
+        app.go_up_directory();
+        settle(&mut app).await;
+
+        // The upload into the child folder is reflected in the parent's scan.
+        assert_eq!(
+            app.browsing().unwrap().directory.file_items[0].size,
+            Some(14)
         );
     }
 
