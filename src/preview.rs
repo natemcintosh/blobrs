@@ -669,7 +669,8 @@ pub fn parse_parquet_table(data: &[u8]) -> Result<PreviewData, String> {
     let mut builder = ParquetRecordBatchReaderBuilder::try_new(bytes)
         .map_err(|e| format!("Failed to read Parquet file: {e}"))?;
 
-    let total_rows = builder.metadata().file_metadata().num_rows().max(0) as usize;
+    // A negative row count means corrupt metadata; treat it as empty.
+    let total_rows = usize::try_from(builder.metadata().file_metadata().num_rows()).unwrap_or(0);
     builder = builder.with_batch_size(MAX_PREVIEW_ROWS);
 
     let schema = builder.schema().clone();

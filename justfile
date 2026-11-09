@@ -38,6 +38,11 @@ test:
 check:
     cargo clippy -- -D warnings
 
+# Run pedantic Clippy on all targets and features, treating warnings as errors.
+[group('validation')]
+pedantic:
+    cargo clippy --all-targets --all-features --locked -- -D warnings -W clippy::pedantic
+
 # Format Rust source files.
 [group('validation')]
 fmt:

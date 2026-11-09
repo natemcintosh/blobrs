@@ -633,8 +633,7 @@ impl App {
         let selected_file = browsing
             .files()
             .get(browsing.selected_index)
-            .map(std::string::String::as_str)
-            .unwrap_or("No file selected");
+            .map_or("No file selected", std::string::String::as_str);
 
         // Extract the name without the icon prefix
         let folder_prefix = format!("{} ", self.icons.folder);
@@ -1101,10 +1100,7 @@ impl App {
         } else {
             format!(" {}", overflow_hints.join(" | "))
         };
-        let title = format!(
-            " {} • Cols {start_col}-{end_col}/{num_cols}{overflow_text} ",
-            row_info
-        );
+        let title = format!(" {row_info} • Cols {start_col}-{end_col}/{num_cols}{overflow_text} ");
 
         // Build header row
         let header_cells: Vec<Cell> = viewport

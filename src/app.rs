@@ -1448,6 +1448,7 @@ impl App {
         self.selected_container_index = 0;
     }
 
+    #[must_use]
     pub fn is_favorite(&self, container: &str) -> bool {
         self.favorites.contains(&self.storage_account, container)
     }
@@ -2183,7 +2184,7 @@ impl App {
                                 match schema_result {
                                     Ok(PreviewData::ParquetSchema(mut schema)) => {
                                         if self.preview_data.is_none() && table_error.is_some() {
-                                            schema.note = table_error.clone();
+                                            schema.note.clone_from(&table_error);
                                         }
                                         self.parquet_schema_data = Some(schema);
                                     }
@@ -2609,16 +2610,15 @@ mod tests {
         let mut app = upload_test_app("");
         assert!(app.upload_file(&dir.path().join("missing")).await.is_err());
         assert!(app.upload_file(dir.path()).await.is_err());
-        assert!(
-            app.browsing()
-                .unwrap()
-                .object_store
-                .list_with_delimiter(None)
-                .await
-                .unwrap()
-                .objects
-                .is_empty()
-        );
+        let objects = app
+            .browsing()
+            .unwrap()
+            .object_store
+            .list_with_delimiter(None)
+            .await
+            .unwrap()
+            .objects;
+        assert_eq!(objects, Vec::<object_store::ObjectMeta>::new());
         assert!(app.success_message.is_none());
     }
 
@@ -2815,7 +2815,7 @@ mod tests {
                 query,
                 all_containers,
             } => {
-                assert!(query.is_empty());
+                assert_eq!(query, "");
                 assert_eq!(all_containers.len(), 2);
             }
             _ => panic!("Expected container search state"),
@@ -3029,12 +3029,8 @@ mod tests {
             is_folder: true,
         };
         app.execute_delete().await.unwrap();
-        assert!(
-            crate::bulk::snapshot(store.list(None))
-                .await
-                .unwrap()
-                .is_empty()
-        );
+        let remaining = crate::bulk::snapshot(store.list(None)).await.unwrap();
+        assert_eq!(remaining, Vec::<object_store::ObjectMeta>::new());
         assert!(
             app.success_message
                 .as_deref()
@@ -3093,7 +3089,11 @@ mod tests {
                 let area = Rect::new(0, 0, width, 32);
                 let mut buffer = Buffer::empty(area);
                 (&app).render(area, &mut buffer);
-                let text: String = buffer.content.iter().map(|cell| cell.symbol()).collect();
+                let text: String = buffer
+                    .content
+                    .iter()
+                    .map(ratatui::buffer::Cell::symbol)
+                    .collect();
                 assert!(text.contains("injected failure"));
             }
         }
@@ -3185,7 +3185,7 @@ mod tests {
         else {
             panic!("failed navigation must preserve search");
         };
-        assert!(query.is_empty());
+        assert_eq!(query, "");
         assert_eq!(all_files, before.files());
         assert_eq!(
             all_file_items
@@ -3365,11 +3365,6 @@ mod tests {
             items in prop::collection::vec(arb_file_item(), 0..40),
             criteria in arb_sort_criteria(),
         ) {
-            let mut sorted = items.clone();
-            App::sort_file_items_static(&mut sorted, criteria);
-
-            prop_assert_eq!(sorted.len(), items.len());
-
             type ItemKey = (
                 String,
                 String,
@@ -3378,6 +3373,11 @@ mod tests {
                 Option<chrono::DateTime<chrono::Utc>>,
                 Option<chrono::DateTime<chrono::Utc>>,
             );
+
+            let mut sorted = items.clone();
+            App::sort_file_items_static(&mut sorted, criteria);
+
+            prop_assert_eq!(sorted.len(), items.len());
 
             let before = items.iter().fold(BTreeMap::<ItemKey, usize>::new(), |mut acc, item| {
                 *acc.entry((
