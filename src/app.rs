@@ -411,6 +411,22 @@ impl App {
                 }
             }
         } else if self.is_browsing() {
+            // An open preview hides the file list, so it takes every key until closed.
+            if self.ui.show_preview {
+                match key_event.code {
+                    KeyCode::Char('p') | KeyCode::Esc | KeyCode::Backspace => self.close_preview(),
+                    KeyCode::Tab => self.toggle_parquet_preview_mode(),
+                    KeyCode::Up | KeyCode::Char('k') => self.preview_scroll_up(),
+                    KeyCode::Down | KeyCode::Char('j') => self.preview_scroll_down(),
+                    KeyCode::Right | KeyCode::Char('l') | KeyCode::Enter => {
+                        self.preview_scroll_right();
+                    }
+                    KeyCode::Left | KeyCode::Char('h') => self.preview_scroll_left(),
+                    _ => {}
+                }
+                return Ok(());
+            }
+
             match key_event.code {
                 KeyCode::Char('/') => {
                     if !self.is_modal_blob_info() {
@@ -426,7 +442,6 @@ impl App {
                 }
                 KeyCode::Char('i') => {
                     if !self.is_modal_blob_info()
-                        && !self.ui.show_preview
                         && let Err(e) = self.show_blob_info().await
                     {
                         self.error_message = Some(format!("Failed to get blob info: {e}"));
@@ -438,26 +453,12 @@ impl App {
                         && !self.is_modal_sort_picker()
                         && !self.is_modal_clone_dialog()
                         && !self.is_modal_delete_dialog()
+                        && let Err(e) = self.load_preview().await
                     {
-                        if self.ui.show_preview {
-                            // Toggle off
-                            self.close_preview();
-                        } else {
-                            // Toggle on - load preview
-                            if let Err(e) = self.load_preview().await {
-                                self.error_message = Some(format!("Preview failed: {e}"));
-                            }
-                        }
+                        self.error_message = Some(format!("Preview failed: {e}"));
                     }
                 }
-                KeyCode::Tab => {
-                    if self.ui.show_preview {
-                        self.toggle_parquet_preview_mode();
-                    }
-                }
-                KeyCode::Char('u')
-                    if matches!(self.modal, Modal::None) && !self.ui.show_preview =>
-                {
+                KeyCode::Char('u') if matches!(self.modal, Modal::None) => {
                     self.modal = Modal::UploadPicker;
                 }
                 KeyCode::Char('d') => {
@@ -541,23 +542,17 @@ impl App {
                     }
                 }
                 KeyCode::Up | KeyCode::Char('k') => {
-                    if self.ui.show_preview {
-                        self.preview_scroll_up();
-                    } else if !self.is_modal_blob_info() && !self.is_modal_sort_picker() {
+                    if !self.is_modal_blob_info() && !self.is_modal_sort_picker() {
                         self.move_up();
                     }
                 }
                 KeyCode::Down | KeyCode::Char('j') => {
-                    if self.ui.show_preview {
-                        self.preview_scroll_down();
-                    } else if !self.is_modal_blob_info() && !self.is_modal_sort_picker() {
+                    if !self.is_modal_blob_info() && !self.is_modal_sort_picker() {
                         self.move_down();
                     }
                 }
                 KeyCode::Right | KeyCode::Char('l') | KeyCode::Enter => {
-                    if self.ui.show_preview {
-                        self.preview_scroll_right();
-                    } else if self.is_modal_download_picker() {
+                    if self.is_modal_download_picker() {
                         if let Err(e) = self.confirm_download().await {
                             self.error_message = Some(format!("Download failed: {e}"));
                         }
@@ -569,9 +564,7 @@ impl App {
                     }
                 }
                 KeyCode::Left | KeyCode::Char('h') => {
-                    if self.ui.show_preview {
-                        self.preview_scroll_left();
-                    } else if self.is_modal_download_picker() {
+                    if self.is_modal_download_picker() {
                         // Close download picker
                         self.close_modal();
                     } else if self.is_modal_blob_info() {
@@ -585,10 +578,7 @@ impl App {
                     }
                 }
                 KeyCode::Esc => {
-                    if self.ui.show_preview {
-                        // Close preview panel
-                        self.close_preview();
-                    } else if self.is_modal_download_picker() {
+                    if self.is_modal_download_picker() {
                         // Close download picker
                         self.close_modal();
                     } else if self.is_modal_blob_info() {
@@ -3466,6 +3456,43 @@ mod tests {
         }
 
         assert_eq!(app.preview_scroll.1, 2);
+    }
+
+    #[tokio::test]
+    async fn open_preview_captures_keys_until_closed() {
+        let (_dir, mut app) = navigation_test_app().await;
+        app.browsing_mut().unwrap().selected_index = 1;
+        let press = |code| KeyEvent::new(code, KeyModifiers::NONE);
+
+        app.handle_key_event(press(KeyCode::Char('p')))
+            .await
+            .unwrap();
+        assert!(app.ui.show_preview);
+
+        // None of the file-list actions may reach the list hidden behind the preview.
+        for key in ['r', '/', 'd', 'x', 'c', 's', 'u', 'i', 'y'] {
+            app.handle_key_event(press(KeyCode::Char(key)))
+                .await
+                .unwrap();
+            assert!(app.ui.show_preview, "`{key}` closed the preview");
+            assert!(
+                matches!(app.modal, Modal::None),
+                "`{key}` opened a modal over the preview"
+            );
+            assert!(
+                matches!(app.search, Search::Inactive),
+                "`{key}` started a search"
+            );
+            assert_eq!(app.browsing().unwrap().selected_index, 1);
+            assert_eq!(app.success_message, None);
+        }
+
+        // Backspace closes the preview rather than leaving the container with it open.
+        app.handle_key_event(press(KeyCode::Backspace))
+            .await
+            .unwrap();
+        assert!(!app.ui.show_preview);
+        assert_eq!(app.browsing().unwrap().current_path(), "parent/");
     }
 
     // Folders a < b < c by name, b > c > a by newest blob (b's is nested and
