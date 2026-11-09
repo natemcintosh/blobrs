@@ -29,6 +29,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::io::AsyncWriteExt;
 use tokio_util::sync::CancellationToken;
 
 /// How often the spinner advances while an operation runs.
@@ -2389,25 +2390,45 @@ impl App {
 
         let object_path = Self::object_path(blob_path.as_str())?;
 
-        // Create destination file path
-        let file_destination = destination.join(file_name);
+        Self::download_object(object_store, &object_path, &destination.join(file_name)).await
+    }
+
+    /// Stream one blob to `destination` without holding it in memory.
+    ///
+    /// The data goes to a `.part` file beside the destination that is renamed
+    /// only once complete, so a failed or canceled download leaves no
+    /// truncated file behind.
+    async fn download_object(
+        object_store: &dyn ObjectStore,
+        location: &ObjectPath,
+        destination: &Path,
+    ) -> color_eyre::Result<()> {
+        /// Removes the partial file; after a completed download it is already
+        /// renamed away and there is nothing to remove.
+        struct Partial(PathBuf);
+        impl Drop for Partial {
+            fn drop(&mut self) {
+                let _ = fs::remove_file(&self.0);
+            }
+        }
 
         // Ensure parent directory exists
-        if let Some(parent) = file_destination.parent() {
-            fs::create_dir_all(parent)?;
+        if let Some(parent) = destination.parent() {
+            tokio::fs::create_dir_all(parent).await?;
         }
+        let mut partial_name = destination.as_os_str().to_owned();
+        partial_name.push(".part");
+        let partial = Partial(PathBuf::from(partial_name));
 
-        // Download the file
-        match object_store.get(&object_path).await {
-            Ok(get_result) => {
-                let bytes = get_result.bytes().await?;
-                fs::write(&file_destination, &bytes)?;
-            }
-            Err(e) => {
-                return Err(color_eyre::eyre::eyre!("Download failed: {}", e));
-            }
+        let mut chunks = object_store.get(location).await?.into_stream();
+        let mut file = tokio::fs::File::create(&partial.0).await?;
+        while let Some(chunk) = chunks.try_next().await? {
+            file.write_all(&chunk).await?;
         }
-
+        // Tokio writes in the background; wait for the last one before renaming.
+        file.flush().await?;
+        drop(file);
+        tokio::fs::rename(&partial.0, destination).await?;
         Ok(())
     }
 
@@ -2440,12 +2461,7 @@ impl App {
                         )
                     })?;
                     let file_destination = folder_destination.join(relative_path);
-                    if let Some(parent) = file_destination.parent() {
-                        fs::create_dir_all(parent)?;
-                    }
-                    let bytes = object_store.get(&meta.location).await?.bytes().await?;
-                    fs::write(&file_destination, &bytes)?;
-                    Ok(())
+                    Self::download_object(object_store, &meta.location, &file_destination).await
                 }
             },
         )
@@ -3510,6 +3526,14 @@ mod tests {
             b"payload"
         );
         assert!(!destination.path().join("folder/c").exists());
+        // The failed object's partial file is cleaned up, and none is left
+        // behind for the one that succeeded.
+        let leftovers: Vec<_> = std::fs::read_dir(destination.path().join("folder"))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .filter(|name| name.to_string_lossy().ends_with(".part"))
+            .collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
     }
 
     #[test]
