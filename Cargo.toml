@@ -11,7 +11,7 @@ edition = "2024"
 crossterm = "0.29.0"
 ratatui = "0.30.0"
 color-eyre = "0.6.3"
-object_store = { version = "0.13", features = ["azure"] }
+object_store = { version = "0.14", features = ["azure"] }
 tokio = { version = "1", features = ["full"] }
 url = "2.5"
 futures = "0.3"
