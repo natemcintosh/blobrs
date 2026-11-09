@@ -2,9 +2,11 @@
 
 A terminal UI for browsing Azure Blob Storage containers and blobs.
 
+Blobrs supports Linux only. It is not built or tested on macOS or Windows.
+
 ## Quick start
 
-You'll need Rust (Cargo + rustc), [Azure CLI](https://learn.microsoft.com/en-us/cli/azure/install-azure-cli),
+You'll need Linux, Rust (Cargo + rustc), [Azure CLI](https://learn.microsoft.com/en-us/cli/azure/install-azure-cli),
 and an Azure Storage account.
 
 ```bash
@@ -18,9 +20,9 @@ blobrs
 ```
 
 `AZURE_STORAGE_ACCOUNT` is the only required environment variable. See
-[Environment variables](#environment-variables) for PowerShell and optional settings.
+[Environment variables](#environment-variables) for optional settings.
 Once installed, run `blobrs` from any directory. Make sure Cargo's binary directory
-(`~/.cargo/bin` or `%USERPROFILE%\.cargo\bin`) is on your `PATH`.
+(`~/.cargo/bin`) is on your `PATH`.
 
 ## Features
 
@@ -39,20 +41,11 @@ Once installed, run `blobrs` from any directory. Make sure Cargo's binary direct
 | `AZURE_STORAGE_ACCOUNT` | Yes | Storage account name, not a URL or connection string. |
 | `BLOBRS_ICONS` | No | Set to `unicode`, `ascii`, or `minimal` to override automatic icon detection. |
 
-For Bash/zsh:
-
 ```bash
 export AZURE_STORAGE_ACCOUNT="your_storage_account_name"
 ```
 
-For PowerShell:
-
-```powershell
-$env:AZURE_STORAGE_ACCOUNT = "your_storage_account_name"
-```
-
-To keep the setting across terminals, add the line to `~/.bashrc`, `~/.zshrc`, or
-your PowerShell profile (`$PROFILE`).
+To keep the setting across terminals, add the line to `~/.bashrc` or `~/.zshrc`.
 
 Credentials come from your Azure CLI login; no storage key or container variable
 is needed. The installed binary and `cargo run` do not load `.env` files.
@@ -69,11 +62,11 @@ grant blob data access.
 ## Usage notes
 
 - Favorites are saved per storage account in `$XDG_DATA_HOME/blobrs/favorites.json`
-  (defaulting to `~/.local/share/blobrs/favorites.json` on Linux). Finish searching
+  (defaulting to `~/.local/share/blobrs/favorites.json`). Finish searching
   with Enter before pressing `f` to toggle a favorite.
 - Uploads use the local filename and never overwrite existing blobs. Uploads
   read the file into memory and block the TUI until complete.
-- Upload and download file choosers require a working desktop portal on Linux.
+- Upload and download file choosers require a working desktop portal.
 
 ## Development
 
