@@ -67,6 +67,8 @@ grant blob data access.
 - Uploads use the local filename and never overwrite existing blobs. Uploads
   read the file into memory and block the TUI until complete.
 - Upload and download file choosers require a working desktop portal.
+- On X11 without a clipboard manager (e.g. XFCE over xrdp), paths copied with
+  `y` can be pasted only while blobrs is running.
 
 ## Development
 
