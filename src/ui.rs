@@ -9,7 +9,7 @@ use ratatui::{
     },
 };
 
-use crate::app::{App, EntryKind, Modal, ParquetPreviewMode, PreviewPanel, Session};
+use crate::app::{App, EntryKind, FileItem, Modal, ParquetPreviewMode, PreviewPanel, Session};
 use crate::preview::PreviewData;
 
 mod command_bar;
@@ -20,6 +20,7 @@ const MUTED: Color = Color::Rgb(145, 157, 174);
 const BORDER: Color = Color::Rgb(80, 94, 112);
 const ACCENT: Color = Color::Rgb(125, 195, 232);
 const SURFACE: Color = Color::Rgb(36, 49, 65);
+const FILE_LIST_COLUMN_SPACING: u16 = 3;
 
 fn panel() -> Block<'static> {
     Block::bordered()
@@ -33,6 +34,16 @@ fn selection() -> Style {
         .bg(SURFACE)
         .fg(ACCENT)
         .add_modifier(Modifier::BOLD)
+}
+
+fn file_list_size(item: &FileItem) -> String {
+    match item.kind {
+        EntryKind::File => item.size.map(format_bytes).unwrap_or_default(),
+        EntryKind::Folder => item
+            .blob_count
+            .map(|count| format!("{count} blob{}", if count == 1 { "" } else { "s" }))
+            .unwrap_or_default(),
+    }
 }
 
 impl Widget for &App {
@@ -318,6 +329,38 @@ impl App {
             (main_area, None)
         };
 
+        let size_width = browsing
+            .file_items()
+            .iter()
+            .map(|item| file_list_size(item).len())
+            .max()
+            .unwrap_or(0)
+            .max("Size".len());
+        let size_width = u16::try_from(size_width).unwrap_or(u16::MAX).min(
+            file_list_area
+                .width
+                .saturating_sub(8 + FILE_LIST_COLUMN_SPACING),
+        );
+        // Reserve borders, the selection marker, column spacing, and 12 cells
+        // for names before adding a timestamp column.
+        let modified_column = match file_list_area
+            .width
+            .saturating_sub(size_width + 16 + 2 * FILE_LIST_COLUMN_SPACING)
+        {
+            16.. => Some((16, "Modified (UTC)", "%Y-%m-%d %H:%M")),
+            10.. => Some((10, "Date (UTC)", "%Y-%m-%d")),
+            _ => None,
+        };
+        let mut widths = vec![Constraint::Min(0), Constraint::Length(size_width)];
+        let mut headings = vec![
+            Cell::from("Name"),
+            Cell::from(Line::from("Size").right_aligned()),
+        ];
+        if let Some((width, heading, _)) = modified_column {
+            widths.push(Constraint::Length(width));
+            headings.push(Cell::from(heading));
+        }
+
         // Main block with file list
         let file_rows: Vec<Row> = if browsing.files().is_empty() {
             let has_query = self.file_search_query().is_some_and(|q| !q.is_empty());
@@ -338,17 +381,20 @@ impl App {
                 .iter()
                 .enumerate()
                 .map(|(index, file)| {
-                    let size = browsing
-                        .file_items()
-                        .get(index)
-                        .filter(|item| item.kind == EntryKind::File)
-                        .and_then(|item| item.size)
-                        .map(format_bytes)
-                        .unwrap_or_default();
-                    Row::new([
+                    let item = browsing.file_items().get(index);
+                    let size = item.map(file_list_size).unwrap_or_default();
+                    let mut cells = vec![
                         Cell::from(file.as_str()),
                         Cell::from(Line::from(size).alignment(Alignment::Right)),
-                    ])
+                    ];
+                    if let Some((_, _, format)) = modified_column {
+                        let modified = item
+                            .and_then(|item| item.last_modified)
+                            .map(|date| date.format(format).to_string())
+                            .unwrap_or_default();
+                        cells.push(Cell::from(modified));
+                    }
+                    Row::new(cells)
                 })
                 .collect()
         };
@@ -390,30 +436,18 @@ impl App {
             )
         };
 
-        let size_width = browsing
-            .file_items()
-            .iter()
-            .filter(|item| item.kind == EntryKind::File)
-            .filter_map(|item| item.size)
-            .map(|size| format_bytes(size).len())
-            .max()
-            .unwrap_or(0);
-        let size_width = u16::try_from(size_width)
-            .unwrap_or(u16::MAX)
-            .min(file_list_area.width.saturating_sub(5));
-        let main_block = Table::new(
-            file_rows,
-            [Constraint::Min(0), Constraint::Length(size_width)],
-        )
-        .block(
-            panel()
-                .title(title)
-                .title_alignment(Alignment::Left)
-                .border_type(BorderType::Rounded),
-        )
-        .fg(TEXT)
-        .row_highlight_style(selection())
-        .highlight_symbol("▸ ");
+        let main_block = Table::new(file_rows, widths)
+            .column_spacing(FILE_LIST_COLUMN_SPACING)
+            .header(Row::new(headings).style(Style::default().fg(MUTED).bold()))
+            .block(
+                panel()
+                    .title(title)
+                    .title_alignment(Alignment::Left)
+                    .border_type(BorderType::Rounded),
+            )
+            .fg(TEXT)
+            .row_highlight_style(selection())
+            .highlight_symbol("▸ ");
 
         ratatui::widgets::StatefulWidget::render(main_block, file_list_area, buf, &mut list_state);
 

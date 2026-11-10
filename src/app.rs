@@ -64,7 +64,7 @@ pub(crate) struct LoadedDirectory {
     current_path: String,
     files: Vec<String>,
     file_items: Vec<FileItem>,
-    /// Whether folder items carry their newest blob time and total blob size.
+    /// Whether folder items carry their blob count, newest time, and total size.
     has_folder_stats: bool,
 }
 
@@ -120,6 +120,8 @@ pub struct FileItem {
     pub actual_name: String,  // The actual file/folder name
     pub kind: EntryKind,
     pub size: Option<u64>,
+    /// Recursive count for folders, populated only by an explicitly requested scan.
+    pub blob_count: Option<usize>,
     pub last_modified: Option<chrono::DateTime<chrono::Utc>>,
     pub created: Option<chrono::DateTime<chrono::Utc>>,
 }
@@ -128,6 +130,7 @@ pub struct FileItem {
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct FolderStats {
     size: u64,
+    blob_count: usize,
     last_modified: chrono::DateTime<chrono::Utc>,
 }
 
@@ -973,6 +976,7 @@ impl App {
                     actual_name: last_part.to_string(),
                     kind: EntryKind::Folder,
                     size: None,
+                    blob_count: None,
                     last_modified: None,
                     created: None,
                 });
@@ -988,6 +992,7 @@ impl App {
                     actual_name: last_part.to_string(),
                     kind: EntryKind::File,
                     size: Some(meta.size),
+                    blob_count: None,
                     last_modified: Some(meta.last_modified),
                     created: None, // Azure Blob Storage doesn't provide creation time in list operation
                 });
@@ -1028,6 +1033,7 @@ impl App {
             match stats.get_mut(folder.as_ref()) {
                 Some(folder_stats) => {
                     folder_stats.size += meta.size;
+                    folder_stats.blob_count += 1;
                     folder_stats.last_modified = folder_stats.last_modified.max(meta.last_modified);
                 }
                 None => {
@@ -1035,6 +1041,7 @@ impl App {
                         folder.as_ref().to_owned(),
                         FolderStats {
                             size: meta.size,
+                            blob_count: 1,
                             last_modified: meta.last_modified,
                         },
                     );
@@ -1051,6 +1058,7 @@ impl App {
         {
             if let Some(folder_stats) = stats.get(&item.actual_name) {
                 item.size = Some(folder_stats.size);
+                item.blob_count = Some(folder_stats.blob_count);
                 item.last_modified = Some(folder_stats.last_modified);
             }
         }
@@ -1131,6 +1139,12 @@ impl App {
     fn sort_new_listing(&mut self) {
         if self.sort_criteria.needs_folder_stats() {
             self.apply_sort(self.sort_criteria);
+        } else if let Some(stats) = self
+            .browsing()
+            .and_then(|state| self.folder_stats_cache.get(state.current_path()))
+            .cloned()
+        {
+            self.merge_folder_stats(&stats);
         }
     }
 
@@ -2930,6 +2944,7 @@ mod tests {
                     actual_name,
                     kind,
                     size,
+                    blob_count: None,
                     last_modified,
                     created,
                 }
@@ -3229,6 +3244,7 @@ mod tests {
                     actual_name: "file.txt".to_string(),
                     kind: super::EntryKind::File,
                     size: None,
+                    blob_count: None,
                     last_modified: None,
                     created: None,
                 }],
@@ -3266,6 +3282,7 @@ mod tests {
                     actual_name: "logs".to_string(),
                     kind: super::EntryKind::Folder,
                     size: None,
+                    blob_count: None,
                     last_modified: None,
                     created: None,
                 }],
@@ -3366,6 +3383,7 @@ mod tests {
                 actual_name: "file_a".to_string(),
                 kind: super::EntryKind::File,
                 size: None,
+                blob_count: None,
                 last_modified: None,
                 created: None,
             },
@@ -3374,6 +3392,7 @@ mod tests {
                 actual_name: "file_b".to_string(),
                 kind: super::EntryKind::File,
                 size: None,
+                blob_count: None,
                 last_modified: None,
                 created: None,
             },
@@ -3955,7 +3974,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn file_sizes_stay_right_aligned_when_names_are_clipped() {
+    async fn file_columns_stay_aligned_when_names_are_clipped() {
         use ratatui::{buffer::Buffer, layout::Rect, widgets::Widget};
         let (_dir, mut app) = navigation_test_app().await;
         let store = app.browsing().unwrap().object_store.clone();
@@ -3982,7 +4001,7 @@ mod tests {
             } else {
                 super::PreviewPanel::Hidden
             };
-            for width in [60, 100, 140] {
+            for width in [60, 90, 100, 110, 140] {
                 let mut buffer = Buffer::empty(Rect::new(0, 0, width, 30));
                 app.render(buffer.area, &mut buffer);
                 let list_width = if show_preview {
@@ -3990,17 +4009,41 @@ mod tests {
                 } else {
                     width
                 };
-                for (row, expected) in [(1, ""), (2, "7 B"), (3, "0 B"), (4, "1.5 KB")] {
-                    let size: String = (list_width - 1 - u16::try_from(expected.len()).unwrap()
-                        ..list_width - 1)
-                        .map(|x| buffer[(x, row)].symbol())
-                        .collect();
+                let modified_width = match list_width {
+                    24 | 36 => 0,
+                    40 => 10,
+                    _ => 16,
+                };
+                let size_end = list_width - 1 - modified_width - 3 * u16::from(modified_width > 0);
+                let cell_text = |start, end, row| -> String {
+                    (start..end).map(|x| buffer[(x, row)].symbol()).collect()
+                };
+                assert_eq!(cell_text(size_end - 4, size_end, 1), "Size");
+                for (row, expected) in [(3, "7 B"), (4, "0 B"), (5, "1.5 KB")] {
+                    let size = cell_text(
+                        size_end - u16::try_from(expected.len()).unwrap(),
+                        size_end,
+                        row,
+                    );
                     assert_eq!(size, expected, "width={width}, preview={show_preview}");
+                    if modified_width > 0 {
+                        let item = &app.browsing().unwrap().file_items()[usize::from(row - 2)];
+                        let format = if modified_width == 16 {
+                            "%Y-%m-%d %H:%M"
+                        } else {
+                            "%Y-%m-%d"
+                        };
+                        let modified = item.last_modified.unwrap().format(format).to_string();
+                        assert_eq!(
+                            cell_text(list_width - 1 - modified_width, list_width - 1, row),
+                            modified,
+                        );
+                    }
                 }
                 assert_eq!(
-                    buffer[(list_width - 2, 1)].symbol(),
-                    " ",
-                    "folder has no size"
+                    cell_text(size_end - 6, list_width - 1, 2).trim(),
+                    "",
+                    "folder summaries stay blank until scanned"
                 );
             }
         }
@@ -4238,6 +4281,57 @@ mod tests {
             assert_eq!(item_names(&app), ["b", "c", "a", "f.txt"], "{base:?}");
         }
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn folder_columns_reuse_recursive_sort_statistics() {
+        let (_dir, mut app) = folder_sort_test_app("").await;
+        assert!(
+            app.browsing()
+                .unwrap()
+                .file_items()
+                .iter()
+                .all(|item| item.blob_count.is_none())
+        );
+        assert!(!app.tasks.is_running());
+
+        app.apply_sort(SortCriteria::DateModified);
+        settle(&mut app).await;
+        app.apply_sort(SortCriteria::Name);
+        let items = app.browsing().unwrap().file_items();
+        assert_eq!(
+            items.iter().map(|item| item.blob_count).collect::<Vec<_>>(),
+            [Some(1), Some(2), Some(1), None]
+        );
+        assert_eq!(
+            items[1].last_modified.unwrap(),
+            Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap()
+        );
+        app.ui.preview = super::PreviewPanel::Hidden;
+        let text = rendered(&app);
+        assert!(text.contains("1 blob "));
+        assert!(text.contains("2 blobs"));
+        assert!(text.contains("2024-01-01 00:00"));
+    }
+
+    #[tokio::test]
+    async fn name_sorted_navigation_reuses_folder_summaries_without_scanning() {
+        let (gate, mut app) = gated_app().await;
+        assert!(app.browsing().unwrap().file_items()[0].blob_count.is_none());
+        gate.add_permits(1);
+        app.apply_sort(SortCriteria::Size);
+        settle(&mut app).await;
+        app.apply_sort(SortCriteria::Name);
+
+        // Only the two directory listings may access the store.
+        gate.add_permits(2);
+        app.enter_directory();
+        settle(&mut app).await;
+        app.go_up_directory();
+        settle(&mut app).await;
+        assert_eq!(app.browsing().unwrap().file_items()[0].blob_count, Some(1));
+        assert_eq!(gate.available_permits(), 0);
+        assert!(!app.tasks.is_running());
     }
 
     #[tokio::test]

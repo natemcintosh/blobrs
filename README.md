@@ -64,6 +64,11 @@ grant blob data access.
 - Favorites are saved per storage account in `$XDG_DATA_HOME/blobrs/favorites.json`
   (defaulting to `~/.local/share/blobrs/favorites.json`). Finish searching
   with Enter before pressing `f` to toggle a favorite.
+- The file list shows names, file sizes, and last-modified times in UTC. Narrow
+  panes show just the date or hide that column to leave room for names.
+  Folder blob counts (including nested folders) and newest-blob times appear
+  when a date/size sort has loaded them. Normal browsing does not scan folders
+  for these summaries, since recursive listings can be slow for large folders.
 - Uploads use the local filename and never overwrite existing blobs. Uploads
   read the file into memory and run in the background.
 - Network operations show activity in the command bar. While an operation runs,
