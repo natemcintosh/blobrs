@@ -32,6 +32,17 @@ fn panel() -> Block<'static> {
         .title_style(Style::default().fg(ACCENT).add_modifier(Modifier::BOLD))
 }
 
+fn focus_panel(focused: bool) -> Block<'static> {
+    if focused {
+        panel()
+            .border_type(BorderType::Double)
+            .border_style(Style::default().fg(ACCENT))
+            .title_bottom(" Focused ")
+    } else {
+        panel().title_style(Style::default().fg(MUTED))
+    }
+}
+
 fn selection() -> Style {
     Style::default()
         .bg(SURFACE)
@@ -469,10 +480,9 @@ impl App {
             .column_spacing(FILE_LIST_COLUMN_SPACING)
             .header(Row::new(headings).style(Style::default().fg(MUTED).bold()))
             .block(
-                panel()
+                focus_panel(self.ui.preview != PreviewPanel::Focused)
                     .title(title)
-                    .title_alignment(Alignment::Left)
-                    .border_type(BorderType::Rounded),
+                    .title_alignment(Alignment::Left),
             )
             .fg(TEXT)
             .row_highlight_style(selection())
@@ -527,6 +537,10 @@ impl App {
         command_bar.render(chunks[chunk_index], buf);
     }
 
+    fn preview_panel(&self) -> Block<'static> {
+        focus_panel(self.ui.preview == PreviewPanel::Focused)
+    }
+
     /// Render the selected folder's shortcuts or the selected file's contents.
     fn render_preview_panel(&self, area: Rect, buf: &mut Buffer) {
         if self.ui.preview == PreviewPanel::Browsing {
@@ -546,7 +560,7 @@ impl App {
             };
             if let Some(lines) = overview {
                 Paragraph::new(lines)
-                    .block(panel().title(" Preview "))
+                    .block(self.preview_panel().title(" Preview "))
                     .fg(TEXT)
                     .wrap(Wrap { trim: false })
                     .render(area, buf);
@@ -574,10 +588,9 @@ impl App {
         {
             let loading = Paragraph::new(format!("{} Loading preview...", self.icons.loading))
                 .block(
-                    panel()
+                    self.preview_panel()
                         .title(format!(" {file_type_name} Preview "))
-                        .title_alignment(Alignment::Left)
-                        .border_type(BorderType::Rounded),
+                        .title_alignment(Alignment::Left),
                 )
                 .fg(MUTED)
                 .alignment(Alignment::Center);
@@ -589,10 +602,9 @@ impl App {
         if let Some(error) = &self.preview_error {
             let error_widget = Paragraph::new(format!("{} {}", self.icons.error, error))
                 .block(
-                    panel()
+                    self.preview_panel()
                         .title(format!(" {file_type_name} Preview "))
-                        .title_alignment(Alignment::Left)
-                        .border_type(BorderType::Rounded),
+                        .title_alignment(Alignment::Left),
                 )
                 .fg(DANGER)
                 .wrap(Wrap { trim: true })
@@ -618,10 +630,9 @@ impl App {
             None => {
                 let empty = Paragraph::new("No preview data available")
                     .block(
-                        panel()
+                        self.preview_panel()
                             .title(format!(" {file_type_name} Preview "))
-                            .title_alignment(Alignment::Left)
-                            .border_type(BorderType::Rounded),
+                            .title_alignment(Alignment::Left),
                     )
                     .fg(MUTED)
                     .alignment(Alignment::Center);
@@ -663,10 +674,9 @@ impl App {
         if num_cols == 0 {
             let empty = Paragraph::new("Empty table")
                 .block(
-                    panel()
+                    self.preview_panel()
                         .title(format!(" {row_info} "))
-                        .title_alignment(Alignment::Left)
-                        .border_type(BorderType::Rounded),
+                        .title_alignment(Alignment::Left),
                 )
                 .fg(MUTED)
                 .alignment(Alignment::Center);
@@ -792,10 +802,9 @@ impl App {
         let table = Table::new(rows, constraints)
             .header(header_row)
             .block(
-                panel()
+                self.preview_panel()
                     .title(title)
-                    .title_alignment(Alignment::Left)
-                    .border_type(BorderType::Rounded),
+                    .title_alignment(Alignment::Left),
             )
             .row_highlight_style(selection());
 
@@ -857,10 +866,9 @@ impl App {
 
         let json_widget = Paragraph::new(visible_content)
             .block(
-                panel()
+                self.preview_panel()
                     .title(title)
-                    .title_alignment(Alignment::Left)
-                    .border_type(BorderType::Rounded),
+                    .title_alignment(Alignment::Left),
             )
             .fg(TEXT)
             .wrap(Wrap { trim: false });
@@ -917,10 +925,9 @@ impl App {
 
         let text_widget = Paragraph::new(visible_content)
             .block(
-                panel()
+                self.preview_panel()
                     .title(title)
-                    .title_alignment(Alignment::Left)
-                    .border_type(BorderType::Rounded),
+                    .title_alignment(Alignment::Left),
             )
             .fg(TEXT)
             .wrap(Wrap { trim: false });
@@ -983,10 +990,9 @@ impl App {
         let text = Text::from(visible_lines);
 
         let schema_widget = Paragraph::new(text).block(
-            panel()
+            self.preview_panel()
                 .title(title)
-                .title_alignment(Alignment::Left)
-                .border_type(BorderType::Rounded),
+                .title_alignment(Alignment::Left),
         );
 
         schema_widget.render(area, buf);

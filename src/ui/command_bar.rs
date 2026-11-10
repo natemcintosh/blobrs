@@ -180,7 +180,14 @@ impl App {
                         Hint::new("/", "Search"),
                         Hint::new("s", "Sort"),
                         Hint::new("i", "Info"),
-                        Hint::new("p", "Preview"),
+                        Hint::new(
+                            "p",
+                            if self.ui.preview == PreviewPanel::Browsing {
+                                "Focus preview"
+                            } else {
+                                "Preview"
+                            },
+                        ),
                         Hint::new("y", "Copy path"),
                         Hint::new("d", "Download"),
                         Hint::new("u", "Upload"),
