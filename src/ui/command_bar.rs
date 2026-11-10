@@ -2,13 +2,16 @@ use ratatui::{
     buffer::Buffer,
     layout::Rect,
     style::{Modifier, Style},
-    text::{Line, Span, Text},
+    text::{Line, Span},
     widgets::{Paragraph, Widget},
 };
 
 use crate::app::{App, Modal, Session};
 
-use super::{ACCENT, MUTED, SURFACE, TEXT};
+use super::{ACCENT, MUTED, SURFACE, TEXT, panel};
+
+const COMMAND_ROW_HEIGHT: u16 = 3;
+const COMMAND_GAP: usize = 1;
 
 /// A shortcut stays together when the command bar wraps to another row.
 #[derive(Clone, Copy)]
@@ -32,35 +35,46 @@ impl CommandHint {
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled(format!(" {}", self.label), Style::default().fg(TEXT)),
-            Span::raw("  "),
+            Span::raw(" "),
         ]
     }
 }
 
 pub(super) struct CommandBar {
-    commands: Vec<Line<'static>>,
+    commands: Vec<Vec<Line<'static>>>,
     status: Option<String>,
 }
 
 impl CommandBar {
     fn new(hints: &[CommandHint], width: u16, status: Option<String>) -> Self {
         let mut commands = Vec::new();
-        let mut line = Line::default();
+        let mut row = Vec::new();
+        let mut row_width = 0;
         for hint in hints {
-            let spans = hint.spans();
-            let hint_width: usize = spans.iter().map(Span::width).sum();
-            if !line.spans.is_empty() && line.width() + hint_width > usize::from(width) {
-                commands.push(line);
-                line = Line::default();
+            let line = Line::from(Vec::from(hint.spans()));
+            let hint_width = line.width() + 2; // Left and right borders.
+            if !row.is_empty() && row_width + COMMAND_GAP + hint_width > usize::from(width) {
+                commands.push(row);
+                row = Vec::new();
+                row_width = 0;
             }
-            line.spans.extend(spans);
+            if !row.is_empty() {
+                row_width += COMMAND_GAP;
+            }
+            row_width += hint_width;
+            row.push(line);
         }
-        commands.push(line);
+        if !row.is_empty() {
+            commands.push(row);
+        }
         Self { commands, status }
     }
 
     pub(super) fn height(&self) -> u16 {
-        u16::try_from(self.commands.len() + usize::from(self.status.is_some())).unwrap_or(u16::MAX)
+        u16::try_from(self.commands.len())
+            .unwrap_or(u16::MAX)
+            .saturating_mul(COMMAND_ROW_HEIGHT)
+            .saturating_add(u16::from(self.status.is_some()))
     }
 }
 
@@ -78,14 +92,29 @@ impl Widget for CommandBar {
                     buf,
                 );
         }
-        Paragraph::new(Text::from(self.commands)).render(
-            Rect {
-                y: area.y.saturating_add(status_height),
-                height: area.height.saturating_sub(status_height),
-                ..area
-            },
-            buf,
-        );
+        let mut y = area.y.saturating_add(status_height);
+        for row in self.commands {
+            if y >= area.bottom() {
+                break;
+            }
+            let mut x = area.x;
+            for command in row {
+                let width = u16::try_from(command.width() + 2)
+                    .unwrap_or(u16::MAX)
+                    .min(area.right().saturating_sub(x));
+                let command_area = Rect::new(
+                    x,
+                    y,
+                    width,
+                    COMMAND_ROW_HEIGHT.min(area.bottom().saturating_sub(y)),
+                );
+                Paragraph::new(command)
+                    .block(panel())
+                    .render(command_area, buf);
+                x = x.saturating_add(width).saturating_add(1);
+            }
+            y = y.saturating_add(COMMAND_ROW_HEIGHT);
+        }
     }
 }
 
@@ -183,9 +212,12 @@ mod tests {
         for width in [24, 40, 80, 120] {
             let bar = CommandBar::new(&hints, width, None);
             assert!(
-                bar.commands
+                bar.commands.iter().all(|row| row
                     .iter()
-                    .all(|line| line.width() <= usize::from(width))
+                    .map(|line| line.width() + 2)
+                    .sum::<usize>()
+                    + row.len().saturating_sub(1)
+                    <= usize::from(width))
             );
             let area = Rect::new(3, 2, width, bar.height());
             let mut buffer = Buffer::empty(area);
@@ -197,7 +229,7 @@ mod tests {
                 .collect();
             for hint in hints {
                 assert!(
-                    text.contains(&format!(" {}  {}", hint.key, hint.label)),
+                    text.contains(&format!("│ {}  {} │", hint.key, hint.label)),
                     "{text}"
                 );
             }
