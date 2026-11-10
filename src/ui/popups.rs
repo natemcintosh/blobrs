@@ -1,7 +1,7 @@
 use ratatui::{
     buffer::Buffer,
     layout::{Constraint, Layout, Rect},
-    style::{Color, Modifier, Style},
+    style::{Modifier, Style},
     text::{Line, Span},
     widgets::{Clear, Padding, Paragraph, Widget, Wrap},
 };
@@ -9,13 +9,10 @@ use ratatui::{
 use crate::app::{App, BlobInfo};
 
 use super::{
-    ACCENT, MUTED, SURFACE, TEXT,
+    ACCENT, BACKGROUND, DANGER, MUTED, SURFACE, TEXT,
     command_bar::{CommandBar, CommandHint as Hint},
-    format_bytes, panel, truncate_with_ellipsis,
+    detail, format_bytes, panel, truncate_with_ellipsis,
 };
-
-const BACKGROUND: Color = Color::Rgb(22, 31, 43);
-const DANGER: Color = Color::Rgb(232, 139, 139);
 
 /// Clear the underlying view and reserve space for the same boxed shortcuts as
 /// the main command bar. The returned body stays inside the padded panel.
@@ -54,13 +51,6 @@ fn popup(
     .areas(inner);
     commands.render(footer, buf);
     body
-}
-
-fn detail(label: &str, value: impl Into<String>) -> Line<'static> {
-    Line::from(vec![
-        Span::styled(format!("{label}: "), Style::default().fg(MUTED)),
-        Span::styled(value.into(), Style::default().fg(TEXT)),
-    ])
 }
 
 /// Show the end of an input without slicing UTF-8 or hiding the cursor. Ratatui

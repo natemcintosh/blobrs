@@ -20,6 +20,9 @@ const MUTED: Color = Color::Rgb(145, 157, 174);
 const BORDER: Color = Color::Rgb(80, 94, 112);
 const ACCENT: Color = Color::Rgb(125, 195, 232);
 const SURFACE: Color = Color::Rgb(36, 49, 65);
+const BACKGROUND: Color = Color::Rgb(22, 31, 43);
+const DANGER: Color = Color::Rgb(232, 139, 139);
+const SUCCESS: Color = Color::Rgb(151, 201, 163);
 const FILE_LIST_COLUMN_SPACING: u16 = 3;
 
 fn panel() -> Block<'static> {
@@ -34,6 +37,36 @@ fn selection() -> Style {
         .bg(SURFACE)
         .fg(ACCENT)
         .add_modifier(Modifier::BOLD)
+}
+
+fn detail(label: &str, value: impl Into<String>) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(format!("{label}: "), Style::default().fg(MUTED)),
+        Span::styled(value.into(), Style::default().fg(TEXT)),
+    ])
+}
+
+#[derive(Clone, Copy)]
+enum MessageKind {
+    Error,
+    Success,
+}
+
+fn render_message(area: Rect, buf: &mut Buffer, kind: MessageKind, icon: &str, message: &str) {
+    let (title, color) = match kind {
+        MessageKind::Error => (" Error ", DANGER),
+        MessageKind::Success => (" Success ", SUCCESS),
+    };
+    Paragraph::new(format!("{icon} {message}"))
+        .block(
+            panel()
+                .title(title)
+                .border_style(Style::default().fg(color))
+                .title_style(Style::default().fg(color).bold()),
+        )
+        .fg(TEXT)
+        .wrap(Wrap { trim: true })
+        .render(area, buf);
 }
 
 fn file_list_size(item: &FileItem) -> String {
@@ -219,7 +252,7 @@ impl App {
                         .title(" Filter containers ")
                         .border_type(BorderType::Rounded),
                 )
-                .fg(Color::Cyan)
+                .fg(ACCENT)
                 .alignment(Alignment::Left);
             search_widget.render(chunks[chunk_index], buf);
             chunk_index += 1;
@@ -227,26 +260,22 @@ impl App {
 
         // Error/success message if present
         if let Some(error) = &self.error_message {
-            let error_widget = Paragraph::new(format!(
-                "{error_icon} {error}",
-                error_icon = self.icons.error
-            ))
-            .block(panel().border_type(BorderType::Rounded))
-            .fg(Color::Red)
-            .wrap(ratatui::widgets::Wrap { trim: true })
-            .alignment(Alignment::Left);
-            error_widget.render(chunks[chunk_index], buf);
+            render_message(
+                chunks[chunk_index],
+                buf,
+                MessageKind::Error,
+                self.icons.error,
+                error,
+            );
             chunk_index += 1;
         } else if let Some(success) = &self.success_message {
-            let success_widget = Paragraph::new(format!(
-                "{success_icon} {success}",
-                success_icon = self.icons.success
-            ))
-            .block(panel().border_type(BorderType::Rounded))
-            .fg(Color::Green)
-            .wrap(ratatui::widgets::Wrap { trim: true })
-            .alignment(Alignment::Left);
-            success_widget.render(chunks[chunk_index], buf);
+            render_message(
+                chunks[chunk_index],
+                buf,
+                MessageKind::Success,
+                self.icons.success,
+                success,
+            );
             chunk_index += 1;
         }
 
@@ -468,7 +497,7 @@ impl App {
                         .title(" Filter files ")
                         .border_type(BorderType::Rounded),
                 )
-                .fg(Color::Cyan)
+                .fg(ACCENT)
                 .alignment(Alignment::Left);
             search_widget.render(chunks[chunk_index], buf);
             chunk_index += 1;
@@ -476,26 +505,22 @@ impl App {
 
         // Error/Success/Loading message if present
         if let Some(error) = &self.error_message {
-            let error_widget = Paragraph::new(format!(
-                "{error_icon} {error}",
-                error_icon = self.icons.error
-            ))
-            .block(panel().border_type(BorderType::Rounded))
-            .fg(Color::Red)
-            .wrap(ratatui::widgets::Wrap { trim: true })
-            .alignment(Alignment::Left);
-            error_widget.render(chunks[chunk_index], buf);
+            render_message(
+                chunks[chunk_index],
+                buf,
+                MessageKind::Error,
+                self.icons.error,
+                error,
+            );
             chunk_index += 1;
         } else if let Some(success) = &self.success_message {
-            let success_widget = Paragraph::new(format!(
-                "{success_icon} {success}",
-                success_icon = self.icons.success
-            ))
-            .block(panel().border_type(BorderType::Rounded))
-            .fg(Color::Green)
-            .wrap(ratatui::widgets::Wrap { trim: true })
-            .alignment(Alignment::Left);
-            success_widget.render(chunks[chunk_index], buf);
+            render_message(
+                chunks[chunk_index],
+                buf,
+                MessageKind::Success,
+                self.icons.success,
+                success,
+            );
             chunk_index += 1;
         }
 
@@ -554,7 +579,7 @@ impl App {
                         .title_alignment(Alignment::Left)
                         .border_type(BorderType::Rounded),
                 )
-                .fg(Color::Yellow)
+                .fg(MUTED)
                 .alignment(Alignment::Center);
             loading.render(area, buf);
             return;
@@ -569,7 +594,7 @@ impl App {
                         .title_alignment(Alignment::Left)
                         .border_type(BorderType::Rounded),
                 )
-                .fg(Color::Red)
+                .fg(DANGER)
                 .wrap(Wrap { trim: true })
                 .alignment(Alignment::Center);
             error_widget.render(area, buf);
@@ -598,7 +623,7 @@ impl App {
                             .title_alignment(Alignment::Left)
                             .border_type(BorderType::Rounded),
                     )
-                    .fg(Color::DarkGray)
+                    .fg(MUTED)
                     .alignment(Alignment::Center);
                 empty.render(area, buf);
             }
@@ -643,7 +668,7 @@ impl App {
                         .title_alignment(Alignment::Left)
                         .border_type(BorderType::Rounded),
                 )
-                .fg(Color::DarkGray)
+                .fg(MUTED)
                 .alignment(Alignment::Center);
             empty.render(area, buf);
             return;
@@ -718,11 +743,8 @@ impl App {
             .visible_indices
             .iter()
             .map(|idx| {
-                Cell::from(table_data.headers.get(*idx).cloned().unwrap_or_default()).style(
-                    Style::default()
-                        .fg(Color::Cyan)
-                        .add_modifier(Modifier::BOLD),
-                )
+                Cell::from(table_data.headers.get(*idx).cloned().unwrap_or_default())
+                    .style(Style::default().fg(ACCENT).add_modifier(Modifier::BOLD))
             })
             .collect();
 
@@ -735,11 +757,7 @@ impl App {
                 .map(|idx| Cell::from(column_types.get(*idx).cloned().unwrap_or_default()))
                 .collect();
 
-            Row::new(type_cells).style(
-                Style::default()
-                    .fg(Color::DarkGray)
-                    .add_modifier(Modifier::ITALIC),
-            )
+            Row::new(type_cells).style(Style::default().fg(MUTED).add_modifier(Modifier::ITALIC))
         });
 
         // Build data rows with scroll offset
@@ -757,7 +775,7 @@ impl App {
                 let style = if row_idx == self.preview_selected_row {
                     selection()
                 } else {
-                    Style::default().fg(Color::White)
+                    Style::default().fg(TEXT)
                 };
 
                 Row::new(cells).style(style).height(1)
@@ -844,7 +862,7 @@ impl App {
                     .title_alignment(Alignment::Left)
                     .border_type(BorderType::Rounded),
             )
-            .fg(Color::White)
+            .fg(TEXT)
             .wrap(Wrap { trim: false });
 
         json_widget.render(area, buf);
@@ -904,7 +922,7 @@ impl App {
                     .title_alignment(Alignment::Left)
                     .border_type(BorderType::Rounded),
             )
-            .fg(Color::White)
+            .fg(TEXT)
             .wrap(Wrap { trim: false });
 
         text_widget.render(area, buf);
@@ -920,92 +938,42 @@ impl App {
     ) {
         let title = format!(" Parquet Metadata ({} columns) ", schema_data.fields.len());
 
-        // Build metadata section
-        let mut lines: Vec<Line> = Vec::new();
-
-        // File metadata header
-        lines.push(Line::from(vec![
-            Span::styled(
-                "── Metadata ",
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled("─".repeat(30), Style::default().fg(Color::DarkGray)),
-        ]));
-        lines.push(Line::from(""));
+        let mut lines = vec![
+            Line::styled("Metadata", Style::default().fg(ACCENT).bold()),
+            Line::default(),
+        ];
 
         if let Some(note) = &schema_data.note {
-            lines.push(Line::from(vec![
-                Span::styled("  Note: ", Style::default().fg(Color::Yellow)),
-                Span::styled(note.clone(), Style::default().fg(Color::White)),
-            ]));
-            lines.push(Line::from(""));
+            lines.push(detail("Note", note.clone()));
+            lines.push(Line::default());
         }
 
-        // Row count
-        lines.push(Line::from(vec![
-            Span::styled("  Rows:        ", Style::default().fg(Color::Yellow)),
-            Span::styled(
-                format_number(schema_data.num_rows.cast_unsigned()),
-                Style::default().fg(Color::White),
-            ),
-        ]));
-
-        // Row groups
-        lines.push(Line::from(vec![
-            Span::styled("  Row Groups:  ", Style::default().fg(Color::Yellow)),
-            Span::styled(
-                schema_data.num_row_groups.to_string(),
-                Style::default().fg(Color::White),
-            ),
-        ]));
-
-        // File size (if known)
+        lines.push(detail(
+            "Rows",
+            format_number(schema_data.num_rows.cast_unsigned()),
+        ));
+        lines.push(detail("Row Groups", schema_data.num_row_groups.to_string()));
         if let Some(size) = schema_data.file_size {
-            lines.push(Line::from(vec![
-                Span::styled("  File Size:   ", Style::default().fg(Color::Yellow)),
-                Span::styled(format_bytes(size), Style::default().fg(Color::White)),
-            ]));
+            lines.push(detail("File Size", format_bytes(size)));
+        }
+        if let Some(created_by) = &schema_data.created_by {
+            lines.push(detail("Created By", created_by.clone()));
         }
 
-        // Created by (if known)
-        if let Some(ref created_by) = schema_data.created_by {
-            lines.push(Line::from(vec![
-                Span::styled("  Created By:  ", Style::default().fg(Color::Yellow)),
-                Span::styled(created_by.clone(), Style::default().fg(Color::White)),
-            ]));
-        }
-
-        lines.push(Line::from(""));
-
-        // Schema header
-        lines.push(Line::from(vec![
-            Span::styled(
-                "── Schema ",
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled("─".repeat(31), Style::default().fg(Color::DarkGray)),
-        ]));
-        lines.push(Line::from(""));
-
-        // Schema fields
+        lines.extend([
+            Line::default(),
+            Line::styled("Schema", Style::default().fg(ACCENT).bold()),
+            Line::default(),
+        ]);
         for field in &schema_data.fields {
-            // Parse the field into name and type
             if let Some((name, type_str)) = field.split_once(": ") {
                 lines.push(Line::from(vec![
-                    Span::styled("  ", Style::default()),
-                    Span::styled(name.to_string(), Style::default().fg(Color::Green)),
-                    Span::styled(": ", Style::default().fg(Color::DarkGray)),
-                    Span::styled(type_str.to_string(), Style::default().fg(Color::Magenta)),
+                    Span::styled(name.to_string(), Style::default().fg(TEXT)),
+                    Span::styled(": ", Style::default().fg(MUTED)),
+                    Span::styled(type_str.to_string(), Style::default().fg(MUTED)),
                 ]));
             } else {
-                lines.push(Line::from(vec![
-                    Span::styled("  ", Style::default()),
-                    Span::styled(field.clone(), Style::default().fg(Color::White)),
-                ]));
+                lines.push(Line::styled(field.clone(), Style::default().fg(TEXT)));
             }
         }
 
