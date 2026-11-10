@@ -192,6 +192,17 @@ impl App {
                 },
             }
         };
+        if matches!(self.session, Session::Browsing(_))
+            && matches!(self.modal, Modal::None)
+            && !self.is_searching_files()
+            && !self.tasks.is_running()
+            && self.ui.preview == PreviewPanel::Browsing
+            && self.preview_file_type == Some(crate::preview::PreviewFileType::Parquet)
+        {
+            let mut hints = hints.to_vec();
+            hints.push(Hint::new("Tab", "Table/metadata"));
+            return CommandBar::new(&hints, width, None);
+        }
         CommandBar::new(hints, width, self.tasks.status())
     }
 }

@@ -660,6 +660,12 @@ impl App {
             }
 
             match key_event.code {
+                KeyCode::Tab
+                    if self.ui.preview == PreviewPanel::Browsing
+                        && matches!(self.modal, Modal::None) =>
+                {
+                    self.toggle_parquet_preview_mode();
+                }
                 KeyCode::Char('/') => {
                     if !self.is_modal_blob_info() {
                         self.enter_search_mode();
@@ -3806,6 +3812,7 @@ mod tests {
             ("empty.txt", Vec::new()),
             ("résumé-with-a-very-long-name.txt", vec![b'x'; 1536]),
             ("data.json", br#"[{"name":"example","count":42}]"#.to_vec()),
+            ("table.parquet", parquet_preview_bytes()),
         ] {
             store
                 .put(&ObjectPath::from(format!("parent/{name}")), data.into())
@@ -3818,6 +3825,68 @@ mod tests {
         let result = app.run(&mut terminal).await;
         ratatui::restore();
         result.unwrap();
+    }
+
+    fn parquet_preview_bytes() -> Vec<u8> {
+        use arrow::{array::Int32Array, record_batch::RecordBatch};
+        let batch = RecordBatch::try_from_iter([(
+            "value",
+            Arc::new(Int32Array::from(vec![42])) as arrow::array::ArrayRef,
+        )])
+        .unwrap();
+        let mut bytes = Vec::new();
+        let mut writer =
+            parquet::arrow::ArrowWriter::try_new(&mut bytes, batch.schema(), None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+        bytes
+    }
+
+    #[tokio::test]
+    async fn tab_switches_automatic_parquet_preview_without_taking_list_focus() {
+        let (_dir, mut app) = navigation_test_app().await;
+        let store = app.browsing().unwrap().object_store.clone();
+        store
+            .put(
+                &ObjectPath::from("parent/table.parquet"),
+                parquet_preview_bytes().into(),
+            )
+            .await
+            .unwrap();
+        app.refresh_files();
+        settle(&mut app).await;
+        app.browsing_mut().unwrap().selected_index = 2;
+        app.sync_preview();
+        let message = app.preview_tasks.recv().await.unwrap();
+        if let Some(super::TaskEvent::PreviewLoaded(preview)) = app.preview_tasks.accept(message) {
+            app.install_preview(*preview);
+        }
+        assert_eq!(app.parquet_preview_mode, Some(ParquetPreviewMode::Table));
+        assert!(rendered(&app).contains("Table/metadata"));
+        for expected in [ParquetPreviewMode::Metadata, ParquetPreviewMode::Table] {
+            app.handle_key_event(KeyEvent::from(KeyCode::Tab)).unwrap();
+            assert_eq!(app.parquet_preview_mode, Some(expected));
+            app.sync_preview();
+            assert_eq!(
+                app.parquet_preview_mode,
+                Some(expected),
+                "redraw preserves mode"
+            );
+            assert!(!app.tasks.is_running());
+            assert!(!app.preview_tasks.is_running());
+            assert_eq!(app.ui.preview, super::PreviewPanel::Browsing);
+        }
+        app.modal = Modal::SortPicker;
+        app.handle_key_event(KeyEvent::from(KeyCode::Tab)).unwrap();
+        assert_eq!(app.parquet_preview_mode, Some(ParquetPreviewMode::Table));
+        assert!(!rendered(&app).contains("Table/metadata"));
+        app.close_modal();
+        app.handle_key_event(KeyEvent::from(KeyCode::Char('k')))
+            .unwrap();
+        app.sync_preview();
+        assert_eq!(app.browsing().unwrap().selected_index, 1);
+        assert_eq!(app.parquet_preview_mode, None);
+        assert!(!rendered(&app).contains("Table/metadata"));
     }
 
     #[tokio::test]
