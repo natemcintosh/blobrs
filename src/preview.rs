@@ -1,10 +1,13 @@
 //! Preview module for displaying CSV, TSV, JSON, Parquet, and text file contents.
 
-use std::io::Cursor;
+use std::{io::Cursor, sync::Arc};
 
 use bytes::Bytes;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::file::reader::{FileReader, SerializedFileReader};
+
+mod parquet_paged;
+pub use parquet_paged::{PARQUET_PAGE_ROWS, ParquetFilePreview, ParquetPage, SharedParquetFile};
 
 /// Maximum bytes to download for preview (50KB)
 pub const MAX_PREVIEW_BYTES: usize = 50 * 1024;
@@ -12,11 +15,35 @@ pub const MAX_PREVIEW_BYTES: usize = 50 * 1024;
 /// Maximum bytes to download for Parquet preview (1MB - parquet is compressed)
 pub const MAX_PARQUET_PREVIEW_BYTES: usize = 1024 * 1024;
 
-/// Maximum bytes to download for full Parquet table preview (16MB)
+/// Maximum bytes to download for automatic Parquet table preview (16MB)
 pub const MAX_PARQUET_TABLE_PREVIEW_BYTES: usize = 16 * 1024 * 1024;
 
 /// Maximum rows to display in table preview
 pub const MAX_PREVIEW_ROWS: usize = 100;
+
+/// Whether to keep automatic preview limits or load every byte and row.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum PreviewScope {
+    #[default]
+    Limited,
+    Full,
+}
+
+impl PreviewScope {
+    fn row_limit(self) -> usize {
+        match self {
+            Self::Limited => MAX_PREVIEW_ROWS,
+            Self::Full => usize::MAX,
+        }
+    }
+
+    fn line_limit(self) -> usize {
+        match self {
+            Self::Limited => MAX_PREVIEW_ROWS * 2,
+            Self::Full => usize::MAX,
+        }
+    }
+}
 
 /// Supported file types for preview
 #[derive(Debug, Clone, PartialEq)]
@@ -213,7 +240,7 @@ impl PreviewFileType {
 #[derive(Debug, Clone)]
 pub enum PreviewData {
     /// Tabular data (CSV, TSV, or JSON array of objects)
-    Table(TablePreview),
+    Table(Arc<TablePreview>),
     /// Pretty-printed JSON (for non-array JSON)
     Json(JsonPreview),
     /// Generic text file
@@ -284,14 +311,14 @@ pub struct ParquetSchemaPreview {
 
 /// Parse CSV data from bytes
 #[allow(clippy::missing_errors_doc)]
-pub fn parse_csv(data: &[u8]) -> Result<PreviewData, String> {
-    parse_delimited(data, b',', PreviewFileType::Csv)
+pub fn parse_csv(data: &[u8], scope: PreviewScope) -> Result<PreviewData, String> {
+    parse_delimited(data, b',', PreviewFileType::Csv, scope)
 }
 
 /// Parse TSV data from bytes
 #[allow(clippy::missing_errors_doc)]
-pub fn parse_tsv(data: &[u8]) -> Result<PreviewData, String> {
-    parse_delimited(data, b'\t', PreviewFileType::Tsv)
+pub fn parse_tsv(data: &[u8], scope: PreviewScope) -> Result<PreviewData, String> {
+    parse_delimited(data, b'\t', PreviewFileType::Tsv, scope)
 }
 
 /// Parse delimited data (CSV or TSV)
@@ -299,6 +326,7 @@ fn parse_delimited(
     data: &[u8],
     delimiter: u8,
     file_type: PreviewFileType,
+    scope: PreviewScope,
 ) -> Result<PreviewData, String> {
     let cursor = Cursor::new(data);
     let mut reader = csv::ReaderBuilder::new()
@@ -322,7 +350,7 @@ fn parse_delimited(
 
     for result in reader.records() {
         total_rows += 1;
-        if rows.len() >= MAX_PREVIEW_ROWS {
+        if rows.len() >= scope.row_limit() {
             truncated = true;
             continue; // Count remaining rows but don't store them
         }
@@ -334,7 +362,7 @@ fn parse_delimited(
             }
             Err(e) => {
                 // Log error but continue with partial data
-                if rows.is_empty() {
+                if rows.is_empty() || scope == PreviewScope::Full {
                     return Err(format!("Failed to parse data: {e}"));
                 }
                 truncated = true;
@@ -343,19 +371,19 @@ fn parse_delimited(
         }
     }
 
-    Ok(PreviewData::Table(TablePreview {
+    Ok(PreviewData::Table(Arc::new(TablePreview {
         headers,
         column_types: None,
         rows,
         total_rows,
         truncated,
         file_type,
-    }))
+    })))
 }
 
 /// Parse JSON data from bytes
 #[allow(clippy::missing_errors_doc)]
-pub fn parse_json(data: &[u8]) -> Result<PreviewData, String> {
+pub fn parse_json(data: &[u8], scope: PreviewScope) -> Result<PreviewData, String> {
     // First, ensure we have valid UTF-8 (truncation might cut mid-character)
     let text = if let Ok(s) = std::str::from_utf8(data) {
         s.to_string()
@@ -372,9 +400,9 @@ pub fn parse_json(data: &[u8]) -> Result<PreviewData, String> {
     if let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) {
         // Check if it's an array of objects (can be displayed as table)
         if let serde_json::Value::Array(arr) = &value
-            && let Some(table) = try_json_array_as_table(arr)
+            && let Some(table) = try_json_array_as_table(arr, scope)
         {
-            return Ok(PreviewData::Table(table));
+            return Ok(PreviewData::Table(Arc::new(table)));
         }
 
         // Fall back to pretty-printed JSON
@@ -382,13 +410,13 @@ pub fn parse_json(data: &[u8]) -> Result<PreviewData, String> {
             .map_err(|e| format!("Failed to format JSON: {e}"))?;
 
         let total_lines = pretty.lines().count();
-        let truncated = total_lines > MAX_PREVIEW_ROWS * 2; // Allow more lines for JSON
+        let truncated = total_lines > scope.line_limit(); // Allow more lines for JSON
 
         // Truncate if too long
         let content = if truncated {
             pretty
                 .lines()
-                .take(MAX_PREVIEW_ROWS * 2)
+                .take(scope.line_limit())
                 .collect::<Vec<_>>()
                 .join("\n")
         } else {
@@ -404,12 +432,12 @@ pub fn parse_json(data: &[u8]) -> Result<PreviewData, String> {
     } else {
         // JSON parsing failed (likely truncated) - show raw content
         let total_lines = text.lines().count();
-        let truncated = true; // We assume it's truncated since parsing failed
+        let truncated = scope == PreviewScope::Limited; // Full downloads can contain invalid JSON.
 
         // Truncate display if too long
-        let content = if total_lines > MAX_PREVIEW_ROWS * 2 {
+        let content = if total_lines > scope.line_limit() {
             text.lines()
-                .take(MAX_PREVIEW_ROWS * 2)
+                .take(scope.line_limit())
                 .collect::<Vec<_>>()
                 .join("\n")
         } else {
@@ -474,7 +502,7 @@ fn is_likely_binary(data: &[u8]) -> bool {
 }
 
 /// Try to convert a JSON array to a table (if it's an array of objects with consistent keys)
-fn try_json_array_as_table(arr: &[serde_json::Value]) -> Option<TablePreview> {
+fn try_json_array_as_table(arr: &[serde_json::Value], scope: PreviewScope) -> Option<TablePreview> {
     if arr.is_empty() {
         return None;
     }
@@ -492,17 +520,21 @@ fn try_json_array_as_table(arr: &[serde_json::Value]) -> Option<TablePreview> {
     // Convert each object to a row
     let mut rows = Vec::new();
     let total_rows = arr.len();
-    let truncated = total_rows > MAX_PREVIEW_ROWS;
+    let truncated = total_rows > scope.row_limit();
 
     for (i, item) in arr.iter().enumerate() {
-        if i >= MAX_PREVIEW_ROWS {
+        if i >= scope.row_limit() {
             break;
         }
 
         if let serde_json::Value::Object(obj) = item {
             let row: Vec<String> = headers
                 .iter()
-                .map(|key| obj.get(key).map(value_to_string).unwrap_or_default())
+                .map(|key| {
+                    obj.get(key)
+                        .map(|value| value_to_string(value, scope))
+                        .unwrap_or_default()
+                })
                 .collect();
             rows.push(row);
         } else {
@@ -522,7 +554,15 @@ fn try_json_array_as_table(arr: &[serde_json::Value]) -> Option<TablePreview> {
 }
 
 /// Convert a JSON value to a display string
-fn value_to_string(value: &serde_json::Value) -> String {
+fn value_to_string(value: &serde_json::Value, scope: PreviewScope) -> String {
+    if scope == PreviewScope::Full
+        && matches!(
+            value,
+            serde_json::Value::Array(_) | serde_json::Value::Object(_)
+        )
+    {
+        return value.to_string();
+    }
     match value {
         serde_json::Value::Null => "null".to_string(),
         serde_json::Value::Bool(b) => b.to_string(),
@@ -534,7 +574,7 @@ fn value_to_string(value: &serde_json::Value) -> String {
                 format!(
                     "[{}]",
                     arr.iter()
-                        .map(value_to_string)
+                        .map(|value| value_to_string(value, scope))
                         .collect::<Vec<_>>()
                         .join(", ")
                 )
@@ -548,7 +588,7 @@ fn value_to_string(value: &serde_json::Value) -> String {
                 format!(
                     "{{{}}}",
                     obj.iter()
-                        .map(|(k, v)| format!("{k}: {}", value_to_string(v)))
+                        .map(|(k, v)| format!("{k}: {}", value_to_string(v, scope)))
                         .collect::<Vec<_>>()
                         .join(", ")
                 )
@@ -561,18 +601,22 @@ fn value_to_string(value: &serde_json::Value) -> String {
 
 /// Parse data based on file type
 #[allow(clippy::missing_errors_doc)]
-pub fn parse_preview(data: &[u8], file_type: &PreviewFileType) -> Result<PreviewData, String> {
+pub fn parse_preview(
+    data: &[u8],
+    file_type: &PreviewFileType,
+    scope: PreviewScope,
+) -> Result<PreviewData, String> {
     match file_type {
-        PreviewFileType::Csv => parse_csv(data),
-        PreviewFileType::Tsv => parse_tsv(data),
-        PreviewFileType::Json => parse_json(data),
+        PreviewFileType::Csv => parse_csv(data, scope),
+        PreviewFileType::Tsv => parse_tsv(data, scope),
+        PreviewFileType::Json => parse_json(data, scope),
         PreviewFileType::Parquet => parse_parquet_schema(data, None),
-        PreviewFileType::Text(ext) => parse_text(data, ext),
+        PreviewFileType::Text(ext) => parse_text(data, ext, scope),
         PreviewFileType::Unsupported => {
             // Last resort: try to detect if it's valid UTF-8 text
             let detected = PreviewFileType::detect_from_content(data);
             if let PreviewFileType::Text(ext) = detected {
-                parse_text(data, &ext)
+                parse_text(data, &ext, scope)
             } else {
                 Err("Cannot preview binary file".to_string())
             }
@@ -582,7 +626,11 @@ pub fn parse_preview(data: &[u8], file_type: &PreviewFileType) -> Result<Preview
 
 /// Parse text data from bytes
 #[allow(clippy::missing_errors_doc)]
-pub fn parse_text(data: &[u8], extension: &str) -> Result<PreviewData, String> {
+pub fn parse_text(
+    data: &[u8],
+    extension: &str,
+    scope: PreviewScope,
+) -> Result<PreviewData, String> {
     // Ensure we have valid UTF-8
     let text = if let Ok(s) = std::str::from_utf8(data) {
         s.to_string()
@@ -597,12 +645,13 @@ pub fn parse_text(data: &[u8], extension: &str) -> Result<PreviewData, String> {
 
     let total_lines = text.lines().count();
     // Check if we likely have truncated content (hit the 50KB limit)
-    let truncated = data.len() >= MAX_PREVIEW_BYTES;
+    let truncated = total_lines > scope.line_limit()
+        || (scope == PreviewScope::Limited && data.len() >= MAX_PREVIEW_BYTES);
 
     // Truncate display if too many lines
-    let content = if total_lines > MAX_PREVIEW_ROWS * 2 {
+    let content = if total_lines > scope.line_limit() {
         text.lines()
-            .take(MAX_PREVIEW_ROWS * 2)
+            .take(scope.line_limit())
             .collect::<Vec<_>>()
             .join("\n")
     } else {
@@ -662,7 +711,7 @@ pub fn parse_parquet_schema(data: &[u8], file_size: Option<u64>) -> Result<Previ
     }))
 }
 
-/// Parse Parquet data as a table preview.
+/// Parse a bounded Parquet table sample from in-memory bytes.
 #[allow(clippy::missing_errors_doc)]
 pub fn parse_parquet_table(data: &[u8]) -> Result<PreviewData, String> {
     let bytes = Bytes::copy_from_slice(data);
@@ -712,14 +761,14 @@ pub fn parse_parquet_table(data: &[u8]) -> Result<PreviewData, String> {
         }
     }
 
-    Ok(PreviewData::Table(TablePreview {
+    Ok(PreviewData::Table(Arc::new(TablePreview {
         headers,
         column_types: Some(column_types),
         rows,
         total_rows,
         truncated: total_rows > MAX_PREVIEW_ROWS,
         file_type: PreviewFileType::Parquet,
-    }))
+    })))
 }
 
 /// Format a Parquet schema type for display
@@ -865,7 +914,7 @@ mod tests {
     #[test]
     fn test_csv_parsing() {
         let csv_data = b"name,age,city\nAlice,30,NYC\nBob,25,LA";
-        let result = parse_csv(csv_data).unwrap();
+        let result = parse_csv(csv_data, PreviewScope::Limited).unwrap();
 
         if let PreviewData::Table(table) = result {
             assert_eq!(table.headers, vec!["name", "age", "city"]);
@@ -879,7 +928,7 @@ mod tests {
     #[test]
     fn test_json_array_as_table() {
         let json_data = br#"[{"name": "Alice", "age": 30}, {"name": "Bob", "age": 25}]"#;
-        let result = parse_json(json_data).unwrap();
+        let result = parse_json(json_data, PreviewScope::Limited).unwrap();
 
         if let PreviewData::Table(table) = result {
             assert_eq!(table.rows.len(), 2);
@@ -891,7 +940,7 @@ mod tests {
     #[test]
     fn test_json_object_as_pretty() {
         let json_data = br#"{"name": "Alice", "details": {"age": 30}}"#;
-        let result = parse_json(json_data).unwrap();
+        let result = parse_json(json_data, PreviewScope::Limited).unwrap();
 
         if let PreviewData::Json(json) = result {
             assert!(json.content.contains("Alice"));
@@ -905,7 +954,7 @@ mod tests {
     fn test_truncated_json_falls_back_to_raw() {
         // Simulate truncated JSON (incomplete array)
         let truncated_json = br#"[{"name": "Alice", "age": 30}, {"name": "Bob""#;
-        let result = parse_json(truncated_json).unwrap();
+        let result = parse_json(truncated_json, PreviewScope::Limited).unwrap();
 
         if let PreviewData::Json(json) = result {
             assert!(json.is_raw); // Should be raw since parsing failed
@@ -924,7 +973,7 @@ mod tests {
         data.push(0xE2); // First byte of '€'
         data.push(0x82); // Second byte of '€' - incomplete!
 
-        let result = parse_json(&data).unwrap();
+        let result = parse_json(&data, PreviewScope::Limited).unwrap();
 
         if let PreviewData::Json(json) = result {
             assert!(json.is_raw); // Should be raw since it's incomplete
@@ -937,7 +986,7 @@ mod tests {
     #[test]
     fn test_text_file_parsing() {
         let text_data = b"Hello, World!\nThis is a test file.\nLine 3.";
-        let result = parse_text(text_data, "TXT").unwrap();
+        let result = parse_text(text_data, "TXT", PreviewScope::Limited).unwrap();
 
         if let PreviewData::Text(text) = result {
             assert_eq!(text.extension, "TXT");
@@ -947,6 +996,58 @@ mod tests {
         } else {
             panic!("Expected text preview");
         }
+    }
+
+    #[test]
+    fn full_json_keeps_nested_values_and_raw_content() {
+        let data = br#"[{"values":[1,2,3,4],"object":{"a":1,"b":2,"c":3}}]"#;
+        let PreviewData::Table(table) = parse_json(data, PreviewScope::Full).unwrap() else {
+            panic!("expected a table");
+        };
+        let values_col = table
+            .headers
+            .iter()
+            .position(|header| header == "values")
+            .unwrap();
+        let object_col = table
+            .headers
+            .iter()
+            .position(|header| header == "object")
+            .unwrap();
+        assert_eq!(table.rows[0][values_col], "[1,2,3,4]");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&table.rows[0][object_col]).unwrap(),
+            serde_json::json!({"a":1,"b":2,"c":3})
+        );
+
+        let raw = format!("{}final invalid JSON", "invalid JSON\n".repeat(300));
+        let PreviewData::Json(json) = parse_json(raw.as_bytes(), PreviewScope::Full).unwrap()
+        else {
+            panic!("expected raw JSON");
+        };
+        assert!(json.is_raw);
+        assert!(!json.truncated);
+        assert_eq!(json.content, raw);
+    }
+
+    #[test]
+    fn text_line_limit_is_reported_even_below_byte_limit() {
+        let data = "line\n".repeat(250);
+        assert!(data.len() < MAX_PREVIEW_BYTES);
+        let PreviewData::Text(limited) =
+            parse_text(data.as_bytes(), "TXT", PreviewScope::Limited).unwrap()
+        else {
+            panic!("expected text");
+        };
+        assert!(limited.truncated);
+        assert_eq!(limited.content.lines().count(), 200);
+        let PreviewData::Text(full) =
+            parse_text(data.as_bytes(), "TXT", PreviewScope::Full).unwrap()
+        else {
+            panic!("expected text");
+        };
+        assert!(!full.truncated);
+        assert_eq!(full.content, data);
     }
 
     #[test]
@@ -962,7 +1063,11 @@ mod tests {
     fn test_unknown_extension_with_text_content() {
         // Unknown extension but valid UTF-8 content
         let text_data = b"Some valid text content";
-        let result = parse_preview(text_data, &PreviewFileType::Unsupported);
+        let result = parse_preview(
+            text_data,
+            &PreviewFileType::Unsupported,
+            PreviewScope::Limited,
+        );
 
         // Should fall back to text detection and succeed
         assert!(result.is_ok());
@@ -977,7 +1082,11 @@ mod tests {
     fn test_unknown_extension_with_binary_content() {
         // Unknown extension with binary content
         let binary_data: &[u8] = &[0x00, 0x01, 0x02, 0xFF, 0xFE];
-        let result = parse_preview(binary_data, &PreviewFileType::Unsupported);
+        let result = parse_preview(
+            binary_data,
+            &PreviewFileType::Unsupported,
+            PreviewScope::Limited,
+        );
 
         // Should fail with binary error
         assert!(result.is_err());
@@ -1098,11 +1207,11 @@ mod tests {
         #[test]
         fn parse_json_handles_arbitrary_valid_json(value in arb_json_value()) {
             let data = serde_json::to_vec(&value).expect("serializing generated JSON should succeed");
-            let preview = parse_json(&data).expect("valid JSON input should parse");
+            let preview = parse_json(&data, PreviewScope::Limited).expect("valid JSON input should parse");
 
             match preview {
                 PreviewData::Table(table) => {
-                    prop_assert_eq!(table.file_type, PreviewFileType::Json);
+                    prop_assert_eq!(&table.file_type, &PreviewFileType::Json);
                     prop_assert!(table.rows.len() <= MAX_PREVIEW_ROWS);
                     prop_assert!(table.total_rows >= table.rows.len());
                     prop_assert!(table.rows.iter().all(|row| row.len() == table.headers.len()));
@@ -1122,7 +1231,7 @@ mod tests {
         fn parse_preview_for_unknown_extension_only_yields_text_or_error(
             data in prop::collection::vec(any::<u8>(), 0..2048)
         ) {
-            let result = parse_preview(&data, &PreviewFileType::Unsupported);
+            let result = parse_preview(&data, &PreviewFileType::Unsupported, PreviewScope::Limited);
             match result {
                 Ok(PreviewData::Text(text)) => {
                     prop_assert_eq!(text.extension, "TEXT");

@@ -2,8 +2,9 @@ use crate::{
     favorites::Favorites,
     preview::{
         MAX_PARQUET_PREVIEW_BYTES, MAX_PARQUET_TABLE_PREVIEW_BYTES, MAX_PREVIEW_BYTES,
-        ParquetSchemaPreview, PreviewData, PreviewFileType, TablePreview, parse_parquet_schema,
-        parse_parquet_table, parse_preview,
+        PARQUET_PAGE_ROWS, ParquetFilePreview, ParquetPage, ParquetSchemaPreview, PreviewData,
+        PreviewFileType, PreviewScope, SharedParquetFile, TablePreview, parse_parquet_schema,
+        parse_preview,
     },
     task::{Reporter, TaskMessage, Tasks},
     terminal_icons::{IconSet, detect_terminal_icons},
@@ -12,7 +13,7 @@ use arboard::Clipboard;
 use chrono::Utc;
 use futures::{Stream, StreamExt, TryStreamExt};
 use object_store::{
-    ObjectStore, ObjectStoreExt,
+    GetOptions, GetRange, ObjectStore, ObjectStoreExt,
     azure::{AzureCredential, AzureCredentialProvider, MicrosoftAzureBuilder},
     path::Path as ObjectPath,
 };
@@ -192,6 +193,7 @@ pub(crate) enum TaskEvent {
         result: color_eyre::Result<HashMap<String, FolderStats>>,
     },
     PreviewLoaded(Box<LoadedPreview>),
+    ParquetPageLoaded(Result<ParquetPage, String>),
     BlobInfo(color_eyre::Result<BlobInfo>),
     ContainersLoaded(Result<Vec<ContainerInfo>, String>),
     /// The native dialog closed; `None` means it was dismissed.
@@ -210,8 +212,9 @@ pub(crate) struct LoadedPreview {
     data: Option<PreviewData>,
     error: Option<String>,
     parquet_mode: Option<ParquetPreviewMode>,
-    parquet_table: Option<TablePreview>,
+    parquet_table: Option<Arc<TablePreview>>,
     parquet_schema: Option<ParquetSchemaPreview>,
+    parquet_file: Option<SharedParquetFile>,
 }
 
 #[derive(Debug, Clone)]
@@ -322,6 +325,8 @@ pub struct App {
     pub preview_data: Option<PreviewData>,
     /// Preview file type.
     pub preview_file_type: Option<PreviewFileType>,
+    /// Download and display limits for the selected file only.
+    pub preview_scope: PreviewScope,
     /// Preview scroll offset (row, column).
     pub preview_scroll: (usize, usize),
     /// Preview error message.
@@ -331,9 +336,13 @@ pub struct App {
     /// Current parquet preview mode, if parquet preview is active.
     pub parquet_preview_mode: Option<ParquetPreviewMode>,
     /// Cached parquet table preview data for fast toggling.
-    pub parquet_table_data: Option<TablePreview>,
+    pub parquet_table_data: Option<Arc<TablePreview>>,
     /// Cached parquet metadata preview data for fast toggling.
     pub parquet_schema_data: Option<ParquetSchemaPreview>,
+    /// Disk-backed Parquet data and the bounded page currently in the table.
+    pub parquet_file: Option<SharedParquetFile>,
+    pub parquet_page_offset: usize,
+    parquet_pending_offset: Option<usize>,
     /// The running background operation, if any, and its result channel.
     pub(crate) tasks: Tasks,
     /// Automatic previews are replaceable and never block file-list actions.
@@ -413,12 +422,16 @@ impl App {
             sort_criteria: SortCriteria::Name,
             preview_data: None,
             preview_file_type: None,
+            preview_scope: PreviewScope::Limited,
             preview_scroll: (0, 0),
             preview_error: None,
             preview_selected_row: 0,
             parquet_preview_mode: None,
             parquet_table_data: None,
             parquet_schema_data: None,
+            parquet_file: None,
+            parquet_page_offset: 0,
+            parquet_pending_offset: None,
             tasks: Tasks::new(),
             preview_tasks: Tasks::new(),
             preview_target: None,
@@ -465,8 +478,8 @@ impl App {
                 },
                 Some(message) = self.tasks.recv() => self.apply_task_message(message),
                 Some(message) = self.preview_tasks.recv() => {
-                    if let Some(TaskEvent::PreviewLoaded(preview)) = self.preview_tasks.accept(message) {
-                        self.install_preview(*preview);
+                    if let Some(event) = self.preview_tasks.accept(message) {
+                        self.install_preview_event(event);
                     }
                 },
                 _ = tick.tick(), if self.tasks.is_running() => self.tasks.advance_spinner(),
@@ -487,8 +500,8 @@ impl App {
                 criteria,
                 result,
             } => self.finish_folder_stats(path, criteria, result),
-            TaskEvent::PreviewLoaded(preview) => {
-                self.install_preview(*preview);
+            event @ (TaskEvent::PreviewLoaded(_) | TaskEvent::ParquetPageLoaded(_)) => {
+                self.install_preview_event(event);
             }
             TaskEvent::BlobInfo(Ok(info)) => self.modal = Modal::BlobInfo { info },
             TaskEvent::BlobInfo(Err(e)) => {
@@ -518,12 +531,35 @@ impl App {
         }
     }
 
+    fn install_preview_event(&mut self, event: TaskEvent) {
+        match event {
+            TaskEvent::PreviewLoaded(preview) => self.install_preview(*preview),
+            TaskEvent::ParquetPageLoaded(result) => {
+                self.parquet_pending_offset = None;
+                match result {
+                    Ok(page) => {
+                        self.parquet_page_offset = page.offset;
+                        if self.parquet_preview_mode == Some(ParquetPreviewMode::Table) {
+                            self.preview_data = Some(PreviewData::Table(page.table.clone()));
+                        }
+                        self.parquet_table_data = Some(page.table);
+                    }
+                    Err(error) => self.preview_error = Some(error),
+                }
+            }
+            _ => unreachable!("preview tasks only produce preview events"),
+        }
+    }
+
     fn install_preview(&mut self, preview: LoadedPreview) {
         self.preview_data = preview.data;
         self.preview_error = preview.error;
         self.parquet_preview_mode = preview.parquet_mode;
         self.parquet_table_data = preview.parquet_table;
         self.parquet_schema_data = preview.parquet_schema;
+        self.parquet_file = preview.parquet_file;
+        self.parquet_page_offset = 0;
+        self.parquet_pending_offset = None;
     }
 
     fn cancel_activity(&mut self) {
@@ -651,6 +687,16 @@ impl App {
                 match key_event.code {
                     KeyCode::Char('p') | KeyCode::Esc | KeyCode::Backspace => self.close_preview(),
                     KeyCode::Tab => self.toggle_parquet_preview_mode(),
+                    KeyCode::Char('f') => self.load_full_preview(),
+                    KeyCode::Home => {
+                        self.preview_selected_row = 0;
+                        self.preview_scroll.0 = 0;
+                        self.ensure_parquet_page();
+                    }
+                    KeyCode::End => {
+                        self.preview_selected_row = self.preview_last_row();
+                        self.ensure_parquet_page();
+                    }
                     KeyCode::Up | KeyCode::Char('k') => self.preview_scroll_up(),
                     KeyCode::Down | KeyCode::Char('j') => self.preview_scroll_down(),
                     KeyCode::Right | KeyCode::Char('l') | KeyCode::Enter => {
@@ -2578,18 +2624,61 @@ impl App {
         self.clear_preview_data();
         self.preview_target = target;
         if self.preview_target.is_some() {
-            self.start_preview(PreviewPanel::Browsing);
+            self.start_preview(PreviewPanel::Browsing, PreviewScope::Limited);
         }
     }
 
     /// Open the preview panel and fetch the selected file's preview.
     pub fn load_preview(&mut self) {
+        let target = self.browsing().and_then(|state| {
+            self.selected_file_item().map(|item| PreviewTarget {
+                container: self.selected_container_index,
+                path: state.current_path().to_owned(),
+                name: item.actual_name.clone(),
+            })
+        });
+        if self.ui.preview == PreviewPanel::Browsing
+            && self.preview_data.is_some()
+            && target == self.preview_target
+        {
+            self.ui.preview = PreviewPanel::Focused;
+            return;
+        }
         self.preview_tasks.cancel();
         self.clear_preview_data();
-        self.start_preview(PreviewPanel::Focused);
+        self.start_preview(PreviewPanel::Focused, PreviewScope::Limited);
     }
 
-    fn start_preview(&mut self, panel: PreviewPanel) {
+    /// Upgrade a focused preview, reusing a cached Parquet download when available.
+    pub fn load_full_preview(&mut self) {
+        if self.ui.preview != PreviewPanel::Focused || self.preview_scope == PreviewScope::Full {
+            return;
+        }
+        if let Some(file) = self.parquet_file.clone() {
+            self.preview_tasks.cancel();
+            self.clear_preview_data();
+            self.preview_file_type = Some(PreviewFileType::Parquet);
+            self.preview_scope = PreviewScope::Full;
+            self.tasks
+                .spawn("Loading full Parquet preview", async move {
+                    let preview = tokio::task::spawn_blocking(move || {
+                        Self::preview_parquet_file(file, PreviewScope::Full)
+                    })
+                    .await
+                    .unwrap_or_else(|e| LoadedPreview {
+                        error: Some(format!("Failed to read preview: {e}")),
+                        ..LoadedPreview::default()
+                    });
+                    TaskEvent::PreviewLoaded(Box::new(preview))
+                });
+            return;
+        }
+        self.preview_tasks.cancel();
+        self.clear_preview_data();
+        self.start_preview(PreviewPanel::Focused, PreviewScope::Full);
+    }
+
+    fn start_preview(&mut self, panel: PreviewPanel, scope: PreviewScope) {
         let (selected_item, current_path, object_store) = match self.browsing() {
             Some(state) => {
                 let Some(item) = self.selected_file_item() else {
@@ -2637,6 +2726,7 @@ impl App {
         };
 
         self.preview_file_type = Some(file_type.clone());
+        self.preview_scope = scope;
         self.ui.preview = panel;
         self.preview_error = None;
         self.preview_data = None;
@@ -2645,154 +2735,233 @@ impl App {
         self.parquet_preview_mode = None;
         self.parquet_table_data = None;
         self.parquet_schema_data = None;
+        self.parquet_file = None;
+        self.parquet_page_offset = 0;
+        self.parquet_pending_offset = None;
 
         let tasks = if panel == PreviewPanel::Focused {
             &mut self.tasks
         } else {
             &mut self.preview_tasks
         };
-        tasks.spawn(format!("Loading preview of {name}"), async move {
+        let label = match scope {
+            PreviewScope::Limited => format!("Loading preview of {name}"),
+            PreviewScope::Full => format!("Loading full preview of {name}"),
+        };
+        tasks.spawn(label, async move {
             TaskEvent::PreviewLoaded(Box::new(
-                Self::fetch_preview(object_store.as_ref(), &object_path, &file_type).await,
+                Self::fetch_preview(object_store.as_ref(), &object_path, &file_type, scope).await,
             ))
         });
     }
 
-    /// Fetch and parse a preview (up to `MAX_PREVIEW_BYTES` for non-Parquet files).
-    #[allow(clippy::too_many_lines)]
+    /// Fetch a bounded automatic preview or the entire selected file.
     async fn fetch_preview(
         object_store: &dyn ObjectStore,
         object_path: &ObjectPath,
         file_type: &PreviewFileType,
+        scope: PreviewScope,
     ) -> LoadedPreview {
-        let mut preview = LoadedPreview::default();
-
-        // For Parquet files, support both table and metadata views.
         if *file_type == PreviewFileType::Parquet {
-            let head_result = object_store.head(object_path).await;
-            match head_result {
-                Ok(meta) => {
-                    let file_size = meta.size;
-                    if file_size <= MAX_PARQUET_TABLE_PREVIEW_BYTES as u64 {
-                        let get_result = object_store.get_range(object_path, 0..file_size).await;
-
-                        match get_result {
-                            Ok(bytes) => {
-                                let table_result = parse_parquet_table(&bytes);
-                                let schema_result = parse_parquet_schema(&bytes, Some(file_size));
-                                let mut table_error: Option<String> = None;
-
-                                match table_result {
-                                    Ok(PreviewData::Table(table)) => {
-                                        preview.parquet_table = Some(table.clone());
-                                        preview.data = Some(PreviewData::Table(table));
-                                        preview.parquet_mode = Some(ParquetPreviewMode::Table);
-                                    }
-                                    Ok(_) => {
-                                        table_error = Some(
-                                            "Unexpected Parquet table preview format".to_string(),
-                                        );
-                                    }
-                                    Err(e) => {
-                                        table_error = Some(e);
-                                    }
-                                }
-
-                                match schema_result {
-                                    Ok(PreviewData::ParquetSchema(mut schema)) => {
-                                        if preview.data.is_none() && table_error.is_some() {
-                                            schema.note.clone_from(&table_error);
-                                        }
-                                        preview.parquet_schema = Some(schema);
-                                    }
-                                    Ok(_) => {
-                                        preview.error = Some(
-                                            "Unexpected Parquet metadata preview format"
-                                                .to_string(),
-                                        );
-                                    }
-                                    Err(e) => {
-                                        preview.error = Some(e);
-                                    }
-                                }
-
-                                if preview.data.is_none() {
-                                    if let Some(schema) = &preview.parquet_schema {
-                                        preview.data =
-                                            Some(PreviewData::ParquetSchema(schema.clone()));
-                                        preview.parquet_mode = Some(ParquetPreviewMode::Metadata);
-                                        preview.error = None;
-                                    } else if preview.error.is_none() {
-                                        preview.error = table_error;
-                                    }
-                                }
-                            }
-                            Err(e) => {
-                                preview.error = Some(format!("Failed to fetch file: {e}"));
-                            }
-                        }
-                    } else {
-                        // Large parquet files: read only footer metadata.
-                        let start = file_size.saturating_sub(MAX_PARQUET_PREVIEW_BYTES as u64);
-                        let get_result =
-                            object_store.get_range(object_path, start..file_size).await;
-
-                        match get_result {
-                            Ok(bytes) => match parse_parquet_schema(&bytes, Some(file_size)) {
-                                Ok(PreviewData::ParquetSchema(mut schema)) => {
-                                    schema.note = Some(
-                                        "Table preview unavailable for files larger than 16 MB"
-                                            .to_string(),
-                                    );
-                                    preview.parquet_schema = Some(schema.clone());
-                                    preview.data = Some(PreviewData::ParquetSchema(schema));
-                                    preview.parquet_mode = Some(ParquetPreviewMode::Metadata);
-                                }
-                                Ok(_) => {
-                                    preview.error = Some(
-                                        "Unexpected Parquet metadata preview format".to_string(),
-                                    );
-                                }
-                                Err(e) => {
-                                    preview.error = Some(e);
-                                }
-                            },
-                            Err(e) => {
-                                preview.error = Some(format!("Failed to fetch file: {e}"));
-                            }
-                        }
-                    }
-                }
-                Err(e) => {
-                    preview.error = Some(format!("Failed to get file info: {e}"));
-                }
-            }
-            return preview;
+            return Self::fetch_parquet_preview(object_store, object_path, scope)
+                .await
+                .unwrap_or_else(|error| LoadedPreview {
+                    error: Some(error),
+                    ..LoadedPreview::default()
+                });
         }
-
-        // For other file types, fetch from the beginning
-        let get_result = object_store
-            .get_range(object_path, 0..(MAX_PREVIEW_BYTES as u64))
-            .await;
-
-        match get_result {
-            Ok(bytes) => {
-                // Parse the data
-                match parse_preview(&bytes, file_type) {
-                    Ok(data) => {
-                        preview.data = Some(data);
-                    }
-                    Err(e) => {
-                        preview.error = Some(e);
+        let options = GetOptions {
+            range: (scope == PreviewScope::Limited)
+                .then_some(GetRange::Bounded(0..MAX_PREVIEW_BYTES as u64)),
+            ..GetOptions::default()
+        };
+        let result = async {
+            let result = object_store.get_opts(object_path, options).await?;
+            let file_size = result.meta.size;
+            Ok::<_, object_store::Error>((result.bytes().await?, file_size))
+        }
+        .await;
+        let (bytes, file_size) = match result {
+            Ok(result) => result,
+            Err(error) => {
+                return LoadedPreview {
+                    error: Some(format!("Failed to fetch file: {error}")),
+                    ..LoadedPreview::default()
+                };
+            }
+        };
+        let file_type = file_type.clone();
+        tokio::task::spawn_blocking(move || match parse_preview(&bytes, &file_type, scope) {
+            Ok(mut data) => {
+                if (bytes.len() as u64) < file_size {
+                    match &mut data {
+                        PreviewData::Table(data) => Arc::make_mut(data).truncated = true,
+                        PreviewData::Json(data) => data.truncated = true,
+                        PreviewData::Text(data) => data.truncated = true,
+                        PreviewData::ParquetSchema(_) => {}
                     }
                 }
+                LoadedPreview {
+                    data: Some(data),
+                    ..LoadedPreview::default()
+                }
             }
-            Err(e) => {
-                preview.error = Some(format!("Failed to fetch file: {e}"));
+            Err(error) => LoadedPreview {
+                error: Some(error),
+                ..LoadedPreview::default()
+            },
+        })
+        .await
+        .unwrap_or_else(|error| LoadedPreview {
+            error: Some(format!("Failed to parse preview: {error}")),
+            ..LoadedPreview::default()
+        })
+    }
+
+    async fn fetch_parquet_preview(
+        object_store: &dyn ObjectStore,
+        object_path: &ObjectPath,
+        scope: PreviewScope,
+    ) -> Result<LoadedPreview, String> {
+        if scope == PreviewScope::Limited {
+            let meta = object_store
+                .head(object_path)
+                .await
+                .map_err(|e| format!("Failed to get file info: {e}"))?;
+            if meta.size > MAX_PARQUET_TABLE_PREVIEW_BYTES as u64 {
+                let bytes = object_store
+                    .get_opts(
+                        object_path,
+                        GetOptions {
+                            range: Some(GetRange::Suffix(MAX_PARQUET_PREVIEW_BYTES as u64)),
+                            ..GetOptions::default()
+                        },
+                    )
+                    .await
+                    .map_err(|e| format!("Failed to fetch metadata: {e}"))?
+                    .bytes()
+                    .await
+                    .map_err(|e| format!("Failed to fetch metadata: {e}"))?;
+                return tokio::task::spawn_blocking(move || {
+                    let PreviewData::ParquetSchema(mut schema) =
+                        parse_parquet_schema(&bytes, Some(meta.size))?
+                    else {
+                        unreachable!("schema parser returns metadata");
+                    };
+                    schema.note = Some(
+                        "Full preview downloads the file to browse all rows on demand".to_owned(),
+                    );
+                    Ok(LoadedPreview {
+                        data: Some(PreviewData::ParquetSchema(schema.clone())),
+                        parquet_schema: Some(schema),
+                        parquet_mode: Some(ParquetPreviewMode::Metadata),
+                        ..LoadedPreview::default()
+                    })
+                })
+                .await
+                .map_err(|e| format!("Failed to read metadata: {e}"))?;
             }
         }
+        // Stream compressed bytes to disk; never collect the complete download in RAM.
+        let temporary = tempfile::NamedTempFile::new()
+            .map_err(|e| format!("Failed to create preview cache: {e}"))?;
+        let mut destination = tokio::fs::File::from_std(
+            temporary
+                .reopen()
+                .map_err(|e| format!("Failed to open preview cache: {e}"))?,
+        );
+        let mut stream = object_store
+            .get(object_path)
+            .await
+            .map_err(|e| format!("Failed to fetch file: {e}"))?
+            .into_stream();
+        while let Some(chunk) = stream
+            .try_next()
+            .await
+            .map_err(|e| format!("Failed to download preview: {e}"))?
+        {
+            destination
+                .write_all(&chunk)
+                .await
+                .map_err(|e| format!("Failed to cache preview: {e}"))?;
+        }
+        destination
+            .flush()
+            .await
+            .map_err(|e| format!("Failed to flush preview: {e}"))?;
+        drop(destination);
+        tokio::task::spawn_blocking(move || {
+            let file = Arc::new(ParquetFilePreview::open(temporary)?);
+            Ok(Self::preview_parquet_file(file, scope))
+        })
+        .await
+        .map_err(|e| format!("Failed to read preview: {e}"))?
+    }
 
-        preview
+    fn preview_parquet_file(file: SharedParquetFile, scope: PreviewScope) -> LoadedPreview {
+        let mut schema = file.schema();
+        match file.read_page(0, scope) {
+            Ok(page) => LoadedPreview {
+                data: Some(PreviewData::Table(page.table.clone())),
+                parquet_table: Some(page.table),
+                parquet_schema: Some(schema),
+                parquet_mode: Some(ParquetPreviewMode::Table),
+                parquet_file: Some(file),
+                ..LoadedPreview::default()
+            },
+            Err(error) => {
+                schema.note = Some(error);
+                LoadedPreview {
+                    data: Some(PreviewData::ParquetSchema(schema.clone())),
+                    parquet_schema: Some(schema),
+                    parquet_mode: Some(ParquetPreviewMode::Metadata),
+                    parquet_file: Some(file),
+                    ..LoadedPreview::default()
+                }
+            }
+        }
+    }
+
+    /// Keep a bounded, overlapping page around the selected global Parquet row.
+    fn ensure_parquet_page(&mut self) {
+        if self.preview_scope != PreviewScope::Full
+            || self.parquet_preview_mode != Some(ParquetPreviewMode::Table)
+        {
+            return;
+        }
+        let Some(file) = self.parquet_file.clone() else {
+            return;
+        };
+        if file.row_count() == 0 {
+            return;
+        }
+        let loaded_rows = self
+            .parquet_table_data
+            .as_ref()
+            .map_or(0, |table| table.rows.len());
+        if (self.parquet_page_offset..self.parquet_page_offset + loaded_rows)
+            .contains(&self.preview_selected_row)
+        {
+            if self.parquet_pending_offset.take().is_some() {
+                self.preview_tasks.cancel();
+            }
+            return;
+        }
+        let stride = PARQUET_PAGE_ROWS / 2;
+        let offset = self.preview_selected_row.saturating_sub(stride) / stride * stride;
+        if self.parquet_pending_offset == Some(offset) {
+            return;
+        }
+        self.parquet_pending_offset = Some(offset);
+        self.preview_error = None;
+        self.preview_tasks
+            .spawn("Loading Parquet rows", async move {
+                let result =
+                    tokio::task::spawn_blocking(move || file.read_page(offset, PreviewScope::Full))
+                        .await
+                        .unwrap_or_else(|e| Err(format!("Failed to read Parquet rows: {e}")));
+                TaskEvent::ParquetPageLoaded(result)
+            });
     }
 
     /// Close the preview panel.
@@ -2806,12 +2975,16 @@ impl App {
     fn clear_preview_data(&mut self) {
         self.preview_data = None;
         self.preview_file_type = None;
+        self.preview_scope = PreviewScope::Limited;
         self.preview_error = None;
         self.preview_scroll = (0, 0);
         self.preview_selected_row = 0;
         self.parquet_preview_mode = None;
         self.parquet_table_data = None;
         self.parquet_schema_data = None;
+        self.parquet_file = None;
+        self.parquet_page_offset = 0;
+        self.parquet_pending_offset = None;
     }
 
     /// Toggle between parquet table and metadata preview modes.
@@ -2839,6 +3012,7 @@ impl App {
             }
             None => {}
         }
+        self.ensure_parquet_page();
     }
 
     /// Scroll preview up (decrease row offset).
@@ -2850,12 +3024,20 @@ impl App {
         if self.preview_selected_row < self.preview_scroll.0 {
             self.preview_scroll.0 = self.preview_selected_row;
         }
+        self.ensure_parquet_page();
     }
 
-    /// Scroll preview down (increase row offset).
-    pub fn preview_scroll_down(&mut self) {
-        let max_row = match &self.preview_data {
-            Some(PreviewData::Table(table)) => table.rows.len().saturating_sub(1),
+    fn preview_last_row(&self) -> usize {
+        match &self.preview_data {
+            Some(PreviewData::Table(table)) => {
+                let rows =
+                    if self.preview_scope == PreviewScope::Full && self.parquet_file.is_some() {
+                        table.total_rows
+                    } else {
+                        table.rows.len()
+                    };
+                rows.saturating_sub(1)
+            }
             Some(PreviewData::Json(json)) => json.content.lines().count().saturating_sub(1),
             Some(PreviewData::Text(text)) => text.content.lines().count().saturating_sub(1),
             Some(PreviewData::ParquetSchema(schema)) => {
@@ -2863,10 +3045,16 @@ impl App {
                 (7 + schema.fields.len()).saturating_sub(1)
             }
             None => 0,
-        };
+        }
+    }
+
+    /// Scroll preview down (increase row offset).
+    pub fn preview_scroll_down(&mut self) {
+        let max_row = self.preview_last_row();
         if self.preview_selected_row < max_row {
             self.preview_selected_row += 1;
         }
+        self.ensure_parquet_page();
     }
 
     /// Scroll preview left (decrease column offset).
@@ -2896,13 +3084,16 @@ mod tests {
         App, BrowsingState, EntryKind, KeyCode, KeyEvent, KeyModifiers, LoadedDirectory, Modal,
         ParquetPreviewMode, Search, Session, SortCriteria, UiToggles,
     };
-    use crate::preview::{ParquetSchemaPreview, PreviewData, PreviewFileType, TablePreview};
+    use crate::preview::{
+        ParquetSchemaPreview, PreviewData, PreviewFileType, PreviewScope, TablePreview,
+    };
     use crate::terminal_icons::detect_terminal_icons;
     use chrono::{TimeZone, Utc};
     use futures::{StreamExt, stream::BoxStream};
     use object_store::{ObjectStoreExt, path::Path as ObjectPath};
     use proptest::prelude::*;
     use std::collections::BTreeMap;
+    use std::fmt::Write as _;
     use std::sync::Arc;
 
     fn arb_entry_kind() -> impl Strategy<Value = super::EntryKind> {
@@ -2975,12 +3166,16 @@ mod tests {
             sort_criteria: SortCriteria::Name,
             preview_data: None,
             preview_file_type: None,
+            preview_scope: PreviewScope::Limited,
             preview_scroll: (0, 0),
             preview_error: None,
             preview_selected_row: 0,
             parquet_preview_mode: None,
             parquet_table_data: None,
             parquet_schema_data: None,
+            parquet_file: None,
+            parquet_page_offset: 0,
+            parquet_pending_offset: None,
             tasks: super::Tasks::new(),
             preview_tasks: super::Tasks::new(),
             preview_target: None,
@@ -3825,19 +4020,34 @@ mod tests {
     #[tokio::test]
     #[ignore = "interactive terminal required"]
     async fn browser_interactive_preview() {
-        let (_dir, mut app) = navigation_test_app().await;
+        let (directory, mut app) = navigation_test_app().await;
         let store = app.browsing().unwrap().object_store.clone();
+        let mut csv = String::from("id,value\n");
+        let mut text = String::new();
+        for i in 0..350 {
+            writeln!(csv, "{i},{}", "x".repeat(200)).unwrap();
+            writeln!(text, "Line {i}: {}", "x".repeat(200)).unwrap();
+        }
         for (name, data) in [
             ("empty.txt", Vec::new()),
             ("résumé-with-a-very-long-name.txt", vec![b'x'; 1536]),
             ("data.json", br#"[{"name":"example","count":42}]"#.to_vec()),
             ("table.parquet", parquet_preview_bytes()),
+            ("large.csv", csv.as_bytes().to_vec()),
+            ("large.tsv", csv.replace(',', "\t").into_bytes()),
+            ("large.txt", text.into_bytes()),
+            ("large.parquet", parquet_preview_rows((0..350).collect())),
+            ("large.json", serde_json::to_vec(&serde_json::json!({"values": (0..350).map(|i| format!("Line {i}: {}", "x".repeat(200))).collect::<Vec<_>>()})).unwrap()),
         ] {
             store
                 .put(&ObjectPath::from(format!("parent/{name}")), data.into())
                 .await
                 .unwrap();
         }
+        write_compressed_parquet(
+            &directory.path().join("online/store/parent/million.parquet"),
+            1_100_000,
+        );
         app.refresh_files();
         settle(&mut app).await;
         let mut terminal = ratatui::init();
@@ -3847,10 +4057,14 @@ mod tests {
     }
 
     fn parquet_preview_bytes() -> Vec<u8> {
+        parquet_preview_rows(vec![42])
+    }
+
+    fn parquet_preview_rows(values: Vec<i32>) -> Vec<u8> {
         use arrow::{array::Int32Array, record_batch::RecordBatch};
         let batch = RecordBatch::try_from_iter([(
             "value",
-            Arc::new(Int32Array::from(vec![42])) as arrow::array::ArrayRef,
+            Arc::new(Int32Array::from(values)) as arrow::array::ArrayRef,
         )])
         .unwrap();
         let mut bytes = Vec::new();
@@ -3859,6 +4073,377 @@ mod tests {
         writer.write(&batch).unwrap();
         writer.close().unwrap();
         bytes
+    }
+
+    fn write_compressed_parquet(path: &std::path::Path, rows: usize) {
+        use arrow::{
+            array::{StringArray, UInt64Array},
+            record_batch::RecordBatch,
+        };
+        use parquet::{basic::Compression, schema::types::ColumnPath};
+        let properties = parquet::file::properties::WriterProperties::builder()
+            .set_compression(Compression::SNAPPY)
+            .set_max_row_group_row_count(Some(rows))
+            .set_column_dictionary_enabled(ColumnPath::from("id"), false)
+            .build();
+        let batch_size = 16_384;
+        let batch = |start: usize| {
+            let end = (start + batch_size).min(rows);
+            RecordBatch::try_from_iter([
+                (
+                    "id",
+                    Arc::new(UInt64Array::from_iter_values(
+                        (start..end).map(|i| i as u64),
+                    )) as arrow::array::ArrayRef,
+                ),
+                (
+                    "label",
+                    Arc::new(StringArray::from_iter_values(std::iter::repeat_n(
+                        "repeated payload that would otherwise be copied into every row",
+                        end - start,
+                    ))) as arrow::array::ArrayRef,
+                ),
+            ])
+            .unwrap()
+        };
+        let file = std::fs::File::create(path).unwrap();
+        let mut writer =
+            parquet::arrow::ArrowWriter::try_new(file, batch(0).schema(), Some(properties))
+                .unwrap();
+        for start in (0..rows).step_by(batch_size) {
+            writer.write(&batch(start)).unwrap();
+        }
+        writer.close().unwrap();
+    }
+
+    #[tokio::test]
+    async fn parquet_pages_reuse_download_share_rows_and_remove_cache_on_close() {
+        use crate::preview::PARQUET_PAGE_ROWS;
+        let (_dir, mut app) = navigation_test_app().await;
+        let store = app.browsing().unwrap().object_store.clone();
+        let path = ObjectPath::from("parent/paged.parquet");
+        store
+            .put(&path, parquet_preview_rows((0..1500).collect()).into())
+            .await
+            .unwrap();
+        app.refresh_files();
+        settle(&mut app).await;
+        app.browsing_mut().unwrap().selected_index = 2;
+        app.sync_preview();
+        let message = app.preview_tasks.recv().await.unwrap();
+        if let Some(event) = app.preview_tasks.accept(message) {
+            app.install_preview_event(event);
+        }
+        assert_eq!(app.parquet_table_data.as_ref().unwrap().rows.len(), 100);
+        let original_file = Arc::downgrade(app.parquet_file.as_ref().unwrap());
+        let cached_path = app.parquet_file.as_ref().unwrap().path().to_owned();
+        // Upgrading and scrolling must work without any further access to the remote object.
+        store.delete(&path).await.unwrap();
+        app.handle_key_event(KeyEvent::from(KeyCode::Char('p')))
+            .unwrap();
+        assert!(
+            !app.tasks.is_running(),
+            "focusing an existing preview reuses it"
+        );
+        assert!(rendered(&app).contains("Full preview"));
+        app.handle_key_event(KeyEvent::from(KeyCode::Char('f')))
+            .unwrap();
+        settle(&mut app).await;
+        assert!(std::ptr::eq(
+            original_file.as_ptr(),
+            Arc::as_ptr(app.parquet_file.as_ref().unwrap())
+        ));
+        assert!(cached_path.exists());
+        assert_eq!(
+            app.parquet_table_data.as_ref().unwrap().rows.len(),
+            PARQUET_PAGE_ROWS
+        );
+        let Some(PreviewData::Table(table)) = &app.preview_data else {
+            panic!("expected table");
+        };
+        assert!(Arc::ptr_eq(table, app.parquet_table_data.as_ref().unwrap()));
+        assert!(
+            !rendered(&app).contains("Full preview"),
+            "hide the upgrade once full preview is active"
+        );
+
+        for row in [256, 700, 1499, 1000, 0] {
+            match row {
+                1499 => app.handle_key_event(KeyEvent::from(KeyCode::End)).unwrap(),
+                0 => app.handle_key_event(KeyEvent::from(KeyCode::Home)).unwrap(),
+                _ => {
+                    app.preview_selected_row = row;
+                    app.ensure_parquet_page();
+                }
+            }
+            assert_eq!(app.preview_selected_row, row);
+            while app.preview_tasks.is_running() {
+                let message = app.preview_tasks.recv().await.unwrap();
+                if let Some(event) = app.preview_tasks.accept(message) {
+                    app.install_preview_event(event);
+                }
+            }
+            let table = app.parquet_table_data.as_ref().unwrap();
+            assert!(table.rows.len() <= PARQUET_PAGE_ROWS);
+            assert_eq!(
+                table.rows[row - app.parquet_page_offset][0],
+                row.to_string()
+            );
+            assert!(rendered(&app).contains("1500 rows"));
+            assert!(
+                rendered(&app).contains(&format!("║{row} ")),
+                "selected row {row} is rendered"
+            );
+        }
+        app.toggle_parquet_preview_mode();
+        app.toggle_parquet_preview_mode();
+        let Some(PreviewData::Table(table)) = &app.preview_data else {
+            panic!("expected table");
+        };
+        assert!(Arc::ptr_eq(table, app.parquet_table_data.as_ref().unwrap()));
+
+        // A queued page from a closed preview must not reinstall data or keep its cache alive.
+        app.preview_selected_row = 1000;
+        app.ensure_parquet_page();
+        let stale = app.preview_tasks.recv().await.unwrap();
+        app.close_preview();
+        assert!(app.preview_tasks.accept(stale).is_none());
+        assert!(app.preview_data.is_none());
+        assert!(original_file.upgrade().is_none());
+        assert!(!cached_path.exists());
+    }
+
+    #[tokio::test]
+    async fn compressed_million_row_parquet_keeps_only_a_page_in_memory() {
+        use crate::preview::PARQUET_PAGE_ROWS;
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("million.parquet");
+        let rows = 1_100_000;
+        write_compressed_parquet(&source, rows);
+        let file_size = std::fs::metadata(&source).unwrap().len();
+        let store =
+            object_store::local::LocalFileSystem::new_with_prefix(directory.path()).unwrap();
+        let started = std::time::Instant::now();
+        let preview = App::fetch_preview(
+            &store,
+            &ObjectPath::from("million.parquet"),
+            &PreviewFileType::Parquet,
+            PreviewScope::Full,
+        )
+        .await;
+        assert!(preview.error.is_none(), "{:?}", preview.error);
+        let table = preview.parquet_table.as_ref().unwrap();
+        assert_eq!(table.total_rows, rows);
+        assert_eq!(table.rows.len(), PARQUET_PAGE_ROWS);
+        assert_eq!(table.rows[0][0], "0");
+        let file = preview.parquet_file.as_ref().unwrap();
+        assert_eq!(std::fs::metadata(file.path()).unwrap().len(), file_size);
+        let page = file.read_page(rows - 128, PreviewScope::Full).unwrap();
+        assert_eq!(page.table.rows.len(), 128);
+        assert_eq!(page.table.rows.last().unwrap()[0], (rows - 1).to_string());
+        eprintln!(
+            "{rows} rows, {file_size} compressed bytes: download and first/last pages in {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn full_preview_downloads_and_displays_all_supported_text_formats() {
+        use crate::preview::MAX_PREVIEW_BYTES;
+        let store = object_store::memory::InMemory::new();
+        let padding = "x".repeat(256);
+        let rows = 350;
+        let mut csv = String::from("id,value\n");
+        let mut text = String::new();
+        for i in 0..rows {
+            writeln!(csv, "{i},{padding}").unwrap();
+            writeln!(text, "{i}: {padding}").unwrap();
+        }
+        let tsv = csv.replace(',', "\t");
+        let table_json = serde_json::to_vec(
+            &(0..rows)
+                .map(|i| serde_json::json!({"id": i, "value": padding}))
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        let object_json = serde_json::to_vec(&serde_json::json!({"values": (0..rows).map(|i| format!("{i}: {padding}")).collect::<Vec<_>>()})).unwrap();
+        for (name, bytes) in [
+            ("data.csv", csv.into_bytes()),
+            ("data.tsv", tsv.into_bytes()),
+            ("table.json", table_json),
+            ("object.json", object_json),
+            ("notes.txt", text.into_bytes()),
+            (
+                "script.py",
+                format!("{}# final line\n", "# comment\n".repeat(6000)).into_bytes(),
+            ),
+        ] {
+            assert!(bytes.len() > MAX_PREVIEW_BYTES, "{name}");
+            let path = ObjectPath::from(name);
+            store.put(&path, bytes.into()).await.unwrap();
+            let file_type = PreviewFileType::from_extension(name);
+            let limited =
+                App::fetch_preview(&store, &path, &file_type, PreviewScope::Limited).await;
+            assert!(limited.error.is_none(), "{name}: {:?}", limited.error);
+            match limited.data.unwrap() {
+                PreviewData::Table(data) => {
+                    assert!(data.truncated);
+                    assert!(data.rows.len() <= 100);
+                }
+                PreviewData::Json(data) => {
+                    assert!(data.truncated);
+                    assert!(data.content.lines().count() <= 200);
+                }
+                PreviewData::Text(data) => {
+                    assert!(data.truncated);
+                    assert!(data.content.lines().count() <= 200);
+                }
+                PreviewData::ParquetSchema(_) => panic!("unexpected metadata"),
+            }
+            let full = App::fetch_preview(&store, &path, &file_type, PreviewScope::Full).await;
+            assert!(full.error.is_none(), "{name}: {:?}", full.error);
+            match full.data.unwrap() {
+                PreviewData::Table(data) => {
+                    assert!(!data.truncated);
+                    assert_eq!(data.rows.len(), rows);
+                    assert_eq!(data.rows.last().unwrap()[0], "349");
+                }
+                PreviewData::Json(data) => {
+                    assert!(!data.truncated);
+                    assert!(!data.is_raw);
+                    assert_eq!(data.content.lines().count(), data.total_lines);
+                    assert!(data.content.contains("349:"));
+                    assert!(serde_json::from_str::<serde_json::Value>(&data.content).is_ok());
+                }
+                PreviewData::Text(data) => {
+                    assert!(!data.truncated);
+                    assert_eq!(data.content.lines().count(), data.total_lines);
+                    assert!(data.content.contains(if name == "script.py" {
+                        "# final line"
+                    } else {
+                        "349:"
+                    }));
+                }
+                PreviewData::ParquetSchema(_) => panic!("unexpected metadata"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn full_parquet_preview_bypasses_download_and_row_limits() {
+        use crate::preview::MAX_PARQUET_TABLE_PREVIEW_BYTES;
+        use arrow::{array::StringArray, record_batch::RecordBatch};
+        let values = (0..250)
+            .map(|i| format!("{i}:{}", "x".repeat(70_000)))
+            .collect::<Vec<_>>();
+        let batch = RecordBatch::try_from_iter([(
+            "value",
+            Arc::new(StringArray::from(values)) as arrow::array::ArrayRef,
+        )])
+        .unwrap();
+        let properties = parquet::file::properties::WriterProperties::builder()
+            .set_dictionary_enabled(false)
+            .build();
+        let mut bytes = Vec::new();
+        let mut writer =
+            parquet::arrow::ArrowWriter::try_new(&mut bytes, batch.schema(), Some(properties))
+                .unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+        assert!(bytes.len() > MAX_PARQUET_TABLE_PREVIEW_BYTES);
+        let store = object_store::memory::InMemory::new();
+        let path = ObjectPath::from("large.parquet");
+        store.put(&path, bytes.into()).await.unwrap();
+        let limited = App::fetch_preview(
+            &store,
+            &path,
+            &PreviewFileType::Parquet,
+            PreviewScope::Limited,
+        )
+        .await;
+        assert!(limited.error.is_none(), "{:?}", limited.error);
+        assert_eq!(limited.parquet_mode, Some(ParquetPreviewMode::Metadata));
+        assert!(limited.parquet_table.is_none());
+        let full =
+            App::fetch_preview(&store, &path, &PreviewFileType::Parquet, PreviewScope::Full).await;
+        assert!(full.error.is_none(), "{:?}", full.error);
+        assert_eq!(full.parquet_mode, Some(ParquetPreviewMode::Table));
+        let table = full.parquet_table.as_ref().unwrap();
+        assert_eq!(table.rows.len(), 250);
+        assert_eq!(table.total_rows, 250);
+        assert!(!table.truncated);
+        assert!(table.rows.last().unwrap()[0].starts_with("249:"));
+        assert_eq!(full.parquet_schema.as_ref().unwrap().num_rows, 250);
+        let mut app = test_app();
+        app.preview_file_type = Some(PreviewFileType::Parquet);
+        app.install_preview(full);
+        app.toggle_parquet_preview_mode();
+        assert_eq!(app.parquet_preview_mode, Some(ParquetPreviewMode::Metadata));
+        app.toggle_parquet_preview_mode();
+        assert_eq!(app.parquet_table_data.as_ref().unwrap().rows.len(), 250);
+    }
+
+    #[tokio::test]
+    async fn full_preview_shortcut_is_scoped_to_one_file_and_scrolls_past_default_limit() {
+        let (_dir, mut app) = navigation_test_app().await;
+        let store = app.browsing().unwrap().object_store.clone();
+        let mut csv = String::from("value\n");
+        for i in 0..350 {
+            writeln!(csv, "row-{i}").unwrap();
+        }
+        store
+            .put(&ObjectPath::from("parent/large.csv"), csv.into())
+            .await
+            .unwrap();
+        app.refresh_files();
+        settle(&mut app).await;
+        app.browsing_mut().unwrap().selected_index = 2;
+        app.sync_preview();
+        assert!(app.preview_tasks.is_running());
+        assert!(!rendered(&app).contains("Full preview"));
+        app.handle_key_event(KeyEvent::from(KeyCode::Char('f')))
+            .unwrap();
+        assert_eq!(app.ui.preview, super::PreviewPanel::Browsing);
+        assert!(!app.tasks.is_running());
+        app.handle_key_event(KeyEvent::from(KeyCode::Char('p')))
+            .unwrap();
+        settle(&mut app).await;
+        assert!(!app.preview_tasks.is_running());
+        assert!(rendered(&app).contains("Full preview"));
+        app.handle_key_event(KeyEvent::from(KeyCode::Char('f')))
+            .unwrap();
+        assert!(rendered(&app).contains("Loading full preview"));
+        settle(&mut app).await;
+        assert_eq!(app.ui.preview, super::PreviewPanel::Focused);
+        assert_eq!(app.preview_scope, PreviewScope::Full);
+        assert!(rendered(&app).contains("Full file"));
+        for _ in 0..400 {
+            app.handle_key_event(KeyEvent::from(KeyCode::Down)).unwrap();
+        }
+        assert_eq!(app.preview_selected_row, 349);
+        assert!(rendered(&app).contains("row-349"));
+        app.handle_key_event(KeyEvent::from(KeyCode::Esc)).unwrap();
+        assert_eq!(app.preview_scope, PreviewScope::Limited);
+        app.move_up();
+        app.ui.preview = super::PreviewPanel::Browsing;
+        app.sync_preview();
+        let message = app.preview_tasks.recv().await.unwrap();
+        if let Some(super::TaskEvent::PreviewLoaded(preview)) = app.preview_tasks.accept(message) {
+            app.install_preview(*preview);
+        }
+        assert_eq!(
+            app.preview_file_type,
+            Some(PreviewFileType::Text("TXT".to_owned()))
+        );
+        assert_eq!(app.preview_scope, PreviewScope::Limited);
+        // The same shortcut upgrades an already focused preview.
+        app.handle_key_event(KeyEvent::from(KeyCode::Char('p')))
+            .unwrap();
+        settle(&mut app).await;
+        app.handle_key_event(KeyEvent::from(KeyCode::Char('f')))
+            .unwrap();
+        settle(&mut app).await;
+        assert_eq!(app.preview_scope, PreviewScope::Full);
     }
 
     #[tokio::test]
@@ -4111,14 +4696,14 @@ mod tests {
         app.ui.preview = super::PreviewPanel::Focused;
         app.preview_file_type = Some(PreviewFileType::Parquet);
         app.parquet_preview_mode = Some(ParquetPreviewMode::Table);
-        app.parquet_table_data = Some(TablePreview {
+        app.parquet_table_data = Some(Arc::new(TablePreview {
             headers: vec!["a".to_string()],
             column_types: Some(vec!["Int32".to_string()]),
             rows: vec![vec!["1".to_string()]],
             total_rows: 1,
             truncated: false,
             file_type: PreviewFileType::Parquet,
-        });
+        }));
         app.parquet_schema_data = Some(ParquetSchemaPreview {
             fields: vec!["a: Int32".to_string()],
             num_row_groups: 1,
@@ -4163,14 +4748,14 @@ mod tests {
     #[test]
     fn preview_scroll_right_is_bounded_for_tables() {
         let mut app = test_app();
-        app.preview_data = Some(PreviewData::Table(TablePreview {
+        app.preview_data = Some(PreviewData::Table(Arc::new(TablePreview {
             headers: vec!["a".to_string(), "b".to_string(), "c".to_string()],
             column_types: None,
             rows: vec![vec!["1".to_string(), "2".to_string(), "3".to_string()]],
             total_rows: 1,
             truncated: false,
             file_type: PreviewFileType::Csv,
-        }));
+        })));
 
         for _ in 0..10 {
             app.preview_scroll_right();
@@ -4628,6 +5213,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn full_preview_can_be_canceled_and_retried() {
+        let (gate, mut app) = gated_app().await;
+        app.browsing_mut().unwrap().selected_index = 1;
+        for cancel in [
+            KeyEvent::from(KeyCode::Esc),
+            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+        ] {
+            app.ui.preview = super::PreviewPanel::Focused;
+            app.handle_key_event(KeyEvent::from(KeyCode::Char('f')))
+                .unwrap();
+            assert!(app.tasks.is_running());
+            assert!(rendered(&app).contains("Loading full preview"));
+            app.handle_key_event(cancel).unwrap();
+            assert!(!app.tasks.is_running());
+            assert!(!app.ui.preview.is_visible());
+            assert!(app.preview_data.is_none());
+            assert_eq!(app.preview_scope, PreviewScope::Limited);
+        }
+        gate.add_permits(10);
+        app.ui.preview = super::PreviewPanel::Focused;
+        app.handle_key_event(KeyEvent::from(KeyCode::Char('f')))
+            .unwrap();
+        settle(&mut app).await;
+        assert!(matches!(app.preview_data, Some(PreviewData::Text(_))));
+        assert_eq!(app.preview_scope, PreviewScope::Full);
+    }
+
+    #[tokio::test]
     async fn blob_info_arrives_as_a_modal_or_an_error() {
         let (gate, mut app) = gated_app().await;
         gate.add_permits(10);
@@ -4932,7 +5545,7 @@ mod tests {
             moves in 0_usize..32,
         ) {
             let mut app = test_app();
-            app.preview_data = Some(PreviewData::Table(TablePreview {
+            app.preview_data = Some(PreviewData::Table(Arc::new(TablePreview {
                 headers: (0..cols).map(|i| format!("col{i}")).collect(),
                 column_types: None,
                 rows: if cols == 0 {
@@ -4943,7 +5556,7 @@ mod tests {
                 total_rows: 1,
                 truncated: false,
                 file_type: PreviewFileType::Csv,
-            }));
+            })));
 
             for _ in 0..moves {
                 app.preview_scroll_right();

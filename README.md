@@ -69,6 +69,14 @@ grant blob data access.
   Folder blob counts (including nested folders) and newest-blob times appear
   when a date/size sort has loaded them. Normal browsing does not scan folders
   for these summaries, since recursive listings can be slow for large folders.
+- Automatic previews limit downloads and displayed rows/lines. Press `p` to open
+  the initial preview, then `f` to download the selected file completely and
+  browse all rows/lines. This supports CSV, TSV, JSON, text, and Parquet, including
+  Parquet files larger than 16 MB. Use Tab to switch Parquet table/metadata views.
+  Parquet downloads are cached in a temporary file, with a small page of rows
+  decoded as you scroll. The cache is reused when upgrading to full preview and
+  deleted when the preview closes. Other full previews hold the downloaded file
+  and parsed contents in memory. The choice applies only to that preview.
 - Uploads use the local filename and never overwrite existing blobs. Uploads
   read the file into memory and run in the background.
 - Network operations show activity in the command bar. While an operation runs,

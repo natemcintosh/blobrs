@@ -538,7 +538,12 @@ impl App {
     }
 
     fn preview_panel(&self) -> Block<'static> {
-        focus_panel(self.ui.preview == PreviewPanel::Focused)
+        let panel = focus_panel(self.ui.preview == PreviewPanel::Focused);
+        if self.preview_scope == crate::preview::PreviewScope::Full {
+            panel.title_bottom(" Full file ")
+        } else {
+            panel
+        }
     }
 
     /// Render the selected folder's shortcuts or the selected file's contents.
@@ -583,10 +588,18 @@ impl App {
                 file_type_name.clone()
             };
 
-        if self.preview_tasks.is_running()
+        if (self.preview_tasks.is_running()
+            && self.parquet_preview_mode != Some(ParquetPreviewMode::Metadata))
             || (self.ui.preview == PreviewPanel::Focused && self.tasks.is_running())
         {
-            let loading = Paragraph::new(format!("{} Loading preview...", self.icons.loading))
+            let label = if self.parquet_file.is_some() && self.preview_tasks.is_running() {
+                "Loading rows..."
+            } else if self.preview_scope == crate::preview::PreviewScope::Full {
+                "Loading full preview..."
+            } else {
+                "Loading preview..."
+            };
+            let loading = Paragraph::new(format!("{} {label}", self.icons.loading))
                 .block(
                     self.preview_panel()
                         .title(format!(" {file_type_name} Preview "))
@@ -667,7 +680,11 @@ impl App {
             format!(
                 "{} Preview ({} rows)",
                 file_type_name,
-                table_data.rows.len()
+                if self.parquet_file.is_some() {
+                    table_data.total_rows
+                } else {
+                    table_data.rows.len()
+                }
             )
         };
 
@@ -723,7 +740,11 @@ impl App {
             .iter()
             .map(|idx| {
                 let width = col_widths.get(*idx).copied().unwrap_or(3).max(3);
-                Constraint::Length((width as u16) + 2)
+                Constraint::Length(
+                    width
+                        .saturating_add(2)
+                        .min(usize::from(area.width.saturating_sub(2))) as u16,
+                )
             })
             .collect();
 
@@ -770,11 +791,23 @@ impl App {
             Row::new(type_cells).style(Style::default().fg(MUTED).add_modifier(Modifier::ITALIC))
         });
 
-        // Build data rows with scroll offset
+        // Build only visible rows, including the selection, for full-file previews.
+        let visible_rows = usize::from(area.height.saturating_sub(3))
+            .saturating_sub(usize::from(type_row.is_some()))
+            .max(1);
+        let page_offset = if self.parquet_file.is_some() {
+            self.parquet_page_offset
+        } else {
+            0
+        };
+        let selected_row = self.preview_selected_row.saturating_sub(page_offset);
+        let first_row = selected_row.saturating_sub(visible_rows - 1);
         let data_rows: Vec<Row> = table_data
             .rows
             .iter()
             .enumerate()
+            .skip(first_row)
+            .take(visible_rows)
             .map(|(row_idx, row)| {
                 let cells: Vec<Cell> = viewport
                     .visible_indices
@@ -782,7 +815,7 @@ impl App {
                     .map(|idx| Cell::from(row.get(*idx).cloned().unwrap_or_default()))
                     .collect();
 
-                let style = if row_idx == self.preview_selected_row {
+                let style = if row_idx == selected_row {
                     selection()
                 } else {
                     Style::default().fg(TEXT)
@@ -811,7 +844,7 @@ impl App {
         // Use TableState for scrolling
         let mut table_state = TableState::default();
         let selected_row =
-            self.preview_selected_row + usize::from(table_data.column_types.is_some());
+            selected_row.saturating_sub(first_row) + usize::from(table_data.column_types.is_some());
         table_state.select(Some(selected_row));
 
         ratatui::widgets::StatefulWidget::render(table, area, buf, &mut table_state);
@@ -826,7 +859,11 @@ impl App {
     ) {
         // Build title based on mode and truncation state
         let title = if json_data.is_raw {
-            " JSON Preview (raw, truncated at 50KB) ".to_string()
+            if json_data.truncated {
+                " JSON Preview (raw, truncated) ".to_string()
+            } else {
+                format!(" JSON Preview (raw, {} lines) ", json_data.total_lines)
+            }
         } else if json_data.truncated {
             format!(
                 " JSON Preview ({}/{} lines, truncated) ",
@@ -842,11 +879,16 @@ impl App {
             .content
             .lines()
             .skip(self.preview_selected_row)
+            .take(usize::from(area.height.saturating_sub(2)) + 1)
             .collect();
 
         // Add truncation indicator at the bottom if truncated
         let truncation_indicator = if json_data.truncated {
-            Some("... [truncated at 50KB]")
+            Some(if self.ui.preview == PreviewPanel::Focused {
+                "... [truncated; press f for full preview]"
+            } else {
+                "... [truncated; press p to open preview]"
+            })
         } else {
             None
         };
@@ -886,7 +928,7 @@ impl App {
         // Build title with extension and line count
         let title = if text_data.truncated {
             format!(
-                " {} Preview ({} lines, truncated at 50KB) ",
+                " {} Preview ({} lines, truncated) ",
                 text_data.extension, text_data.total_lines
             )
         } else {
@@ -901,11 +943,16 @@ impl App {
             .content
             .lines()
             .skip(self.preview_selected_row)
+            .take(usize::from(area.height.saturating_sub(2)) + 1)
             .collect();
 
         // Add truncation indicator at the bottom if truncated
         let truncation_indicator = if text_data.truncated {
-            Some("... [truncated at 50KB]")
+            Some(if self.ui.preview == PreviewPanel::Focused {
+                "... [truncated; press f for full preview]"
+            } else {
+                "... [truncated; press p to open preview]"
+            })
         } else {
             None
         };

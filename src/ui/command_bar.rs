@@ -157,7 +157,16 @@ impl App {
                     let mut preview = vec![
                         Hint::new("↑/↓/k/j", "Rows"),
                         Hint::new("←/→/h/l", "Columns"),
+                        Hint::new("Home/End", "First/last"),
                     ];
+                    if self.preview_scope == crate::preview::PreviewScope::Limited
+                        && self
+                            .preview_file_type
+                            .as_ref()
+                            .is_some_and(crate::preview::PreviewFileType::is_supported)
+                    {
+                        preview.push(Hint::new("f", "Full preview"));
+                    }
                     if self.preview_file_type == Some(crate::preview::PreviewFileType::Parquet) {
                         preview.push(Hint::new("Tab", "Table/metadata"));
                     }
@@ -180,14 +189,7 @@ impl App {
                         Hint::new("/", "Search"),
                         Hint::new("s", "Sort"),
                         Hint::new("i", "Info"),
-                        Hint::new(
-                            "p",
-                            if self.ui.preview == PreviewPanel::Browsing {
-                                "Focus preview"
-                            } else {
-                                "Preview"
-                            },
-                        ),
+                        Hint::new("p", "Preview"),
                         Hint::new("y", "Copy path"),
                         Hint::new("d", "Download"),
                         Hint::new("u", "Upload"),
