@@ -9,7 +9,7 @@ use ratatui::{
     },
 };
 
-use crate::app::{App, Modal, ParquetPreviewMode, Session};
+use crate::app::{App, EntryKind, Modal, ParquetPreviewMode, PreviewPanel, Session};
 use crate::preview::PreviewData;
 
 mod command_bar;
@@ -305,7 +305,7 @@ impl App {
 
         // Main content area - split horizontally if preview is shown
         let main_area = chunks[0];
-        let (file_list_area, preview_area) = if self.ui.show_preview {
+        let (file_list_area, preview_area) = if self.ui.preview.is_visible() {
             let horizontal_chunks = Layout::default()
                 .direction(Direction::Horizontal)
                 .constraints([
@@ -319,28 +319,41 @@ impl App {
         };
 
         // Main block with file list
-        let file_items: Vec<ListItem> = if browsing.files().is_empty() {
+        let file_rows: Vec<Row> = if browsing.files().is_empty() {
             let has_query = self.file_search_query().is_some_and(|q| !q.is_empty());
             if self.is_searching_files() && has_query {
-                vec![ListItem::new(format!(
+                vec![Row::new([format!(
                     "{search} No results found",
                     search = self.icons.search
-                ))]
+                )])]
             } else {
-                vec![ListItem::new(format!(
+                vec![Row::new([format!(
                     "{empty} No items found",
                     empty = self.icons.empty
-                ))]
+                )])]
             }
         } else {
             browsing
                 .files()
                 .iter()
-                .map(|file| ListItem::new(file.as_str()))
+                .enumerate()
+                .map(|(index, file)| {
+                    let size = browsing
+                        .file_items()
+                        .get(index)
+                        .filter(|item| item.kind == EntryKind::File)
+                        .and_then(|item| item.size)
+                        .map(format_bytes)
+                        .unwrap_or_default();
+                    Row::new([
+                        Cell::from(file.as_str()),
+                        Cell::from(Line::from(size).alignment(Alignment::Right)),
+                    ])
+                })
                 .collect()
         };
 
-        let mut list_state = ListState::default();
+        let mut list_state = TableState::default();
         if !browsing.files().is_empty() {
             list_state.select(Some(browsing.selected_index));
         }
@@ -377,16 +390,30 @@ impl App {
             )
         };
 
-        let main_block = List::new(file_items)
-            .block(
-                panel()
-                    .title(title)
-                    .title_alignment(Alignment::Left)
-                    .border_type(BorderType::Rounded),
-            )
-            .fg(TEXT)
-            .highlight_style(selection())
-            .highlight_symbol("▸ ");
+        let size_width = browsing
+            .file_items()
+            .iter()
+            .filter(|item| item.kind == EntryKind::File)
+            .filter_map(|item| item.size)
+            .map(|size| format_bytes(size).len())
+            .max()
+            .unwrap_or(0);
+        let size_width = u16::try_from(size_width)
+            .unwrap_or(u16::MAX)
+            .min(file_list_area.width.saturating_sub(5));
+        let main_block = Table::new(
+            file_rows,
+            [Constraint::Min(0), Constraint::Length(size_width)],
+        )
+        .block(
+            panel()
+                .title(title)
+                .title_alignment(Alignment::Left)
+                .border_type(BorderType::Rounded),
+        )
+        .fg(TEXT)
+        .row_highlight_style(selection())
+        .highlight_symbol("▸ ");
 
         ratatui::widgets::StatefulWidget::render(main_block, file_list_area, buf, &mut list_state);
 
@@ -441,8 +468,32 @@ impl App {
         command_bar.render(chunks[chunk_index], buf);
     }
 
-    /// Render the preview panel for CSV, TSV, or JSON files.
+    /// Render the selected folder's shortcuts or the selected file's contents.
     fn render_preview_panel(&self, area: Rect, buf: &mut Buffer) {
+        if self.ui.preview == PreviewPanel::Browsing {
+            let overview = match self.selected_file_item() {
+                Some(item) if item.kind == EntryKind::Folder => Some(vec![
+                    Line::from(Span::styled(
+                        item.actual_name.as_str(),
+                        Style::default().fg(ACCENT).bold(),
+                    )),
+                    Line::from("Virtual folder"),
+                    Line::from(""),
+                    Line::from("Enter / → / l  Enter folder"),
+                    Line::from("i  Show folder info"),
+                ]),
+                None => Some(vec![Line::from("No item selected")]),
+                Some(_) => None,
+            };
+            if let Some(lines) = overview {
+                Paragraph::new(lines)
+                    .block(panel().title(" Preview "))
+                    .fg(TEXT)
+                    .wrap(Wrap { trim: false })
+                    .render(area, buf);
+                return;
+            }
+        }
         // Get the file type name for the title
         let file_type_name = self.preview_file_type.as_ref().map_or_else(
             || "Preview".to_string(),
@@ -459,9 +510,9 @@ impl App {
                 file_type_name.clone()
             };
 
-        // Handle loading state; an open preview takes every key, so only its
-        // own load can be running
-        if self.tasks.is_running() {
+        if self.preview_tasks.is_running()
+            || (self.ui.preview == PreviewPanel::Focused && self.tasks.is_running())
+        {
             let loading = Paragraph::new(format!("{} Loading preview...", self.icons.loading))
                 .block(
                     panel()

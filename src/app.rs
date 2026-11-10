@@ -76,6 +76,10 @@ impl BrowsingState {
     pub(crate) fn files(&self) -> &[String] {
         &self.directory.files
     }
+
+    pub(crate) fn file_items(&self) -> &[FileItem] {
+        &self.directory.file_items
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -247,7 +251,30 @@ pub enum Search {
 
 #[derive(Debug, Clone)]
 pub struct UiToggles {
-    pub show_preview: bool,
+    pub preview: PreviewPanel,
+}
+
+/// A visible preview can accompany browsing or take keyboard focus for scrolling.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum PreviewPanel {
+    Hidden,
+    #[default]
+    Browsing,
+    Focused,
+}
+
+impl PreviewPanel {
+    #[must_use]
+    pub fn is_visible(self) -> bool {
+        self != Self::Hidden
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PreviewTarget {
+    container: usize,
+    path: String,
+    name: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -306,6 +333,9 @@ pub struct App {
     pub parquet_schema_data: Option<ParquetSchemaPreview>,
     /// The running background operation, if any, and its result channel.
     pub(crate) tasks: Tasks,
+    /// Automatic previews are replaceable and never block file-list actions.
+    pub(crate) preview_tasks: Tasks,
+    preview_target: Option<PreviewTarget>,
     /// Folder scans of the open container by prefix, kept so a date or size sort
     /// does not rescan on every visit. Dropped on refresh and after any change.
     folder_stats_cache: HashMap<String, HashMap<String, FolderStats>>,
@@ -375,7 +405,7 @@ impl App {
             icons: detect_terminal_icons(),
             modal: Modal::None,
             ui: UiToggles {
-                show_preview: false,
+                preview: PreviewPanel::default(),
             },
             sort_criteria: SortCriteria::Name,
             preview_data: None,
@@ -387,6 +417,8 @@ impl App {
             parquet_table_data: None,
             parquet_schema_data: None,
             tasks: Tasks::new(),
+            preview_tasks: Tasks::new(),
+            preview_target: None,
             folder_stats_cache: HashMap::new(),
             clipboard: None,
         };
@@ -419,6 +451,7 @@ impl App {
         let mut tick = tokio::time::interval(SPINNER_TICK);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         while self.running {
+            self.sync_preview();
             terminal.draw(|frame| frame.render_widget(&*self, frame.area()))?;
             tokio::select! {
                 event = events.next() => match event {
@@ -428,6 +461,11 @@ impl App {
                     None => break,
                 },
                 Some(message) = self.tasks.recv() => self.apply_task_message(message),
+                Some(message) = self.preview_tasks.recv() => {
+                    if let Some(TaskEvent::PreviewLoaded(preview)) = self.preview_tasks.accept(message) {
+                        self.install_preview(*preview);
+                    }
+                },
                 _ = tick.tick(), if self.tasks.is_running() => self.tasks.advance_spinner(),
             }
         }
@@ -447,12 +485,7 @@ impl App {
                 result,
             } => self.finish_folder_stats(path, criteria, result),
             TaskEvent::PreviewLoaded(preview) => {
-                let preview = *preview;
-                self.preview_data = preview.data;
-                self.preview_error = preview.error;
-                self.parquet_preview_mode = preview.parquet_mode;
-                self.parquet_table_data = preview.parquet_table;
-                self.parquet_schema_data = preview.parquet_schema;
+                self.install_preview(*preview);
             }
             TaskEvent::BlobInfo(Ok(info)) => self.modal = Modal::BlobInfo { info },
             TaskEvent::BlobInfo(Err(e)) => {
@@ -482,14 +515,21 @@ impl App {
         }
     }
 
+    fn install_preview(&mut self, preview: LoadedPreview) {
+        self.preview_data = preview.data;
+        self.preview_error = preview.error;
+        self.parquet_preview_mode = preview.parquet_mode;
+        self.parquet_table_data = preview.parquet_table;
+        self.parquet_schema_data = preview.parquet_schema;
+    }
+
     fn cancel_activity(&mut self) {
         if let Some(label) = self.tasks.cancel()
             && self.error_message.is_none()
         {
             self.success_message = Some(format!("Canceled: {label}"));
         }
-        // An open preview takes every key, so only its own load can be running.
-        if self.ui.show_preview {
+        if self.ui.preview == PreviewPanel::Focused {
             self.close_preview();
         }
     }
@@ -603,8 +643,8 @@ impl App {
                 }
             }
         } else if self.is_browsing() {
-            // An open preview hides the file list, so it takes every key until closed.
-            if self.ui.show_preview {
+            // Only a focused file preview captures navigation and action keys.
+            if self.ui.preview == PreviewPanel::Focused {
                 match key_event.code {
                     KeyCode::Char('p') | KeyCode::Esc | KeyCode::Backspace => self.close_preview(),
                     KeyCode::Tab => self.toggle_parquet_preview_mode(),
@@ -826,7 +866,7 @@ impl App {
         }
     }
 
-    fn selected_file_item(&self) -> Option<&FileItem> {
+    pub(crate) fn selected_file_item(&self) -> Option<&FileItem> {
         let state = self.browsing()?;
         state.directory.file_items.get(state.selected_index)
     }
@@ -1281,6 +1321,9 @@ impl App {
                 self.success_message = None;
             }
         }
+        self.preview_target = None;
+        self.preview_tasks.cancel();
+        self.clear_preview_data();
         self.sort_new_listing();
     }
 
@@ -2496,8 +2539,37 @@ impl App {
     // Preview Panel Methods
     // ========================================
 
+    /// Keep the default pane attached to the selected entry without taking focus.
+    fn sync_preview(&mut self) {
+        if self.ui.preview != PreviewPanel::Browsing || self.tasks.is_running() {
+            return;
+        }
+        let target = self.browsing().and_then(|state| {
+            self.selected_file_item().map(|item| PreviewTarget {
+                container: self.selected_container_index,
+                path: state.current_path().to_owned(),
+                name: item.actual_name.clone(),
+            })
+        });
+        if target == self.preview_target {
+            return;
+        }
+        self.preview_tasks.cancel();
+        self.clear_preview_data();
+        self.preview_target = target;
+        if self.preview_target.is_some() {
+            self.start_preview(PreviewPanel::Browsing);
+        }
+    }
+
     /// Open the preview panel and fetch the selected file's preview.
     pub fn load_preview(&mut self) {
+        self.preview_tasks.cancel();
+        self.clear_preview_data();
+        self.start_preview(PreviewPanel::Focused);
+    }
+
+    fn start_preview(&mut self, panel: PreviewPanel) {
         let (selected_item, current_path, object_store) = match self.browsing() {
             Some(state) => {
                 let Some(item) = self.selected_file_item() else {
@@ -2518,8 +2590,7 @@ impl App {
 
         // Check if it's a folder
         if selected_item.kind == EntryKind::Folder {
-            self.preview_error = Some("Cannot preview folders".to_string());
-            self.ui.show_preview = true;
+            self.ui.preview = PreviewPanel::Browsing;
             return;
         }
 
@@ -2533,7 +2604,7 @@ impl App {
                     .to_string(),
             );
             self.preview_file_type = Some(file_type);
-            self.ui.show_preview = true;
+            self.ui.preview = panel;
             return;
         }
 
@@ -2546,7 +2617,7 @@ impl App {
         };
 
         self.preview_file_type = Some(file_type.clone());
-        self.ui.show_preview = true;
+        self.ui.preview = panel;
         self.preview_error = None;
         self.preview_data = None;
         self.preview_scroll = (0, 0);
@@ -2555,12 +2626,16 @@ impl App {
         self.parquet_table_data = None;
         self.parquet_schema_data = None;
 
-        self.tasks
-            .spawn(format!("Loading preview of {name}"), async move {
-                TaskEvent::PreviewLoaded(Box::new(
-                    Self::fetch_preview(object_store.as_ref(), &object_path, &file_type).await,
-                ))
-            });
+        let tasks = if panel == PreviewPanel::Focused {
+            &mut self.tasks
+        } else {
+            &mut self.preview_tasks
+        };
+        tasks.spawn(format!("Loading preview of {name}"), async move {
+            TaskEvent::PreviewLoaded(Box::new(
+                Self::fetch_preview(object_store.as_ref(), &object_path, &file_type).await,
+            ))
+        });
     }
 
     /// Fetch and parse a preview (up to `MAX_PREVIEW_BYTES` for non-Parquet files).
@@ -2702,7 +2777,13 @@ impl App {
 
     /// Close the preview panel.
     pub fn close_preview(&mut self) {
-        self.ui.show_preview = false;
+        self.ui.preview = PreviewPanel::Hidden;
+        self.preview_tasks.cancel();
+        self.preview_target = None;
+        self.clear_preview_data();
+    }
+
+    fn clear_preview_data(&mut self) {
         self.preview_data = None;
         self.preview_file_type = None;
         self.preview_error = None;
@@ -2868,7 +2949,7 @@ mod tests {
             icons: detect_terminal_icons(),
             modal: Modal::None,
             ui: UiToggles {
-                show_preview: false,
+                preview: super::PreviewPanel::default(),
             },
             sort_criteria: SortCriteria::Name,
             preview_data: None,
@@ -2880,6 +2961,8 @@ mod tests {
             parquet_table_data: None,
             parquet_schema_data: None,
             tasks: super::Tasks::new(),
+            preview_tasks: super::Tasks::new(),
+            preview_target: None,
             folder_stats_cache: std::collections::HashMap::new(),
             clipboard: None,
         }
@@ -3713,6 +3796,147 @@ mod tests {
         result.unwrap();
     }
 
+    /// Exercise the default split pane and selection previews in tmux.
+    #[tokio::test]
+    #[ignore = "interactive terminal required"]
+    async fn browser_interactive_preview() {
+        let (_dir, mut app) = navigation_test_app().await;
+        let store = app.browsing().unwrap().object_store.clone();
+        for (name, data) in [
+            ("empty.txt", Vec::new()),
+            ("résumé-with-a-very-long-name.txt", vec![b'x'; 1536]),
+            ("data.json", br#"[{"name":"example","count":42}]"#.to_vec()),
+        ] {
+            store
+                .put(&ObjectPath::from(format!("parent/{name}")), data.into())
+                .await
+                .unwrap();
+        }
+        app.refresh_files();
+        settle(&mut app).await;
+        let mut terminal = ratatui::init();
+        let result = app.run(&mut terminal).await;
+        ratatui::restore();
+        result.unwrap();
+    }
+
+    #[tokio::test]
+    async fn default_folder_preview_keeps_enter_and_info_available() {
+        let (_dir, mut app) = navigation_test_app().await;
+        app.sync_preview();
+        assert_eq!(app.ui.preview, super::PreviewPanel::Browsing);
+        assert!(!app.preview_tasks.is_running());
+        let text = rendered(&app);
+        for expected in [
+            "child",
+            "Virtual folder",
+            "Enter folder",
+            "i  Show folder info",
+        ] {
+            assert!(text.contains(expected), "missing {expected:?}");
+        }
+        app.handle_key_event(KeyEvent::from(KeyCode::Char('i')))
+            .unwrap();
+        settle(&mut app).await;
+        assert!(matches!(
+            app.modal,
+            Modal::BlobInfo {
+                info: super::BlobInfo::Folder { .. }
+            }
+        ));
+        app.handle_key_event(KeyEvent::from(KeyCode::Esc)).unwrap();
+        app.handle_key_event(KeyEvent::from(KeyCode::Enter))
+            .unwrap();
+        settle(&mut app).await;
+        assert_eq!(app.browsing().unwrap().current_path(), "parent/child/");
+        app.sync_preview();
+        let message = app.preview_tasks.recv().await.unwrap();
+        if let Some(super::TaskEvent::PreviewLoaded(preview)) = app.preview_tasks.accept(message) {
+            app.install_preview(*preview);
+        }
+        assert!(rendered(&app).contains("payload"));
+    }
+
+    #[tokio::test]
+    async fn automatic_preview_never_blocks_navigation_and_drops_stale_results() {
+        let (gate, mut app) = gated_app().await;
+        app.move_down();
+        app.sync_preview();
+        assert!(app.preview_tasks.is_running());
+        assert!(!app.tasks.is_running());
+        assert!(rendered(&app).contains("Loading preview"));
+
+        // Finish the fetch but leave its result queued while the selection changes.
+        gate.add_permits(10);
+        let stale =
+            tokio::time::timeout(std::time::Duration::from_secs(2), app.preview_tasks.recv())
+                .await
+                .unwrap()
+                .unwrap();
+        app.handle_key_event(KeyEvent::from(KeyCode::Char('k')))
+            .unwrap();
+        app.sync_preview();
+        assert_eq!(app.browsing().unwrap().selected_index, 0);
+        assert!(app.preview_tasks.accept(stale).is_none());
+        assert!(app.preview_data.is_none());
+        assert!(app.preview_error.is_none());
+        let text = rendered(&app);
+        assert!(text.contains("Virtual folder"));
+        assert!(!text.contains("Loading preview"));
+    }
+
+    #[tokio::test]
+    async fn file_sizes_stay_right_aligned_when_names_are_clipped() {
+        use ratatui::{buffer::Buffer, layout::Rect, widgets::Widget};
+        let (_dir, mut app) = navigation_test_app().await;
+        let store = app.browsing().unwrap().object_store.clone();
+        store
+            .put(
+                &ObjectPath::from("parent/résumé-with-a-very-long-name.txt"),
+                vec![b'x'; 1536].into(),
+            )
+            .await
+            .unwrap();
+        store
+            .put(
+                &ObjectPath::from("parent/empty.txt"),
+                bytes::Bytes::new().into(),
+            )
+            .await
+            .unwrap();
+        app.refresh_files();
+        settle(&mut app).await;
+
+        for show_preview in [true, false] {
+            app.ui.preview = if show_preview {
+                super::PreviewPanel::Browsing
+            } else {
+                super::PreviewPanel::Hidden
+            };
+            for width in [60, 100, 140] {
+                let mut buffer = Buffer::empty(Rect::new(0, 0, width, 30));
+                app.render(buffer.area, &mut buffer);
+                let list_width = if show_preview {
+                    width * 40 / 100
+                } else {
+                    width
+                };
+                for (row, expected) in [(1, ""), (2, "7 B"), (3, "0 B"), (4, "1.5 KB")] {
+                    let size: String = (list_width - 1 - u16::try_from(expected.len()).unwrap()
+                        ..list_width - 1)
+                        .map(|x| buffer[(x, row)].symbol())
+                        .collect();
+                    assert_eq!(size, expected, "width={width}, preview={show_preview}");
+                }
+                assert_eq!(
+                    buffer[(list_width - 2, 1)].symbol(),
+                    " ",
+                    "folder has no size"
+                );
+            }
+        }
+    }
+
     #[tokio::test]
     async fn entering_percent_encoded_folder_lists_children() -> color_eyre::Result<()> {
         let store = object_store::memory::InMemory::new();
@@ -3772,7 +3996,7 @@ mod tests {
     #[test]
     fn parquet_tab_toggle_switches_views_and_resets_scroll() {
         let mut app = test_app();
-        app.ui.show_preview = true;
+        app.ui.preview = super::PreviewPanel::Focused;
         app.preview_file_type = Some(PreviewFileType::Parquet);
         app.parquet_preview_mode = Some(ParquetPreviewMode::Table);
         app.parquet_table_data = Some(TablePreview {
@@ -3851,13 +4075,13 @@ mod tests {
 
         app.handle_key_event(press(KeyCode::Char('p'))).unwrap();
         settle(&mut app).await;
-        assert!(app.ui.show_preview);
+        assert!(app.ui.preview.is_visible());
         assert!(app.preview_data.is_some());
 
         // None of the file-list actions may reach the list hidden behind the preview.
         for key in ['r', '/', 'd', 'x', 'c', 's', 'u', 'i', 'y'] {
             app.handle_key_event(press(KeyCode::Char(key))).unwrap();
-            assert!(app.ui.show_preview, "`{key}` closed the preview");
+            assert!(app.ui.preview.is_visible(), "`{key}` closed the preview");
             assert!(
                 matches!(app.modal, Modal::None),
                 "`{key}` opened a modal over the preview"
@@ -3872,7 +4096,7 @@ mod tests {
 
         // Backspace closes the preview rather than leaving the container with it open.
         app.handle_key_event(press(KeyCode::Backspace)).unwrap();
-        assert!(!app.ui.show_preview);
+        assert!(!app.ui.preview.is_visible());
         assert_eq!(app.browsing().unwrap().current_path(), "parent/");
     }
 
@@ -4148,7 +4372,7 @@ mod tests {
             assert!(matches!(app.modal, Modal::None), "`{key}` opened a modal");
             assert!(matches!(app.search, Search::Inactive));
             assert_eq!(app.browsing().unwrap().selected_index, 0);
-            assert!(!app.ui.show_preview);
+            assert_eq!(app.ui.preview, super::PreviewPanel::Browsing);
         }
         app.handle_key_event(KeyEvent::from(KeyCode::Char('q')))
             .unwrap();
@@ -4230,13 +4454,13 @@ mod tests {
         app.load_preview();
         assert!(rendered(&app).contains("Loading preview"));
         app.handle_key_event(KeyEvent::from(KeyCode::Esc)).unwrap();
-        assert!(!app.ui.show_preview);
+        assert!(!app.ui.preview.is_visible());
         assert!(!app.tasks.is_running());
 
         gate.add_permits(10);
         app.load_preview();
         settle(&mut app).await;
-        assert!(app.ui.show_preview);
+        assert!(app.ui.preview.is_visible());
         assert!(matches!(app.preview_data, Some(PreviewData::Text(_))));
     }
 

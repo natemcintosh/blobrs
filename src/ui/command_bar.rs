@@ -6,7 +6,7 @@ use ratatui::{
     widgets::{Paragraph, Widget},
 };
 
-use crate::app::{App, Modal, Session};
+use crate::app::{App, Modal, PreviewPanel, Session};
 
 use super::{ACCENT, MUTED, SURFACE, TEXT, panel};
 
@@ -153,7 +153,7 @@ impl App {
                     Hint::new("Esc", "Cancel"),
                 ],
                 Modal::BlobInfo { .. } => &[Hint::new("Esc/←/h", "Close"), Hint::new("q", "Quit")],
-                Modal::None if self.ui.show_preview => {
+                Modal::None if self.ui.preview == PreviewPanel::Focused => {
                     let mut preview = vec![
                         Hint::new("↑/↓/k/j", "Rows"),
                         Hint::new("←/→/h/l", "Columns"),
