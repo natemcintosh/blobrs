@@ -15,13 +15,13 @@ const COMMAND_GAP: usize = 1;
 
 /// A shortcut stays together when the command bar wraps to another row.
 #[derive(Clone, Copy)]
-struct CommandHint {
+pub(super) struct CommandHint {
     key: &'static str,
     label: &'static str,
 }
 
 impl CommandHint {
-    const fn new(key: &'static str, label: &'static str) -> Self {
+    pub(super) const fn new(key: &'static str, label: &'static str) -> Self {
         Self { key, label }
     }
 
@@ -46,7 +46,7 @@ pub(super) struct CommandBar {
 }
 
 impl CommandBar {
-    fn new(hints: &[CommandHint], width: u16, status: Option<String>) -> Self {
+    pub(super) fn new(hints: &[CommandHint], width: u16, status: Option<String>) -> Self {
         let mut commands = Vec::new();
         let mut row = Vec::new();
         let mut row_width = 0;
