@@ -65,7 +65,10 @@ grant blob data access.
   (defaulting to `~/.local/share/blobrs/favorites.json`). Finish searching
   with Enter before pressing `f` to toggle a favorite.
 - Uploads use the local filename and never overwrite existing blobs. Uploads
-  read the file into memory and block the TUI until complete.
+  read the file into memory and run in the background.
+- Network operations show activity in the command bar. While an operation runs,
+  press Esc or Ctrl-C to cancel, or `q` to quit. Folder operations stop between
+  objects, so completed changes are kept and partial completion is reported.
 - Upload and download file choosers require a working desktop portal.
 - On X11 without a clipboard manager (e.g. XFCE over xrdp), paths copied with
   `y` can be pasted only while blobrs is running.

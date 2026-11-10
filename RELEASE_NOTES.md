@@ -1,29 +1,34 @@
-# Blobrs 0.5.0
+# Blobrs 0.6.0
 
-This release adds local file uploads and persistent container favorites, and switches storage authentication to your Azure CLI login.
+This release keeps the TUI responsive during network operations, refreshes its styling and command bar, and improves folder sorting and operation reliability. These changes are since v0.5.0.
 
 ## New features
 
-- **Upload local files:** Press `u` while browsing a container or folder to open the upload prompt and choose a local file. The prompt shows the destination. Uploads keep the local filename and refuse to overwrite existing blobs.
-- **Favorite containers:** Press `f` in the container list to pin or unpin a container. Favorites appear first, persist between sessions, and are stored separately for each storage account. Finish searching with Enter before toggling a favorite.
-- **Azure CLI authentication:** Use your existing `az login` session, including managed identity login via `az login --identity`, instead of configuring storage account keys.
+- **Cancelable background operations:** Container and directory listings, folder scans, previews, metadata, uploads, downloads, cloning, deletion, and file dialogs now run in the background. The command bar shows activity and folder-operation progress. While an operation runs, press Esc or Ctrl-C to cancel, or `q` to quit.
+- **Refreshed interface:** A consistent color palette, clearer selection styling, and compact panel titles accompany a context-sensitive command bar. Shortcuts wrap together to fit the terminal width and change for searches, previews, dialogs, and running operations.
+- **Folder sorting by contents:** Date sorts order folders by their newest blob at any depth; size sorts use the total size of their blobs. Name sorting requires no recursive scan. Directory contents appear before the background scan finishes, and scans are cached while the container is open.
+- **Streaming downloads:** Downloads stream to temporary partial files and are renamed only when complete, reducing memory use and avoiding truncated destination files after failure or cancellation.
 
 ## Fixes and improvements
 
-- Preserve encoded blob paths when accessing objects.
-- Fix Linux/Wayland file chooser compatibility by using the desktop portal backend.
-- Update dependencies, including Arrow/Parquet 58, object_store 0.13, and Ratatui 0.30, and replace yanked dependency versions.
-- Expand property and regression tests and simplify terminal event handling.
-- Document standalone installation, environment setup, and required Azure data permissions.
+- Keep the current directory and listing consistent when navigation fails or is canceled, and ignore results from canceled or replaced operations.
+- Report folder-listing failures and partial completion during bulk operations instead of failing silently. Snapshot folder listings before processing, including overlapping folder clones.
+- Preserve active search filters when changing sort order, and keep the previous sort if a folder scan fails.
+- Capture all keys while a preview is open so preview input cannot trigger actions on the underlying listing.
+- Keep the clipboard alive so paths copied with `y` can be pasted on X11 without a clipboard manager.
+- Update object_store to 0.14, dirs to 7, and refresh futures, reqwest, bytes, tempfile, and CI dependencies.
+- Expand regression and property tests, enforce strict pedantic Clippy checks in CI, restore build caches before compilation, and add `just pedantic` and `just install` development commands.
 
-## Upgrading and setup
+## Upgrading and usage notes
 
-Authentication has changed: sign in with `az login` (or `az login --identity`) and set `AZURE_STORAGE_ACCOUNT` to the storage account name. Storage keys and a container environment variable are no longer needed. The binary does not load `.env` files; `just run` loads the repository's `.env` for development.
+Blobrs supports **Linux only**; documentation and CI now explicitly reflect this. Install this release from source with:
 
-Your identity needs **Storage Blob Data Reader** for browsing, previews, and downloads, or **Storage Blob Data Contributor** for uploads, cloning, and deletion. Assign the role at the storage account scope or above so Blobrs can list containers.
+```bash
+cargo install --git https://github.com/natemcintosh/blobrs.git --tag v0.6.0 --locked --force
+```
 
-Uploads read the selected file into memory and block the UI until complete. Linux upload/download file choosers require a working desktop portal.
+Continue using `az login` (or `az login --identity`) and set `AZURE_STORAGE_ACCOUNT` to your storage account name. Upload and download file choosers require a working desktop portal.
 
-The Cargo package version is now aligned with GitHub releases at **0.5.0**; earlier GitHub releases through 0.4.1 still carried Cargo version 0.3.0.
+One operation runs at a time; while it runs, only cancellation and quitting are accepted. Cancellation does not roll back completed changes: bulk folder operations stop between objects and report partial completion. Uploads still read the selected file into memory and never overwrite existing blobs. On X11 without a clipboard manager, copied paths remain available only while Blobrs is running.
 
-**Full changelog:** https://github.com/natemcintosh/blobrs/compare/v0.4.1...v0.5.0
+**Full changelog:** https://github.com/natemcintosh/blobrs/compare/v0.5.0...v0.6.0
