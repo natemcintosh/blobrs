@@ -309,6 +309,11 @@ pub struct App {
     /// Folder scans of the open container by prefix, kept so a date or size sort
     /// does not rescan on every visit. Dropped on refresh and after any change.
     folder_stats_cache: HashMap<String, HashMap<String, FolderStats>>,
+    /// Created on first copy and kept for the app's lifetime. On X11 the copying
+    /// process must answer paste requests itself, so dropping the clipboard right
+    /// after writing loses the text when no clipboard manager is running (e.g.
+    /// XFCE over xrdp).
+    clipboard: Option<Clipboard>,
 }
 
 impl std::fmt::Debug for App {
@@ -383,6 +388,7 @@ impl App {
             parquet_schema_data: None,
             tasks: Tasks::new(),
             folder_stats_cache: HashMap::new(),
+            clipboard: None,
         };
 
         app.load_containers();
@@ -2243,9 +2249,13 @@ impl App {
             Self::join_blob_path(&current_path, &selected_item.actual_name)
         };
 
-        // Copy to clipboard
-        let mut clipboard = Clipboard::new()?;
-        clipboard.set_text(full_path.clone())?;
+        let clipboard = match self.clipboard.take() {
+            Some(clipboard) => clipboard,
+            None => Clipboard::new()?,
+        };
+        self.clipboard
+            .insert(clipboard)
+            .set_text(full_path.clone())?;
 
         // Set success message
         let item_type = if is_folder { "folder" } else { "file" };
@@ -2871,6 +2881,7 @@ mod tests {
             parquet_schema_data: None,
             tasks: super::Tasks::new(),
             folder_stats_cache: std::collections::HashMap::new(),
+            clipboard: None,
         }
     }
 
