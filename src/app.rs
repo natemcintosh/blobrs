@@ -4086,6 +4086,18 @@ mod tests {
         (gate, app)
     }
 
+    /// Every operation blocks forever, to exercise the spinner, input limits,
+    /// and cancel in tmux without Azure credentials.
+    #[tokio::test]
+    #[ignore = "interactive terminal required"]
+    async fn blocked_operation_interactive_preview() {
+        let (_gate, app) = gated_app().await;
+        let mut terminal = ratatui::init();
+        let result = app.run(&mut terminal).await;
+        ratatui::restore();
+        result.unwrap();
+    }
+
     #[tokio::test]
     async fn canceled_directory_load_leaves_state_unchanged() {
         for cancel in [
