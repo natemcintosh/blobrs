@@ -4,6 +4,7 @@ pub mod app;
 mod bulk;
 mod favorites;
 pub mod preview;
+mod task;
 pub mod terminal_icons;
 pub mod ui;
 
@@ -30,6 +31,9 @@ fn main() -> color_eyre::Result<()> {
             .enable_all()
             .build()?;
 
-        runtime.block_on(async { App::new(storage_account).await?.run(terminal).await })
+        let result = runtime.block_on(async { App::new(storage_account)?.run(terminal).await });
+        // Do not wait for a native file dialog that is still open.
+        runtime.shutdown_background();
+        result
     })
 }

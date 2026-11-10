@@ -241,8 +241,9 @@ impl App {
             chunk_index += 1;
         }
 
-        // Footer with instructions (using pre-calculated text)
-        let footer = Paragraph::new(instructions)
+        // Footer with instructions, or the running operation, which takes all
+        // keys except cancel and quit
+        let footer = Paragraph::new(self.tasks.status().unwrap_or_else(|| instructions.into()))
             .block(Block::bordered().border_type(BorderType::Rounded))
             .fg(Color::Cyan)
             .alignment(Alignment::Center)
@@ -458,8 +459,9 @@ impl App {
             chunk_index += 1;
         }
 
-        // Footer with instructions (using pre-calculated text)
-        let footer = Paragraph::new(instructions)
+        // Footer with instructions, or the running operation, which takes all
+        // keys except cancel and quit
+        let footer = Paragraph::new(self.tasks.status().unwrap_or_else(|| instructions.into()))
             .block(Block::bordered().border_type(BorderType::Rounded))
             .fg(Color::Cyan)
             .alignment(Alignment::Center)
@@ -935,8 +937,9 @@ impl App {
                 file_type_name.clone()
             };
 
-        // Handle loading state
-        if self.ui.is_loading_preview {
+        // Handle loading state; an open preview takes every key, so only its
+        // own load can be running
+        if self.tasks.is_running() {
             let loading = Paragraph::new(format!("{} Loading preview...", self.icons.loading))
                 .block(
                     Block::bordered()
