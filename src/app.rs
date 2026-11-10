@@ -4190,11 +4190,13 @@ mod tests {
     #[tokio::test]
     async fn running_operation_is_shown_in_the_footer() {
         let (_gate, mut app) = gated_app().await;
-        assert!(!rendered(&app).contains("to cancel"));
+        assert!(!rendered(&app).contains("Esc/Ctrl-C"));
         app.enter_directory();
         let text = rendered(&app);
         assert!(text.contains("Loading /parent/child"));
-        assert!(text.contains("to cancel"));
+        assert!(text.contains("Esc/Ctrl-C"));
+        assert!(text.contains("Cancel"));
+        assert!(!text.contains("Download"));
     }
 
     #[tokio::test]

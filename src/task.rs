@@ -218,12 +218,9 @@ impl Tasks {
         if let Some((completed, total)) = progress {
             let _ = write!(status, " ({completed}/{total})");
         }
-        status.push_str(match cancel {
-            Cancel::Stop(token) if token.is_cancelled() => {
-                " • stopping after the current object • `q` to quit"
-            }
-            _ => " • `Esc` or `Ctrl-C` to cancel • `q` to quit",
-        });
+        if matches!(cancel, Cancel::Stop(token) if token.is_cancelled()) {
+            status.push_str(" · stopping after the current object");
+        }
         Some(status)
     }
 }

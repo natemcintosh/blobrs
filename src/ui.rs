@@ -12,9 +12,32 @@ use ratatui::{
 use crate::app::{App, Modal, ParquetPreviewMode, Session};
 use crate::preview::PreviewData;
 
+mod command_bar;
+
+const TEXT: Color = Color::Rgb(210, 218, 228);
+const MUTED: Color = Color::Rgb(145, 157, 174);
+const BORDER: Color = Color::Rgb(80, 94, 112);
+const ACCENT: Color = Color::Rgb(125, 195, 232);
+const SURFACE: Color = Color::Rgb(36, 49, 65);
+
+fn panel() -> Block<'static> {
+    Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(BORDER))
+        .title_style(Style::default().fg(ACCENT).add_modifier(Modifier::BOLD))
+}
+
+fn selection() -> Style {
+    Style::default()
+        .bg(SURFACE)
+        .fg(ACCENT)
+        .add_modifier(Modifier::BOLD)
+}
+
 impl Widget for &App {
     /// Renders the user interface widgets.
     fn render(self, area: Rect, buf: &mut Buffer) {
+        buf.set_style(area, Style::default().fg(TEXT));
         match &self.session {
             Session::Selecting => self.render_container_selection(area, buf),
             Session::Browsing(_) => {
@@ -55,36 +78,10 @@ impl Widget for &App {
 }
 
 impl App {
-    /// Calculate the height needed for footer text with wrapping
-    #[allow(clippy::cast_possible_truncation)] // text length is always small for UI
-    fn calculate_footer_height(text: &str, available_width: u16) -> u16 {
-        if available_width <= 4 {
-            return 3; // Minimum height for borders and padding
-        }
-
-        // Account for borders and padding (2 for left/right borders, 2 for padding)
-        let text_width = available_width.saturating_sub(4);
-
-        if text_width == 0 {
-            return 3;
-        }
-
-        // Calculate lines needed: text length / available width, with minimum of 3 and maximum of 6
-        let lines_needed = (text.len() as u16).div_ceil(text_width).clamp(1, 4);
-
-        // Add 2 for top and bottom borders
-        lines_needed + 2
-    }
-
     #[allow(clippy::too_many_lines)]
     fn render_container_selection(&self, area: Rect, buf: &mut Buffer) {
-        // Calculate footer height based on instruction text
-        let instructions = if self.is_searching_containers() {
-            "Search Mode: Type to filter containers • `Enter` to confirm • `Esc` to cancel • `Ctrl+↑`/`Ctrl+↓` to navigate"
-        } else {
-            "Press `Ctrl-C` or `q` or `Esc` to quit • `r`/`F5` to refresh • `↑`/`↓` or `k`/`j` to navigate • `→`/`l`/`Enter` to select container • `f` to toggle favorite • `/` to search"
-        };
-        let footer_height = Self::calculate_footer_height(instructions, area.width);
+        let command_bar = self.command_bar(area.width);
+        let footer_height = command_bar.height();
 
         // Create a vertical layout
         let mut constraints = vec![
@@ -173,13 +170,13 @@ impl App {
 
         let title = if self.is_searching_containers() {
             format!(
-                " Azure Storage Account: {account} - Select Container [SEARCH] ({count} shown) ",
+                " {account} / Containers · Search ({count} shown) ",
                 account = self.storage_account,
                 count = self.containers.len()
             )
         } else {
             format!(
-                " Azure Storage Account: {account} - Select Container ({count} containers) ",
+                " {account} / Containers ({count}) ",
                 account = self.storage_account,
                 count = self.containers.len()
             )
@@ -187,14 +184,14 @@ impl App {
 
         let main_block = List::new(container_items)
             .block(
-                Block::bordered()
+                panel()
                     .title(title)
-                    .title_alignment(Alignment::Center)
+                    .title_alignment(Alignment::Left)
                     .border_type(BorderType::Rounded),
             )
-            .fg(Color::Green)
-            .highlight_style(Style::default().bg(Color::DarkGray).fg(Color::Yellow))
-            .highlight_symbol("▶ ");
+            .fg(TEXT)
+            .highlight_style(selection())
+            .highlight_symbol("▸ ");
 
         ratatui::widgets::StatefulWidget::render(main_block, chunks[0], buf, &mut list_state);
 
@@ -206,8 +203,8 @@ impl App {
             let search_text = format!("Search: {query}");
             let search_widget = Paragraph::new(search_text)
                 .block(
-                    Block::bordered()
-                        .title(" Search Containers (Press Enter to confirm, Esc to cancel) ")
+                    panel()
+                        .title(" Filter containers ")
                         .border_type(BorderType::Rounded),
                 )
                 .fg(Color::Cyan)
@@ -222,7 +219,7 @@ impl App {
                 "{error_icon} {error}",
                 error_icon = self.icons.error
             ))
-            .block(Block::bordered().border_type(BorderType::Rounded))
+            .block(panel().border_type(BorderType::Rounded))
             .fg(Color::Red)
             .wrap(ratatui::widgets::Wrap { trim: true })
             .alignment(Alignment::Left);
@@ -233,7 +230,7 @@ impl App {
                 "{success_icon} {success}",
                 success_icon = self.icons.success
             ))
-            .block(Block::bordered().border_type(BorderType::Rounded))
+            .block(panel().border_type(BorderType::Rounded))
             .fg(Color::Green)
             .wrap(ratatui::widgets::Wrap { trim: true })
             .alignment(Alignment::Left);
@@ -241,15 +238,7 @@ impl App {
             chunk_index += 1;
         }
 
-        // Footer with instructions, or the running operation, which takes all
-        // keys except cancel and quit
-        let footer = Paragraph::new(self.tasks.status().unwrap_or_else(|| instructions.into()))
-            .block(Block::bordered().border_type(BorderType::Rounded))
-            .fg(Color::Cyan)
-            .alignment(Alignment::Center)
-            .wrap(Wrap { trim: true });
-
-        footer.render(chunks[chunk_index], buf);
+        command_bar.render(chunks[chunk_index], buf);
     }
 
     #[allow(clippy::too_many_lines)]
@@ -258,19 +247,8 @@ impl App {
             unreachable!("render_blob_browsing called when session is not Session::Browsing");
         };
 
-        // Calculate footer height based on instruction text
-        let instructions = if self.is_searching_files() {
-            "Search Mode: Type to filter • `Enter` to confirm • `Esc` to cancel • `Ctrl+↑`/`Ctrl+↓` to navigate"
-        } else if self.ui.show_preview {
-            if self.preview_file_type == Some(super::preview::PreviewFileType::Parquet) {
-                "Preview: `↑`/`↓`/`k`/`j` to scroll rows • `←`/`→`/`h`/`l` to scroll columns • `Tab` to switch table/metadata • `p` or `Esc` to close preview"
-            } else {
-                "Preview: `↑`/`↓`/`k`/`j` to scroll rows • `←`/`→`/`h`/`l` to scroll columns • `p` or `Esc` to close preview"
-            }
-        } else {
-            "Press `Ctrl-C` or `q` to quit • `Esc`/`←`/`h` to go back • `r`/`F5` to refresh • `↑`/`↓` or `k`/`j` to navigate • `→`/`l`/`Enter` to enter folder • `/` to search • `s` to sort • `i` for info • `p` to preview • `y` to copy path • `c` to clone • `x` to delete • `d` to download • `u` to upload"
-        };
-        let footer_height = Self::calculate_footer_height(instructions, area.width);
+        let command_bar = self.command_bar(area.width);
+        let footer_height = command_bar.height();
 
         // Create a vertical layout with main content, search (if active), message, and footer
         let mut constraints = vec![
@@ -384,14 +362,14 @@ impl App {
 
         let title = if self.is_searching_files() {
             format!(
-                " Container: {container} - {path} [SEARCH] ({count} shown) ",
+                " {container} {path} · Search ({count} shown) ",
                 container = container_name,
                 path = current_path_display,
                 count = browsing.files().len()
             )
         } else {
             format!(
-                " Container: {container} - {path} ({count} items) ",
+                " {container} {path} ({count} items) ",
                 container = container_name,
                 path = current_path_display,
                 count = browsing.files().len()
@@ -400,14 +378,14 @@ impl App {
 
         let main_block = List::new(file_items)
             .block(
-                Block::bordered()
+                panel()
                     .title(title)
-                    .title_alignment(Alignment::Center)
+                    .title_alignment(Alignment::Left)
                     .border_type(BorderType::Rounded),
             )
-            .fg(Color::Green)
-            .highlight_style(Style::default().bg(Color::DarkGray).fg(Color::Yellow))
-            .highlight_symbol("▶ ");
+            .fg(TEXT)
+            .highlight_style(selection())
+            .highlight_symbol("▸ ");
 
         ratatui::widgets::StatefulWidget::render(main_block, file_list_area, buf, &mut list_state);
 
@@ -424,8 +402,8 @@ impl App {
             let search_text = format!("Search: {query}");
             let search_widget = Paragraph::new(search_text)
                 .block(
-                    Block::bordered()
-                        .title(" Search (Press Enter to confirm, Esc to cancel) ")
+                    panel()
+                        .title(" Filter files ")
                         .border_type(BorderType::Rounded),
                 )
                 .fg(Color::Cyan)
@@ -440,7 +418,7 @@ impl App {
                 "{error_icon} {error}",
                 error_icon = self.icons.error
             ))
-            .block(Block::bordered().border_type(BorderType::Rounded))
+            .block(panel().border_type(BorderType::Rounded))
             .fg(Color::Red)
             .wrap(ratatui::widgets::Wrap { trim: true })
             .alignment(Alignment::Left);
@@ -451,7 +429,7 @@ impl App {
                 "{success_icon} {success}",
                 success_icon = self.icons.success
             ))
-            .block(Block::bordered().border_type(BorderType::Rounded))
+            .block(panel().border_type(BorderType::Rounded))
             .fg(Color::Green)
             .wrap(ratatui::widgets::Wrap { trim: true })
             .alignment(Alignment::Left);
@@ -459,15 +437,7 @@ impl App {
             chunk_index += 1;
         }
 
-        // Footer with instructions, or the running operation, which takes all
-        // keys except cancel and quit
-        let footer = Paragraph::new(self.tasks.status().unwrap_or_else(|| instructions.into()))
-            .block(Block::bordered().border_type(BorderType::Rounded))
-            .fg(Color::Cyan)
-            .alignment(Alignment::Center)
-            .wrap(Wrap { trim: true });
-
-        footer.render(chunks[chunk_index], buf);
+        command_bar.render(chunks[chunk_index], buf);
     }
 
     fn render_blob_info_popup(
@@ -492,7 +462,7 @@ impl App {
         };
 
         // Clear the popup area (make it semi-transparent effect by using a background)
-        let clear_block = Block::bordered()
+        let clear_block = panel()
             .border_type(BorderType::Rounded)
             .style(Style::default().bg(Color::Black));
         clear_block.render(popup_area, buf);
@@ -560,7 +530,7 @@ impl App {
         let info_text = info_lines.join("\n");
         let info_paragraph = Paragraph::new(info_text)
             .block(
-                Block::bordered()
+                panel()
                     .border_type(BorderType::Rounded)
                     .title(" Information ")
                     .style(Style::default().fg(Color::Cyan).bg(Color::Black)),
@@ -601,7 +571,7 @@ impl App {
             "Upload a local file to: /{}\n\nThe file keeps its name. Existing blobs are not replaced.\n\nTo upload elsewhere, press Esc, navigate to that folder,\nthen press u again.\n\nPress Enter to select a file\nPress Esc to cancel",
             browsing.current_path()
         ))
-        .block(Block::bordered().border_type(BorderType::Rounded).title(" Upload "))
+        .block(panel().border_type(BorderType::Rounded).title(" Upload "))
         .style(Style::default().fg(Color::Green).bg(Color::Black))
         .wrap(Wrap { trim: false })
         .render(popup, buf);
@@ -662,7 +632,7 @@ impl App {
         let info_text = download_text.join("\n");
         let info_paragraph = Paragraph::new(info_text)
             .block(
-                Block::bordered()
+                panel()
                     .border_type(BorderType::Rounded)
                     .title(" Download ")
                     .style(Style::default().fg(Color::Green).bg(Color::Black)),
@@ -709,7 +679,7 @@ impl App {
         let info_text = sort_text.join("\n");
         let info_paragraph = Paragraph::new(info_text)
             .block(
-                Block::bordered()
+                panel()
                     .border_type(BorderType::Rounded)
                     .title(" Sort Files ")
                     .style(Style::default().fg(Color::Cyan).bg(Color::Black)),
@@ -808,9 +778,10 @@ impl App {
 
         let info_paragraph = Paragraph::new(info_text)
             .block(
-                Block::bordered()
+                panel()
                     .border_type(BorderType::Rounded)
                     .title(" Clone ")
+                    .title_style(title_style)
                     .style(title_style),
             )
             .style(Style::default().bg(Color::Black))
@@ -897,9 +868,11 @@ impl App {
 
         let info_paragraph = Paragraph::new(info_text)
             .block(
-                Block::bordered()
+                panel()
                     .border_type(BorderType::Rounded)
                     .title(" Delete ")
+                    .title_style(title_style)
+                    .border_style(title_style)
                     .style(title_style),
             )
             .style(Style::default().bg(Color::Black));
@@ -942,9 +915,9 @@ impl App {
         if self.tasks.is_running() {
             let loading = Paragraph::new(format!("{} Loading preview...", self.icons.loading))
                 .block(
-                    Block::bordered()
+                    panel()
                         .title(format!(" {file_type_name} Preview "))
-                        .title_alignment(Alignment::Center)
+                        .title_alignment(Alignment::Left)
                         .border_type(BorderType::Rounded),
                 )
                 .fg(Color::Yellow)
@@ -957,9 +930,9 @@ impl App {
         if let Some(error) = &self.preview_error {
             let error_widget = Paragraph::new(format!("{} {}", self.icons.error, error))
                 .block(
-                    Block::bordered()
+                    panel()
                         .title(format!(" {file_type_name} Preview "))
-                        .title_alignment(Alignment::Center)
+                        .title_alignment(Alignment::Left)
                         .border_type(BorderType::Rounded),
                 )
                 .fg(Color::Red)
@@ -986,9 +959,9 @@ impl App {
             None => {
                 let empty = Paragraph::new("No preview data available")
                     .block(
-                        Block::bordered()
+                        panel()
                             .title(format!(" {file_type_name} Preview "))
-                            .title_alignment(Alignment::Center)
+                            .title_alignment(Alignment::Left)
                             .border_type(BorderType::Rounded),
                     )
                     .fg(Color::DarkGray)
@@ -1031,9 +1004,9 @@ impl App {
         if num_cols == 0 {
             let empty = Paragraph::new("Empty table")
                 .block(
-                    Block::bordered()
+                    panel()
                         .title(format!(" {row_info} "))
-                        .title_alignment(Alignment::Center)
+                        .title_alignment(Alignment::Left)
                         .border_type(BorderType::Rounded),
                 )
                 .fg(Color::DarkGray)
@@ -1148,7 +1121,7 @@ impl App {
                     .collect();
 
                 let style = if row_idx == self.preview_selected_row {
-                    Style::default().bg(Color::DarkGray).fg(Color::Yellow)
+                    selection()
                 } else {
                     Style::default().fg(Color::White)
                 };
@@ -1167,12 +1140,12 @@ impl App {
         let table = Table::new(rows, constraints)
             .header(header_row)
             .block(
-                Block::bordered()
+                panel()
                     .title(title)
-                    .title_alignment(Alignment::Center)
+                    .title_alignment(Alignment::Left)
                     .border_type(BorderType::Rounded),
             )
-            .row_highlight_style(Style::default().bg(Color::DarkGray).fg(Color::Yellow));
+            .row_highlight_style(selection());
 
         // Use TableState for scrolling
         let mut table_state = TableState::default();
@@ -1232,9 +1205,9 @@ impl App {
 
         let json_widget = Paragraph::new(visible_content)
             .block(
-                Block::bordered()
+                panel()
                     .title(title)
-                    .title_alignment(Alignment::Center)
+                    .title_alignment(Alignment::Left)
                     .border_type(BorderType::Rounded),
             )
             .fg(Color::White)
@@ -1292,9 +1265,9 @@ impl App {
 
         let text_widget = Paragraph::new(visible_content)
             .block(
-                Block::bordered()
+                panel()
                     .title(title)
-                    .title_alignment(Alignment::Center)
+                    .title_alignment(Alignment::Left)
                     .border_type(BorderType::Rounded),
             )
             .fg(Color::White)
@@ -1408,9 +1381,9 @@ impl App {
         let text = Text::from(visible_lines);
 
         let schema_widget = Paragraph::new(text).block(
-            Block::bordered()
+            panel()
                 .title(title)
-                .title_alignment(Alignment::Center)
+                .title_alignment(Alignment::Left)
                 .border_type(BorderType::Rounded),
         );
 
@@ -1530,7 +1503,7 @@ fn format_number(n: u64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{App, compute_table_column_viewport, truncate_with_ellipsis};
+    use super::{compute_table_column_viewport, truncate_with_ellipsis};
     use proptest::prelude::*;
 
     #[test]
@@ -1562,15 +1535,6 @@ mod tests {
     }
 
     proptest! {
-        #[test]
-        fn footer_height_stays_in_expected_bounds(text in ".*", width in any::<u16>()) {
-            let height = App::calculate_footer_height(&text, width);
-            prop_assert!((3..=6).contains(&height));
-            if width <= 4 {
-                prop_assert_eq!(height, 3);
-            }
-        }
-
         #[test]
         fn ellipsis_truncation_respects_requested_limits(input in ".*", max_chars in 0_usize..32) {
             let truncated = truncate_with_ellipsis(&input, max_chars);
