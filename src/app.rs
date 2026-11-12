@@ -1,4 +1,5 @@
 use crate::{
+    config::{AccountName, Config},
     favorites::Favorites,
     preview::{
         MAX_PARQUET_PREVIEW_BYTES, MAX_PARQUET_TABLE_PREVIEW_BYTES, MAX_PREVIEW_BYTES,
@@ -85,8 +86,16 @@ impl BrowsingState {
 
 #[derive(Debug, Clone)]
 pub enum Session {
+    Accounts(AccountPicker),
     Selecting,
     Browsing(BrowsingState),
+}
+
+/// Account entry captures text keys; the saved list captures navigation keys.
+#[derive(Debug, Clone)]
+pub enum AccountPicker {
+    Saved { selected_index: usize },
+    Add { input: String },
 }
 
 #[derive(Debug, Clone)]
@@ -297,6 +306,8 @@ pub struct App {
     pub session: Session,
     /// Azure Storage Account name.
     pub storage_account: String,
+    pub(crate) config: Config,
+    config_path: PathBuf,
     /// Shared Azure CLI credentials, including the token refresh cache.
     credentials: AzureCredentialProvider,
     favorites: Favorites,
@@ -384,27 +395,48 @@ impl std::fmt::Debug for App {
 }
 
 impl App {
-    /// Constructs a new instance of [`App`] and starts loading its containers.
+    /// Constructs a new instance of [`App`] showing the saved storage accounts.
     ///
     /// Must be called from within a Tokio runtime.
     ///
     /// # Errors
     ///
-    /// Returns an error if the Azure client cannot be configured.
-    pub fn new(storage_account: String) -> color_eyre::Result<Self> {
+    /// Returns an error if config cannot be loaded/saved or credentials cannot be configured.
+    pub fn new(storage_account: Option<String>) -> color_eyre::Result<Self> {
+        Self::with_config(Config::path()?, storage_account)
+    }
+
+    fn with_config(
+        config_path: PathBuf,
+        storage_account: Option<String>,
+    ) -> color_eyre::Result<Self> {
+        use color_eyre::eyre::{Context, eyre};
+
+        let mut config = Config::load(&config_path)
+            .wrap_err_with(|| format!("Cannot load config {}", config_path.display()))?;
+        if let Some(account) = storage_account {
+            let account = AccountName::try_from(account)
+                .map_err(|error| eyre!("Invalid AZURE_STORAGE_ACCOUNT: {error}"))?;
+            config = Config::add_account(&config_path, account)
+                .wrap_err_with(|| format!("Cannot save config {}", config_path.display()))?;
+        }
         // object_store exposes its CLI provider through a container client. Building
         // this client makes no request; $root need not exist to obtain the provider.
+        // CLI tokens are account independent. The placeholder allows first launch
+        // before any account has been entered; it is never used for requests.
         let credentials = MicrosoftAzureBuilder::new()
-            .with_account(&storage_account)
+            .with_account("blobrs")
             .with_container_name("$root")
             .with_use_azure_cli(true)
             .build()?
             .credentials()
             .clone();
-        let mut app = Self {
+        let app = Self {
             running: true,
-            session: Session::Selecting,
-            storage_account,
+            session: Session::Accounts(AccountPicker::Saved { selected_index: 0 }),
+            storage_account: String::new(),
+            config,
+            config_path,
             credentials,
             favorites: Favorites::default(),
             favorites_path: Favorites::path().ok(),
@@ -438,8 +470,6 @@ impl App {
             folder_stats_cache: HashMap::new(),
             clipboard: None,
         };
-
-        app.load_containers();
 
         Ok(app)
     }
@@ -583,6 +613,18 @@ impl App {
     /// This function currently does not return errors but uses `Result` for API consistency.
     #[allow(clippy::too_many_lines)]
     pub fn handle_key_event(&mut self, key_event: KeyEvent) -> color_eyre::Result<()> {
+        if matches!(self.session, Session::Accounts(_)) {
+            self.handle_account_key_event(key_event);
+            return Ok(());
+        }
+        // Switching accounts also works while a container listing is in flight.
+        if self.is_selecting()
+            && !self.is_searching_containers()
+            && key_event.code == KeyCode::Char('a')
+        {
+            self.open_accounts();
+            return Ok(());
+        }
         // One operation runs at a time, so only cancel and quit are accepted until it ends.
         if self.tasks.is_running() {
             match key_event.code {
@@ -657,10 +699,8 @@ impl App {
 
         if self.is_selecting() {
             match key_event.code {
-                KeyCode::Esc => {
-                    // Only quit at the top level (container selection)
-                    self.quit();
-                    return Ok(());
+                KeyCode::Esc | KeyCode::Backspace | KeyCode::Left | KeyCode::Char('h') => {
+                    self.open_accounts();
                 }
                 KeyCode::Char('f') => self.toggle_favorite(),
                 KeyCode::Char('/') => {
@@ -910,14 +950,14 @@ impl App {
     pub(crate) fn browsing(&self) -> Option<&BrowsingState> {
         match &self.session {
             Session::Browsing(state) => Some(state),
-            Session::Selecting => None,
+            Session::Accounts(_) | Session::Selecting => None,
         }
     }
 
     fn browsing_mut(&mut self) -> Option<&mut BrowsingState> {
         match &mut self.session {
             Session::Browsing(state) => Some(state),
-            Session::Selecting => None,
+            Session::Accounts(_) | Session::Selecting => None,
         }
     }
 
@@ -1979,6 +2019,120 @@ impl App {
             }
             Err(error) => self.error_message = Some(format!("Cannot save favorites: {error}")),
         }
+    }
+
+    fn open_accounts(&mut self) {
+        self.tasks.cancel();
+        self.search = Search::Inactive;
+        self.modal = Modal::None;
+        self.error_message = None;
+        self.success_message = None;
+        match Config::load(&self.config_path) {
+            Ok(config) => self.config = config,
+            Err(error) => self.error_message = Some(format!("Cannot load config: {error}")),
+        }
+        let selected_index = self
+            .config
+            .accounts()
+            .iter()
+            .position(|account| account.as_str() == self.storage_account)
+            .unwrap_or(0);
+        self.session = Session::Accounts(AccountPicker::Saved { selected_index });
+    }
+
+    fn handle_account_key_event(&mut self, key: KeyEvent) {
+        if key.modifiers == KeyModifiers::CONTROL && matches!(key.code, KeyCode::Char('c' | 'C')) {
+            self.quit();
+            return;
+        }
+        if let Session::Accounts(AccountPicker::Add { input }) = &mut self.session {
+            match key.code {
+                KeyCode::Esc => {
+                    self.session = Session::Accounts(AccountPicker::Saved { selected_index: 0 });
+                    self.error_message = None;
+                }
+                KeyCode::Enter => {
+                    let account = match AccountName::try_from(input.clone()) {
+                        Ok(account) => account,
+                        Err(error) => {
+                            self.error_message = Some(error.to_owned());
+                            return;
+                        }
+                    };
+                    match Config::add_account(&self.config_path, account.clone()) {
+                        Ok(config) => {
+                            self.config = config;
+                            self.switch_account(&account);
+                        }
+                        Err(error) => {
+                            self.error_message = Some(format!("Cannot save account: {error}"));
+                        }
+                    }
+                }
+                KeyCode::Backspace => {
+                    input.pop();
+                    self.error_message = None;
+                }
+                KeyCode::Char(c)
+                    if !key
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                {
+                    input.push(c);
+                    self.error_message = None;
+                }
+                _ => {}
+            }
+            return;
+        }
+        let Session::Accounts(AccountPicker::Saved { selected_index }) = &mut self.session else {
+            return;
+        };
+        match key.code {
+            KeyCode::Esc if !self.storage_account.is_empty() => {
+                self.session = Session::Selecting;
+                self.error_message = None;
+            }
+            KeyCode::Char('q') | KeyCode::Esc => self.quit(),
+            KeyCode::Up | KeyCode::Char('k') => *selected_index = selected_index.saturating_sub(1),
+            KeyCode::Down | KeyCode::Char('j') => {
+                *selected_index =
+                    (*selected_index + 1).min(self.config.accounts().len().saturating_sub(1));
+            }
+            KeyCode::Char('a') => {
+                self.session = Session::Accounts(AccountPicker::Add {
+                    input: String::new(),
+                });
+                self.error_message = None;
+            }
+            KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
+                if let Some(account) = self.config.accounts().iter().nth(*selected_index).cloned() {
+                    self.switch_account(&account);
+                } else {
+                    self.session = Session::Accounts(AccountPicker::Add {
+                        input: String::new(),
+                    });
+                }
+            }
+            KeyCode::Char('r') | KeyCode::F(5) => self.open_accounts(),
+            _ => {}
+        }
+    }
+
+    fn switch_account(&mut self, account: &AccountName) {
+        self.tasks.cancel();
+        self.preview_tasks.cancel();
+        self.preview_target = None;
+        self.clear_preview_data();
+        self.folder_stats_cache.clear();
+        account.as_str().clone_into(&mut self.storage_account);
+        self.session = Session::Selecting;
+        self.modal = Modal::None;
+        self.search = Search::Inactive;
+        self.containers.clear();
+        self.all_containers.clear();
+        self.selected_container_index = 0;
+        self.load_containers();
     }
 
     /// Load the list of containers from Azure Storage.
@@ -3147,6 +3301,8 @@ mod tests {
             running: true,
             session: Session::Selecting,
             storage_account: "test-account".to_string(),
+            config: crate::config::Config::default(),
+            config_path: std::path::PathBuf::new(),
             favorites: crate::favorites::Favorites::default(),
             favorites_path: None,
             credentials: Arc::new(object_store::StaticCredentialProvider::new(
@@ -3193,6 +3349,178 @@ mod tests {
                     .expect("operation did not finish")
                     .expect("task channel closed");
             app.apply_task_message(message);
+        }
+    }
+
+    #[tokio::test]
+    async fn startup_shows_saved_accounts_without_a_network_request() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        let app = App::with_config(path.clone(), None).unwrap();
+        assert!(matches!(app.session, Session::Accounts(_)));
+        assert!(app.config.accounts().is_empty());
+        assert!(!app.tasks.is_running());
+
+        let app = App::with_config(path.clone(), Some("firstaccount".to_owned())).unwrap();
+        assert_eq!(app.config.accounts().len(), 1);
+        assert!(!app.tasks.is_running());
+        let app = App::with_config(path.clone(), Some("firstaccount".to_owned())).unwrap();
+        assert_eq!(app.config.accounts().len(), 1);
+        let app = App::with_config(path, None).unwrap();
+        assert_eq!(
+            app.config.accounts().iter().next().unwrap().as_str(),
+            "firstaccount"
+        );
+        assert!(matches!(app.session, Session::Accounts(_)));
+        assert!(!app.tasks.is_running());
+    }
+
+    #[tokio::test]
+    async fn manual_account_entry_validates_saves_and_can_be_canceled() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        let mut app = App::with_config(path.clone(), None).unwrap();
+        app.handle_key_event(KeyCode::Enter.into()).unwrap();
+        // Text input must accept q and navigation letters as account-name text.
+        for c in "qjkl".chars() {
+            app.handle_key_event(KeyCode::Char(c).into()).unwrap();
+        }
+        assert!(app.running);
+        assert!(
+            matches!(&app.session, Session::Accounts(super::AccountPicker::Add { input }) if input == "qjkl")
+        );
+        app.handle_key_event(KeyCode::Esc.into()).unwrap();
+        assert!(!path.exists());
+        app.handle_key_event(KeyCode::Char('a').into()).unwrap();
+        app.handle_key_event(KeyCode::Enter.into()).unwrap();
+        assert!(app.error_message.is_some());
+        assert!(!path.exists());
+        for c in "secondaccount".chars() {
+            app.handle_key_event(KeyCode::Char(c).into()).unwrap();
+        }
+        app.handle_key_event(KeyCode::Enter.into()).unwrap();
+        assert_eq!(app.storage_account, "secondaccount");
+        assert!(matches!(app.session, Session::Selecting));
+        assert!(app.tasks.is_running());
+        app.tasks.cancel();
+        let restarted = App::with_config(path, None).unwrap();
+        assert_eq!(
+            restarted.config.accounts().iter().next().unwrap().as_str(),
+            "secondaccount"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_account_save_keeps_input_and_current_account() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = App::with_config(dir.path().join("config.json"), None).unwrap();
+        let invalid_parent = dir.path().join("file");
+        std::fs::write(&invalid_parent, "not a directory").unwrap();
+        app.config_path = invalid_parent.join("config.json");
+        app.session = Session::Accounts(super::AccountPicker::Add {
+            input: "validaccount".to_owned(),
+        });
+        app.handle_key_event(KeyCode::Enter.into()).unwrap();
+        assert!(
+            app.error_message
+                .as_deref()
+                .unwrap()
+                .contains("Cannot save account")
+        );
+        assert!(
+            matches!(&app.session, Session::Accounts(super::AccountPicker::Add { input }) if input == "validaccount")
+        );
+        assert!(app.config.accounts().is_empty());
+        assert_eq!(app.storage_account, "");
+        assert!(!app.tasks.is_running());
+    }
+
+    #[tokio::test]
+    async fn switching_accounts_drops_old_listings_search_and_scans() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        let mut app = App::with_config(path.clone(), Some("firstaccount".to_owned())).unwrap();
+        app.config = crate::config::Config::add_account(
+            &path,
+            crate::config::AccountName::try_from("secondaccount".to_owned()).unwrap(),
+        )
+        .unwrap();
+        app.storage_account = "firstaccount".to_owned();
+        app.session = Session::Selecting;
+        app.containers = vec![super::ContainerInfo {
+            name: "oldcontainer".to_owned(),
+        }];
+        app.all_containers = app.containers.clone();
+        app.selected_container_index = 10;
+        app.folder_stats_cache
+            .insert("old/".to_owned(), std::collections::HashMap::new());
+        app.tasks.spawn("Old listing", async {
+            super::TaskEvent::ContainersLoaded(Ok(vec![super::ContainerInfo {
+                name: "stale".to_owned(),
+            }]))
+        });
+        tokio::task::yield_now().await;
+        let stale_message = app.tasks.recv().await.unwrap();
+        // The account picker remains available even while containers are loading.
+        app.handle_key_event(KeyCode::Char('a').into()).unwrap();
+        assert!(!app.tasks.is_running());
+        app.search = Search::Containers {
+            query: "old".to_owned(),
+            all_containers: app.containers.clone(),
+        };
+        app.handle_key_event(KeyCode::Down.into()).unwrap();
+        app.handle_key_event(KeyCode::Enter.into()).unwrap();
+        assert_eq!(app.storage_account, "secondaccount");
+        assert!(matches!(app.session, Session::Selecting));
+        assert!(matches!(app.search, Search::Inactive));
+        assert!(app.containers.is_empty());
+        assert!(app.all_containers.is_empty());
+        assert_eq!(app.selected_container_index, 0);
+        assert!(app.folder_stats_cache.is_empty());
+        assert_eq!(app.ui.preview, super::PreviewPanel::Browsing);
+        app.apply_task_message(stale_message);
+        assert!(app.containers.is_empty());
+        app.tasks.cancel();
+
+        app.handle_key_event(KeyCode::Esc.into()).unwrap();
+        assert!(matches!(
+            app.session,
+            Session::Accounts(super::AccountPicker::Saved { selected_index: 1 })
+        ));
+        app.handle_key_event(KeyCode::Esc.into()).unwrap();
+        assert!(matches!(app.session, Session::Selecting));
+        assert!(app.running);
+    }
+
+    #[tokio::test]
+    async fn account_switching_uses_the_selected_accounts_favorites() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        let mut app = App::with_config(path, None).unwrap();
+        app.favorites_path = Some(dir.path().join("favorites.json"));
+        crate::favorites::Favorites::toggle(
+            app.favorites_path.as_deref().unwrap(),
+            "firstaccount",
+            "zebra",
+        )
+        .unwrap();
+        crate::favorites::Favorites::toggle(
+            app.favorites_path.as_deref().unwrap(),
+            "secondaccount",
+            "alpha",
+        )
+        .unwrap();
+        for (account, first) in [("firstaccount", "zebra"), ("secondaccount", "alpha")] {
+            app.switch_account(&crate::config::AccountName::try_from(account.to_owned()).unwrap());
+            app.tasks.cancel();
+            app.finish_load_containers(Ok(["alpha", "zebra"]
+                .into_iter()
+                .map(|name| super::ContainerInfo {
+                    name: name.to_owned(),
+                })
+                .collect()));
+            assert_eq!(app.containers[0].name, first);
+            assert!(app.is_favorite(first));
         }
     }
 

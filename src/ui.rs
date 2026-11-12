@@ -9,7 +9,9 @@ use ratatui::{
     },
 };
 
-use crate::app::{App, EntryKind, FileItem, Modal, ParquetPreviewMode, PreviewPanel, Session};
+use crate::app::{
+    AccountPicker, App, EntryKind, FileItem, Modal, ParquetPreviewMode, PreviewPanel, Session,
+};
 use crate::preview::PreviewData;
 
 mod command_bar;
@@ -95,6 +97,7 @@ impl Widget for &App {
     fn render(self, area: Rect, buf: &mut Buffer) {
         buf.set_style(area, Style::default().fg(TEXT));
         match &self.session {
+            Session::Accounts(picker) => self.render_accounts(area, buf, picker),
             Session::Selecting => self.render_container_selection(area, buf),
             Session::Browsing(_) => {
                 self.render_blob_browsing(area, buf);
@@ -134,6 +137,66 @@ impl Widget for &App {
 }
 
 impl App {
+    fn render_accounts(&self, area: Rect, buf: &mut Buffer, picker: &AccountPicker) {
+        let commands = self.command_bar(area.width);
+        let [header, body, error, footer] = Layout::vertical([
+            Constraint::Length(3),
+            Constraint::Min(0),
+            Constraint::Length(if self.error_message.is_some() { 4 } else { 0 }),
+            Constraint::Length(commands.height()),
+        ])
+        .areas(area);
+        Paragraph::new(
+            "Storage accounts use your Azure CLI login. Sign in with az login before connecting.",
+        )
+        .style(Style::default().fg(MUTED))
+        .wrap(Wrap { trim: true })
+        .render(header, buf);
+        match picker {
+            AccountPicker::Saved { selected_index } => {
+                let items: Vec<ListItem> = if self.config.accounts().is_empty() {
+                    vec![ListItem::new(
+                        "No saved accounts. Press a or Enter to add your first account.",
+                    )]
+                } else {
+                    self.config
+                        .accounts()
+                        .iter()
+                        .map(|account| {
+                            let active = if account.as_str() == self.storage_account {
+                                " (active)"
+                            } else {
+                                ""
+                            };
+                            ListItem::new(format!("{}{active}", account.as_str()))
+                        })
+                        .collect()
+                };
+                let mut state = ListState::default();
+                if !self.config.accounts().is_empty() {
+                    state.select(Some(*selected_index));
+                }
+                ratatui::widgets::StatefulWidget::render(
+                    List::new(items)
+                        .block(panel().title(format!(
+                            " Storage accounts ({}) ",
+                            self.config.accounts().len()
+                        )))
+                        .highlight_style(selection())
+                        .highlight_symbol("› "),
+                    body,
+                    buf,
+                    &mut state,
+                );
+            }
+            AccountPicker::Add { input } => Self::render_account_input(body, buf, input),
+        }
+        if let Some(message) = &self.error_message {
+            render_message(error, buf, MessageKind::Error, self.icons.error, message);
+        }
+        commands.render(footer, buf);
+    }
+
     #[allow(clippy::too_many_lines)]
     fn render_container_selection(&self, area: Rect, buf: &mut Buffer) {
         let command_bar = self.command_bar(area.width);

@@ -6,7 +6,7 @@ use ratatui::{
     widgets::{Paragraph, Widget},
 };
 
-use crate::app::{App, Modal, PreviewPanel, Session};
+use crate::app::{AccountPicker, App, Modal, PreviewPanel, Session};
 
 use super::{ACCENT, MUTED, SURFACE, TEXT, panel};
 
@@ -37,6 +37,31 @@ impl CommandHint {
             Span::styled(format!(" {}", self.label), Style::default().fg(TEXT)),
             Span::raw(" "),
         ]
+    }
+}
+
+impl AccountPicker {
+    fn command_hints(&self) -> &'static [CommandHint] {
+        use CommandHint as Hint;
+
+        const SAVED: &[CommandHint] = &[
+            Hint::new("↑/↓/k/j", "Navigate"),
+            Hint::new("Enter", "Connect"),
+            Hint::new("a", "Add account"),
+            Hint::new("r/F5", "Refresh"),
+            Hint::new("Esc", "Back/quit"),
+            Hint::new("q", "Quit"),
+        ];
+        const ADD: &[CommandHint] = &[
+            Hint::new("Enter", "Save and connect"),
+            Hint::new("Esc", "Cancel"),
+            Hint::new("Ctrl-C", "Quit"),
+        ];
+
+        match self {
+            Self::Saved { .. } => SAVED,
+            Self::Add { .. } => ADD,
+        }
     }
 }
 
@@ -119,10 +144,41 @@ impl Widget for CommandBar {
 }
 
 impl App {
+    fn preview_command_bar(&self, width: u16) -> CommandBar {
+        use CommandHint as Hint;
+
+        let mut hints = vec![
+            Hint::new("↑/↓/k/j", "Rows"),
+            Hint::new("←/→/h/l", "Columns"),
+            Hint::new("Home/End", "First/last"),
+        ];
+        if self.preview_scope == crate::preview::PreviewScope::Limited
+            && self
+                .preview_file_type
+                .as_ref()
+                .is_some_and(crate::preview::PreviewFileType::is_supported)
+        {
+            hints.push(Hint::new("f", "Full preview"));
+        }
+        if self.preview_file_type == Some(crate::preview::PreviewFileType::Parquet) {
+            hints.push(Hint::new("Tab", "Table/metadata"));
+        }
+        hints.extend([Hint::new("p/Esc", "Close"), Hint::new("q", "Quit")]);
+        CommandBar::new(&hints, width, None)
+    }
+
     pub(super) fn command_bar(&self, width: u16) -> CommandBar {
         use CommandHint as Hint;
 
-        let hints: &[CommandHint] = if self.tasks.is_running() {
+        let hints: &[CommandHint] = if let Session::Accounts(picker) = &self.session {
+            picker.command_hints()
+        } else if self.tasks.is_running() && matches!(self.session, Session::Selecting) {
+            &[
+                Hint::new("a", "Accounts"),
+                Hint::new("Esc/Ctrl-C", "Cancel"),
+                Hint::new("q", "Quit"),
+            ]
+        } else if self.tasks.is_running() {
             &[Hint::new("Esc/Ctrl-C", "Cancel"), Hint::new("q", "Quit")]
         } else if self.is_searching_containers() || self.is_searching_files() {
             &[
@@ -154,33 +210,18 @@ impl App {
                 ],
                 Modal::BlobInfo { .. } => &[Hint::new("Esc/←/h", "Close"), Hint::new("q", "Quit")],
                 Modal::None if self.ui.preview == PreviewPanel::Focused => {
-                    let mut preview = vec![
-                        Hint::new("↑/↓/k/j", "Rows"),
-                        Hint::new("←/→/h/l", "Columns"),
-                        Hint::new("Home/End", "First/last"),
-                    ];
-                    if self.preview_scope == crate::preview::PreviewScope::Limited
-                        && self
-                            .preview_file_type
-                            .as_ref()
-                            .is_some_and(crate::preview::PreviewFileType::is_supported)
-                    {
-                        preview.push(Hint::new("f", "Full preview"));
-                    }
-                    if self.preview_file_type == Some(crate::preview::PreviewFileType::Parquet) {
-                        preview.push(Hint::new("Tab", "Table/metadata"));
-                    }
-                    preview.extend([Hint::new("p/Esc", "Close"), Hint::new("q", "Quit")]);
-                    return CommandBar::new(&preview, width, None);
+                    return self.preview_command_bar(width);
                 }
                 Modal::None => match self.session {
+                    Session::Accounts(_) => unreachable!("account shortcuts handled above"),
                     Session::Selecting => &[
                         Hint::new("↑/↓/k/j", "Navigate"),
                         Hint::new("Enter/→/l", "Open"),
                         Hint::new("/", "Search"),
                         Hint::new("f", "Favorite"),
                         Hint::new("r/F5", "Refresh"),
-                        Hint::new("q/Esc", "Quit"),
+                        Hint::new("a/Esc", "Accounts"),
+                        Hint::new("q", "Quit"),
                     ],
                     Session::Browsing(_) => &[
                         Hint::new("↑/↓/k/j", "Navigate"),

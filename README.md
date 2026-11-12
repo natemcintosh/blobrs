@@ -15,18 +15,19 @@ cd blobrs
 cargo install --path . --locked
 
 az login
-export AZURE_STORAGE_ACCOUNT="your_storage_account_name"
 blobrs
 ```
 
-`AZURE_STORAGE_ACCOUNT` is the only required environment variable. See
-[Environment variables](#environment-variables) for optional settings.
+Press `a` to enter and save a storage account name, then Enter to connect.
+On future launches, choose an account from the saved list with ↑/↓ and Enter.
+See [Environment variables](#environment-variables) for optional settings.
 Once installed, run `blobrs` from any directory. Make sure Cargo's binary directory
 (`~/.cargo/bin`) is on your `PATH`.
 
 ## Features
 
 - Browse containers and virtual folders
+- Save multiple storage accounts and switch between them
 - Pin favorite containers
 - Search/filter blobs by name
 - Preview files and view blob/folder metadata
@@ -38,14 +39,14 @@ Once installed, run `blobrs` from any directory. Make sure Cargo's binary direct
 
 | Variable | Required | Purpose |
 | --- | --- | --- |
-| `AZURE_STORAGE_ACCOUNT` | Yes | Storage account name, not a URL or connection string. |
+| `AZURE_STORAGE_ACCOUNT` | No | Add this account to the saved account list at startup. Use an account name, not a URL or connection string. |
 | `BLOBRS_ICONS` | No | Set to `unicode`, `ascii`, or `minimal` to override automatic icon detection. |
 
 ```bash
 export AZURE_STORAGE_ACCOUNT="your_storage_account_name"
 ```
 
-To keep the setting across terminals, add the line to `~/.bashrc` or `~/.zshrc`.
+The account is saved automatically, so the variable is optional on later launches.
 
 Credentials come from your Azure CLI login; no storage key or container variable
 is needed. The installed binary and `cargo run` do not load `.env` files.
@@ -61,6 +62,12 @@ grant blob data access.
 
 ## Usage notes
 
+- Storage accounts are saved in `$XDG_CONFIG_HOME/blobrs/config.json`
+  (defaulting to `~/.config/blobrs/config.json`). At the storage account root
+  (container list), press `a` or Esc to view and switch saved accounts. Press `a`
+  in that list to add another account. Enter saves and connects; Esc cancels entry.
+  Names must contain 3–24 lowercase letters and numbers. Saving an account does
+  not require a connection; credentials continue to come from your Azure CLI login.
 - Favorites are saved per storage account in `$XDG_DATA_HOME/blobrs/favorites.json`
   (defaulting to `~/.local/share/blobrs/favorites.json`). Finish searching
   with Enter before pressing `f` to toggle a favorite.
@@ -88,8 +95,9 @@ grant blob data access.
 
 ## Development
 
-Run from the repository with `cargo run --release`, or copy `.env.example` to
-`.env`, set your account name, and use `just run` to load it automatically.
+Run from the repository with `cargo run --release` or `just run`. To seed the
+saved account list from an environment file, copy `.env.example` to `.env`, set
+your account name, and use `just run` to load it automatically.
 
 Install [cargo-nextest](https://nexte.st/docs/installation/) and run the tests:
 

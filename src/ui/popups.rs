@@ -83,6 +83,21 @@ fn input_field(area: Rect, buf: &mut Buffer, input: &str) {
 }
 
 impl App {
+    pub(super) fn render_account_input(area: Rect, buf: &mut Buffer, input: &str) {
+        let block = panel().title(" Add storage account ");
+        let inner = block.inner(area);
+        block.render(area, buf);
+        let [field, description] =
+            Layout::vertical([Constraint::Length(3), Constraint::Min(0)]).areas(inner);
+        Paragraph::new("Enter 3–24 lowercase letters and numbers.\nUse the account name, e.g. mystorageaccount.\nEnter saves the account and connects using your Azure CLI login.")
+            .wrap(Wrap { trim: true })
+            .render(description, buf);
+        let block = panel().title(" Account name ");
+        let inner = block.inner(field);
+        block.render(field, buf);
+        input_field(inner, buf, input);
+    }
+
     pub(super) fn render_blob_info_popup(&self, area: Rect, buf: &mut Buffer, info: &BlobInfo) {
         let value_width = usize::from(area.width.min(64).saturating_sub(14));
         let lines = match info {

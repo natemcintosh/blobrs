@@ -22,10 +22,9 @@ build:
 install:
     cargo install --path . --locked --force
 
-# Run the release build using the configured Azure Storage account.
+# Run the release build and choose a saved Azure Storage account.
 [group('development')]
 run:
-    @just check-env
     cargo run --release
 
 # Run tests with cargo-nextest.
@@ -56,11 +55,3 @@ clean:
 # Format source files, run Clippy, and run all tests.
 [group('validation')]
 test-all: fmt check test
-
-# Ensure AZURE_STORAGE_ACCOUNT is set before running the application.
-[private]
-check-env:
-    @if [ -z "${AZURE_STORAGE_ACCOUNT:-}" ]; then \
-        echo "AZURE_STORAGE_ACCOUNT environment variable not set"; \
-        exit 1; \
-    fi
