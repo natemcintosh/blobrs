@@ -2983,11 +2983,13 @@ impl App {
                 .await
                 .map_err(|e| format!("Failed to get file info: {e}"))?;
             if meta.size > MAX_PARQUET_TABLE_PREVIEW_BYTES as u64 {
+                // Azure requires explicit offsets rather than a suffix range.
+                let start = meta.size.saturating_sub(MAX_PARQUET_PREVIEW_BYTES as u64);
                 let bytes = object_store
                     .get_opts(
                         object_path,
                         GetOptions {
-                            range: Some(GetRange::Suffix(MAX_PARQUET_PREVIEW_BYTES as u64)),
+                            range: Some(GetRange::Bounded(start..meta.size)),
                             ..GetOptions::default()
                         },
                     )
@@ -4365,6 +4367,7 @@ mod tests {
             ("large.tsv", csv.replace(',', "\t").into_bytes()),
             ("large.txt", text.into_bytes()),
             ("large.parquet", parquet_preview_rows((0..350).collect())),
+            ("metadata.parquet", large_parquet_preview_bytes()),
             ("large.json", serde_json::to_vec(&serde_json::json!({"values": (0..350).map(|i| format!("Line {i}: {}", "x".repeat(200))).collect::<Vec<_>>()})).unwrap()),
         ] {
             store
@@ -4657,8 +4660,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn full_parquet_preview_bypasses_download_and_row_limits() {
+    fn large_parquet_preview_bytes() -> Vec<u8> {
         use crate::preview::MAX_PARQUET_TABLE_PREVIEW_BYTES;
         use arrow::{array::StringArray, record_batch::RecordBatch};
         let values = (0..250)
@@ -4679,6 +4681,90 @@ mod tests {
         writer.write(&batch).unwrap();
         writer.close().unwrap();
         assert!(bytes.len() > MAX_PARQUET_TABLE_PREVIEW_BYTES);
+        bytes
+    }
+
+    #[tokio::test]
+    async fn azure_large_parquet_metadata_uses_bounded_range() {
+        use crate::preview::MAX_PARQUET_PREVIEW_BYTES;
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+        let bytes = large_parquet_preview_bytes();
+        let size = bytes.len();
+        let start = size - MAX_PARQUET_PREVIEW_BYTES;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        // Use the real Azure client with a local endpoint: it rejects suffix
+        // ranges before making an HTTP request, unlike the in-memory store.
+        let server = tokio::spawn(async move {
+            for method in ["HEAD", "GET"] {
+                let (socket, _) = listener.accept().await.unwrap();
+                let mut socket = BufReader::new(socket);
+                let mut request = String::new();
+                loop {
+                    let mut line = String::new();
+                    assert_ne!(socket.read_line(&mut line).await.unwrap(), 0);
+                    if line == "\r\n" {
+                        break;
+                    }
+                    request.push_str(&line);
+                }
+                assert!(request.starts_with(&format!("{method} /store/large.parquet ")));
+                let response = if method == "HEAD" {
+                    format!("HTTP/1.1 200 OK\r\nContent-Length: {size}\r\n")
+                } else {
+                    assert!(
+                        request
+                            .to_ascii_lowercase()
+                            .contains(&format!("range: bytes={start}-{}\r\n", size - 1))
+                    );
+                    format!(
+                        "HTTP/1.1 206 Partial Content\r\nContent-Length: {}\r\nContent-Range: bytes {start}-{}/{size}\r\n",
+                        size - start,
+                        size - 1
+                    )
+                };
+                let response = format!(
+                    "{response}ETag: \"test\"\r\nLast-Modified: Thu, 12 Nov 2026 00:00:00 GMT\r\nConnection: close\r\n\r\n"
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+                if method == "GET" {
+                    socket.write_all(&bytes[start..]).await.unwrap();
+                }
+                socket.shutdown().await.unwrap();
+            }
+        });
+        let store = object_store::azure::MicrosoftAzureBuilder::new()
+            .with_account("testaccount")
+            .with_container_name("store")
+            .with_access_key("dGVzdA==")
+            .with_endpoint(endpoint)
+            .with_allow_http(true)
+            .build()
+            .unwrap();
+        let preview = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            App::fetch_preview(
+                &store,
+                &ObjectPath::from("large.parquet"),
+                &PreviewFileType::Parquet,
+                PreviewScope::Limited,
+            ),
+        )
+        .await
+        .unwrap();
+        assert!(preview.error.is_none(), "{:?}", preview.error);
+        server.await.unwrap();
+        assert_eq!(preview.parquet_mode, Some(ParquetPreviewMode::Metadata));
+        assert!(preview.parquet_file.is_none());
+        let schema = preview.parquet_schema.unwrap();
+        assert_eq!(schema.num_rows, 250);
+        assert_eq!(schema.file_size, Some(size as u64));
+    }
+
+    #[tokio::test]
+    async fn full_parquet_preview_bypasses_download_and_row_limits() {
+        let bytes = large_parquet_preview_bytes();
         let store = object_store::memory::InMemory::new();
         let path = ObjectPath::from("large.parquet");
         store.put(&path, bytes.into()).await.unwrap();
