@@ -532,8 +532,7 @@ fn try_json_array_as_table(arr: &[serde_json::Value], scope: PreviewScope) -> Op
                 .iter()
                 .map(|key| {
                     obj.get(key)
-                        .map(|value| value_to_string(value, scope))
-                        .unwrap_or_default()
+                        .map_or_default(|value| value_to_string(value, scope))
                 })
                 .collect();
             rows.push(row);

@@ -140,11 +140,7 @@ fn is_modern_terminal_program() -> bool {
     }
 
     // Check for Windows Terminal
-    if env::var("WT_SESSION").is_ok() {
-        return true;
-    }
-
-    false
+    env::var("WT_SESSION").is_ok()
 }
 
 #[cfg(test)]

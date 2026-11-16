@@ -84,11 +84,10 @@ fn render_message(area: Rect, buf: &mut Buffer, kind: MessageKind, icon: &str, m
 
 fn file_list_size(item: &FileItem) -> String {
     match item.kind {
-        EntryKind::File => item.size.map(format_bytes).unwrap_or_default(),
+        EntryKind::File => item.size.map_or_default(format_bytes),
         EntryKind::Folder => item
             .blob_count
-            .map(|count| format!("{count} blob{}", if count == 1 { "" } else { "s" }))
-            .unwrap_or_default(),
+            .map_or_default(|count| format!("{count} blob{}", if count == 1 { "" } else { "s" })),
     }
 }
 
@@ -485,7 +484,7 @@ impl App {
                 .enumerate()
                 .map(|(index, file)| {
                     let item = browsing.file_items().get(index);
-                    let size = item.map(file_list_size).unwrap_or_default();
+                    let size = item.map_or_default(file_list_size);
                     let mut cells = vec![
                         Cell::from(file.as_str()),
                         Cell::from(Line::from(size).alignment(Alignment::Right)),
@@ -493,8 +492,7 @@ impl App {
                     if let Some((_, _, format)) = modified_column {
                         let modified = item
                             .and_then(|item| item.last_modified)
-                            .map(|date| date.format(format).to_string())
-                            .unwrap_or_default();
+                            .map_or_default(|date| date.format(format).to_string());
                         cells.push(Cell::from(modified));
                     }
                     Row::new(cells)
