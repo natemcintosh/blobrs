@@ -163,7 +163,7 @@ impl App {
         if self.preview_file_type == Some(crate::preview::PreviewFileType::Parquet) {
             hints.push(Hint::new("Tab", "Table/metadata"));
         }
-        hints.extend([Hint::new("p/Esc", "Close"), Hint::new("q", "Quit")]);
+        hints.extend([Hint::new("p/Esc", "Back to list"), Hint::new("q", "Quit")]);
         CommandBar::new(&hints, width, None)
     }
 
@@ -230,7 +230,7 @@ impl App {
                         Hint::new("/", "Search"),
                         Hint::new("s", "Sort"),
                         Hint::new("i", "Info"),
-                        Hint::new("p", "Preview"),
+                        Hint::new("p", "Focus preview"),
                         Hint::new("y", "Copy path"),
                         Hint::new("d", "Download"),
                         Hint::new("u", "Upload"),

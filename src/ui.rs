@@ -416,20 +416,11 @@ impl App {
             .constraints(constraints)
             .split(area);
 
-        // Main content area - split horizontally if preview is shown
-        let main_area = chunks[0];
-        let (file_list_area, preview_area) = if self.ui.preview.is_visible() {
-            let horizontal_chunks = Layout::default()
-                .direction(Direction::Horizontal)
-                .constraints([
-                    Constraint::Percentage(40), // File list takes 40%
-                    Constraint::Percentage(60), // Preview takes 60%
-                ])
-                .split(main_area);
-            (horizontal_chunks[0], Some(horizontal_chunks[1]))
-        } else {
-            (main_area, None)
-        };
+        // Main content area: file list beside the always-visible preview
+        let [file_list_area, preview_area] = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
+            .areas(chunks[0]);
 
         let size_width = browsing
             .file_items()
@@ -551,10 +542,7 @@ impl App {
 
         ratatui::widgets::StatefulWidget::render(main_block, file_list_area, buf, &mut list_state);
 
-        // Render preview panel if active
-        if let Some(preview_rect) = preview_area {
-            self.render_preview_panel(preview_rect, buf);
-        }
+        self.render_preview_panel(preview_area, buf);
 
         let mut chunk_index = 1;
 
@@ -948,7 +936,7 @@ impl App {
             Some(if self.ui.preview == PreviewPanel::Focused {
                 "... [truncated; press f for full preview]"
             } else {
-                "... [truncated; press p to open preview]"
+                "... [truncated; press p to focus preview]"
             })
         } else {
             None
@@ -1012,7 +1000,7 @@ impl App {
             Some(if self.ui.preview == PreviewPanel::Focused {
                 "... [truncated; press f for full preview]"
             } else {
-                "... [truncated; press p to open preview]"
+                "... [truncated; press p to focus preview]"
             })
         } else {
             None

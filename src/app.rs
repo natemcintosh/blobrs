@@ -269,20 +269,13 @@ pub struct UiToggles {
     pub preview: PreviewPanel,
 }
 
-/// A visible preview can accompany browsing or take keyboard focus for scrolling.
+/// The preview pane is always shown beside the file list; it follows the
+/// selection while browsing, or takes keyboard focus for scrolling.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum PreviewPanel {
-    Hidden,
     #[default]
     Browsing,
     Focused,
-}
-
-impl PreviewPanel {
-    #[must_use]
-    pub fn is_visible(self) -> bool {
-        self != Self::Hidden
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -599,7 +592,7 @@ impl App {
             self.success_message = Some(format!("Canceled: {label}"));
         }
         if self.ui.preview == PreviewPanel::Focused {
-            self.close_preview();
+            self.unfocus_preview();
         }
     }
 
@@ -725,7 +718,9 @@ impl App {
             // Only a focused file preview captures navigation and action keys.
             if self.ui.preview == PreviewPanel::Focused {
                 match key_event.code {
-                    KeyCode::Char('p') | KeyCode::Esc | KeyCode::Backspace => self.close_preview(),
+                    KeyCode::Char('p') | KeyCode::Esc | KeyCode::Backspace => {
+                        self.unfocus_preview();
+                    }
                     KeyCode::Tab => self.toggle_parquet_preview_mode(),
                     KeyCode::Char('f') => self.load_full_preview(),
                     KeyCode::Home => {
@@ -2782,7 +2777,7 @@ impl App {
         }
     }
 
-    /// Open the preview panel and fetch the selected file's preview.
+    /// Focus the preview pane, fetching the selected file's preview if needed.
     pub fn load_preview(&mut self) {
         let target = self.browsing().and_then(|state| {
             self.selected_file_item().map(|item| PreviewTarget {
@@ -2800,6 +2795,7 @@ impl App {
         }
         self.preview_tasks.cancel();
         self.clear_preview_data();
+        self.preview_target = target;
         self.start_preview(PreviewPanel::Focused, PreviewScope::Limited);
     }
 
@@ -3120,12 +3116,16 @@ impl App {
             });
     }
 
-    /// Close the preview panel.
-    pub fn close_preview(&mut self) {
-        self.ui.preview = PreviewPanel::Hidden;
-        self.preview_tasks.cancel();
-        self.preview_target = None;
-        self.clear_preview_data();
+    /// Return focus to the file list, leaving the pane open to follow the selection.
+    fn unfocus_preview(&mut self) {
+        self.ui.preview = PreviewPanel::Browsing;
+        // Full previews apply only while focused, and a canceled load has nothing
+        // to show, so both fall back to the automatic preview on the next sync.
+        if self.preview_scope == PreviewScope::Full || self.preview_data.is_none() {
+            self.preview_tasks.cancel();
+            self.clear_preview_data();
+            self.preview_target = None;
+        }
     }
 
     fn clear_preview_data(&mut self) {
@@ -4533,11 +4533,12 @@ mod tests {
         };
         assert!(Arc::ptr_eq(table, app.parquet_table_data.as_ref().unwrap()));
 
-        // A queued page from a closed preview must not reinstall data or keep its cache alive.
+        // A queued page from a left full preview must not reinstall data or keep its cache alive.
         app.preview_selected_row = 1000;
         app.ensure_parquet_page();
         let stale = app.preview_tasks.recv().await.unwrap();
-        app.close_preview();
+        app.handle_key_event(KeyEvent::from(KeyCode::Esc)).unwrap();
+        assert_eq!(app.ui.preview, super::PreviewPanel::Browsing);
         assert!(app.preview_tasks.accept(stale).is_none());
         assert!(app.preview_data.is_none());
         assert!(original_file.upgrade().is_none());
@@ -4837,9 +4838,9 @@ mod tests {
         assert_eq!(app.preview_selected_row, 349);
         assert!(rendered(&app).contains("row-349"));
         app.handle_key_event(KeyEvent::from(KeyCode::Esc)).unwrap();
+        assert_eq!(app.ui.preview, super::PreviewPanel::Browsing);
         assert_eq!(app.preview_scope, PreviewScope::Limited);
         app.move_up();
-        app.ui.preview = super::PreviewPanel::Browsing;
         app.sync_preview();
         let message = app.preview_tasks.recv().await.unwrap();
         if let Some(super::TaskEvent::PreviewLoaded(preview)) = app.preview_tasks.accept(message) {
@@ -4994,57 +4995,47 @@ mod tests {
         app.refresh_files();
         settle(&mut app).await;
 
-        for show_preview in [true, false] {
-            app.ui.preview = if show_preview {
-                super::PreviewPanel::Browsing
-            } else {
-                super::PreviewPanel::Hidden
+        // The list always shares the row with the preview, so wide terminals cover wide lists.
+        for width in [60, 90, 100, 110, 140, 250] {
+            let mut buffer = Buffer::empty(Rect::new(0, 0, width, 30));
+            app.render(buffer.area, &mut buffer);
+            let list_width = width * 40 / 100;
+            let modified_width = match list_width {
+                24 | 36 => 0,
+                40 => 10,
+                _ => 16,
             };
-            for width in [60, 90, 100, 110, 140] {
-                let mut buffer = Buffer::empty(Rect::new(0, 0, width, 30));
-                app.render(buffer.area, &mut buffer);
-                let list_width = if show_preview {
-                    width * 40 / 100
-                } else {
-                    width
-                };
-                let modified_width = match list_width {
-                    24 | 36 => 0,
-                    40 => 10,
-                    _ => 16,
-                };
-                let size_end = list_width - 1 - modified_width - 3 * u16::from(modified_width > 0);
-                let cell_text = |start, end, row| -> String {
-                    (start..end).map(|x| buffer[(x, row)].symbol()).collect()
-                };
-                assert_eq!(cell_text(size_end - 4, size_end, 1), "Size");
-                for (row, expected) in [(3, "7 B"), (4, "0 B"), (5, "1.5 KB")] {
-                    let size = cell_text(
-                        size_end - u16::try_from(expected.len()).unwrap(),
-                        size_end,
-                        row,
-                    );
-                    assert_eq!(size, expected, "width={width}, preview={show_preview}");
-                    if modified_width > 0 {
-                        let item = &app.browsing().unwrap().file_items()[usize::from(row - 2)];
-                        let format = if modified_width == 16 {
-                            "%Y-%m-%d %H:%M"
-                        } else {
-                            "%Y-%m-%d"
-                        };
-                        let modified = item.last_modified.unwrap().format(format).to_string();
-                        assert_eq!(
-                            cell_text(list_width - 1 - modified_width, list_width - 1, row),
-                            modified,
-                        );
-                    }
-                }
-                assert_eq!(
-                    cell_text(size_end - 6, list_width - 1, 2).trim(),
-                    "",
-                    "folder summaries stay blank until scanned"
+            let size_end = list_width - 1 - modified_width - 3 * u16::from(modified_width > 0);
+            let cell_text = |start, end, row| -> String {
+                (start..end).map(|x| buffer[(x, row)].symbol()).collect()
+            };
+            assert_eq!(cell_text(size_end - 4, size_end, 1), "Size");
+            for (row, expected) in [(3, "7 B"), (4, "0 B"), (5, "1.5 KB")] {
+                let size = cell_text(
+                    size_end - u16::try_from(expected.len()).unwrap(),
+                    size_end,
+                    row,
                 );
+                assert_eq!(size, expected, "width={width}");
+                if modified_width > 0 {
+                    let item = &app.browsing().unwrap().file_items()[usize::from(row - 2)];
+                    let format = if modified_width == 16 {
+                        "%Y-%m-%d %H:%M"
+                    } else {
+                        "%Y-%m-%d"
+                    };
+                    let modified = item.last_modified.unwrap().format(format).to_string();
+                    assert_eq!(
+                        cell_text(list_width - 1 - modified_width, list_width - 1, row),
+                        modified,
+                    );
+                }
             }
+            assert_eq!(
+                cell_text(size_end - 6, list_width - 1, 2).trim(),
+                "",
+                "folder summaries stay blank until scanned"
+            );
         }
     }
 
@@ -5179,20 +5170,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn open_preview_captures_keys_until_closed() {
+    async fn focused_preview_captures_keys_until_unfocused() {
         let (_dir, mut app) = navigation_test_app().await;
         app.browsing_mut().unwrap().selected_index = 1;
         let press = |code| KeyEvent::new(code, KeyModifiers::NONE);
 
         app.handle_key_event(press(KeyCode::Char('p'))).unwrap();
         settle(&mut app).await;
-        assert!(app.ui.preview.is_visible());
+        assert_eq!(app.ui.preview, super::PreviewPanel::Focused);
         assert!(app.preview_data.is_some());
 
-        // None of the file-list actions may reach the list hidden behind the preview.
+        // None of the file-list actions may reach the list behind the focused preview.
         for key in ['r', '/', 'd', 'x', 'c', 's', 'u', 'i', 'y'] {
             app.handle_key_event(press(KeyCode::Char(key))).unwrap();
-            assert!(app.ui.preview.is_visible(), "`{key}` closed the preview");
+            assert_eq!(
+                app.ui.preview,
+                super::PreviewPanel::Focused,
+                "`{key}` unfocused the preview"
+            );
             assert!(
                 matches!(app.modal, Modal::None),
                 "`{key}` opened a modal over the preview"
@@ -5205,10 +5200,24 @@ mod tests {
             assert_eq!(app.success_message, None);
         }
 
-        // Backspace closes the preview rather than leaving the container with it open.
+        // Backspace returns to the list, keeping the preview, rather than leaving the container.
         app.handle_key_event(press(KeyCode::Backspace)).unwrap();
-        assert!(!app.ui.preview.is_visible());
+        assert_eq!(app.ui.preview, super::PreviewPanel::Browsing);
+        assert!(app.preview_data.is_some());
         assert_eq!(app.browsing().unwrap().current_path(), "parent/");
+
+        // The pane keeps following the selection afterwards.
+        for key in ['k', 'j'] {
+            app.handle_key_event(press(KeyCode::Char(key))).unwrap();
+            app.sync_preview();
+        }
+        assert_eq!(app.browsing().unwrap().selected_index, 1);
+        assert!(app.preview_tasks.is_running());
+        let message = app.preview_tasks.recv().await.unwrap();
+        if let Some(event) = app.preview_tasks.accept(message) {
+            app.install_preview_event(event);
+        }
+        assert!(app.preview_data.is_some());
     }
 
     // Folders a < b < c by name, b > c > a by newest blob (b's is nested and
@@ -5306,8 +5315,8 @@ mod tests {
             items[1].last_modified.unwrap(),
             Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap()
         );
-        app.ui.preview = super::PreviewPanel::Hidden;
-        let text = rendered(&app);
+        // Wide enough that the list beside the preview shows full timestamps.
+        let text = rendered_at(&app, 160);
         assert!(text.contains("1 blob "));
         assert!(text.contains("2 blobs"));
         assert!(text.contains("2024-01-01 00:00"));
@@ -5562,8 +5571,12 @@ mod tests {
     }
 
     fn rendered(app: &App) -> String {
+        rendered_at(app, 100)
+    }
+
+    fn rendered_at(app: &App, width: u16) -> String {
         use ratatui::{buffer::Buffer, layout::Rect, widgets::Widget};
-        let area = Rect::new(0, 0, 100, 30);
+        let area = Rect::new(0, 0, width, 30);
         let mut buffer = Buffer::empty(area);
         app.render(area, &mut buffer);
         buffer
@@ -5609,20 +5622,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn preview_load_shows_progress_and_cancel_closes_the_panel() {
+    async fn preview_load_shows_progress_and_cancel_returns_to_automatic_preview() {
         let (gate, mut app) = gated_app().await;
         app.browsing_mut().unwrap().selected_index = 1;
 
         app.load_preview();
         assert!(rendered(&app).contains("Loading preview"));
         app.handle_key_event(KeyEvent::from(KeyCode::Esc)).unwrap();
-        assert!(!app.ui.preview.is_visible());
+        assert_eq!(app.ui.preview, super::PreviewPanel::Browsing);
         assert!(!app.tasks.is_running());
+        app.sync_preview();
+        assert!(app.preview_tasks.is_running(), "automatic preview restarts");
 
         gate.add_permits(10);
         app.load_preview();
         settle(&mut app).await;
-        assert!(app.ui.preview.is_visible());
+        assert_eq!(app.ui.preview, super::PreviewPanel::Focused);
         assert!(matches!(app.preview_data, Some(PreviewData::Text(_))));
     }
 
@@ -5641,7 +5656,7 @@ mod tests {
             assert!(rendered(&app).contains("Loading full preview"));
             app.handle_key_event(cancel).unwrap();
             assert!(!app.tasks.is_running());
-            assert!(!app.ui.preview.is_visible());
+            assert_eq!(app.ui.preview, super::PreviewPanel::Browsing);
             assert!(app.preview_data.is_none());
             assert_eq!(app.preview_scope, PreviewScope::Limited);
         }
