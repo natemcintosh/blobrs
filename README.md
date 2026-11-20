@@ -71,7 +71,11 @@ grant blob data access.
 - Favorites are saved per storage account in `$XDG_DATA_HOME/blobrs/favorites.json`
   (defaulting to `~/.local/share/blobrs/favorites.json`). Finish searching
   with Enter before pressing `f` to toggle a favorite.
-- The file list shows names, file sizes, and last-modified times in UTC. Narrow
+- Press `,` in the container list or file browser to open settings. Timestamps
+  can be shown in UTC (the default) or local time; the info popup (`i`) shows the
+  time zone abbreviation in effect at that time (e.g. CST or CDT). The choice is
+  saved immediately in `config.json` and kept between sessions.
+- The file list shows names, file sizes, and last-modified times (UTC by default). Narrow
   panes show just the date or hide that column to leave room for names.
   Folder blob counts (including nested folders) and newest-blob times appear
   when a date/size sort has loaded them. Normal browsing does not scan folders

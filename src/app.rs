@@ -11,10 +11,10 @@ use crate::{
     terminal_icons::{IconSet, detect_terminal_icons},
 };
 use arboard::Clipboard;
-use chrono::Utc;
 use futures::{Stream, StreamExt, TryStreamExt};
+use jiff::Timestamp;
 use object_store::{
-    GetOptions, GetRange, ObjectStore, ObjectStoreExt,
+    GetOptions, GetRange, ObjectMeta, ObjectStore, ObjectStoreExt,
     azure::{AzureCredential, AzureCredentialProvider, MicrosoftAzureBuilder},
     path::Path as ObjectPath,
 };
@@ -108,7 +108,7 @@ pub enum BlobInfo {
     File {
         name: String,
         size: u64,
-        last_modified: String,
+        last_modified: Option<Timestamp>,
         etag: Option<String>,
     },
     Folder {
@@ -132,8 +132,8 @@ pub struct FileItem {
     pub size: Option<u64>,
     /// Recursive count for folders, populated only by an explicitly requested scan.
     pub blob_count: Option<usize>,
-    pub last_modified: Option<chrono::DateTime<chrono::Utc>>,
-    pub created: Option<chrono::DateTime<chrono::Utc>>,
+    pub last_modified: Option<Timestamp>,
+    pub created: Option<Timestamp>,
 }
 
 /// Blob storage keeps no metadata for folders, so this is aggregated from their blobs.
@@ -141,7 +141,18 @@ pub struct FileItem {
 pub(crate) struct FolderStats {
     size: u64,
     blob_count: usize,
-    last_modified: chrono::DateTime<chrono::Utc>,
+    last_modified: Option<Timestamp>,
+}
+
+/// `object_store` reports times with chrono; convert once so the app uses jiff only.
+/// Times outside jiff's range (years ±9999) are not real blob times and are dropped.
+fn modified_at(meta: &ObjectMeta) -> Option<Timestamp> {
+    let time = meta.last_modified;
+    Timestamp::new(
+        time.timestamp(),
+        time.timestamp_subsec_nanos().cast_signed(),
+    )
+    .ok()
 }
 
 /// What a finished directory listing is for, which decides how it is installed.
@@ -237,6 +248,7 @@ pub enum Modal {
     },
     UploadPicker,
     SortPicker,
+    Settings,
     Clone {
         input: String,
         original_path: String,
@@ -631,6 +643,11 @@ impl App {
             return Ok(());
         }
 
+        if matches!(self.modal, Modal::Settings) {
+            self.handle_settings_key_event(key_event);
+            return Ok(());
+        }
+
         // Handle delete dialog separately
         if self.is_modal_delete_dialog() {
             return self.handle_delete_dialog_key_event(key_event);
@@ -696,6 +713,7 @@ impl App {
                     self.open_accounts();
                 }
                 KeyCode::Char('f') => self.toggle_favorite(),
+                KeyCode::Char(',') => self.modal = Modal::Settings,
                 KeyCode::Char('/') => {
                     self.enter_container_search_mode();
                 }
@@ -777,6 +795,9 @@ impl App {
                 }
                 KeyCode::Char('u') if matches!(self.modal, Modal::None) => {
                     self.modal = Modal::UploadPicker;
+                }
+                KeyCode::Char(',') if matches!(self.modal, Modal::None) => {
+                    self.modal = Modal::Settings;
                 }
                 KeyCode::Char('d') => {
                     if !self.is_modal_blob_info()
@@ -1009,6 +1030,27 @@ impl App {
         self.modal = Modal::None;
     }
 
+    fn handle_settings_key_event(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Char('c' | 'C') if key.modifiers == KeyModifiers::CONTROL => self.quit(),
+            KeyCode::Char('q') => self.quit(),
+            KeyCode::Esc | KeyCode::Backspace | KeyCode::Char(',') => self.close_modal(),
+            KeyCode::Enter | KeyCode::Char(' ' | 'h' | 'l') | KeyCode::Left | KeyCode::Right => {
+                self.toggle_time_display();
+            }
+            _ => {}
+        }
+    }
+
+    /// Saved immediately, so the choice lasts between sessions.
+    fn toggle_time_display(&mut self) {
+        let next = self.config.time_display().toggled();
+        match Config::set_time_display(&self.config_path, next) {
+            Ok(config) => self.config = config,
+            Err(error) => self.error_message = Some(format!("Cannot save settings: {error}")),
+        }
+    }
+
     pub(crate) fn is_searching_containers(&self) -> bool {
         matches!(self.search, Search::Containers { .. })
     }
@@ -1074,7 +1116,7 @@ impl App {
                     kind: EntryKind::File,
                     size: Some(meta.size),
                     blob_count: None,
-                    last_modified: Some(meta.last_modified),
+                    last_modified: modified_at(&meta),
                     created: None, // Azure Blob Storage doesn't provide creation time in list operation
                 });
             }
@@ -1115,7 +1157,7 @@ impl App {
                 Some(folder_stats) => {
                     folder_stats.size += meta.size;
                     folder_stats.blob_count += 1;
-                    folder_stats.last_modified = folder_stats.last_modified.max(meta.last_modified);
+                    folder_stats.last_modified = folder_stats.last_modified.max(modified_at(&meta));
                 }
                 None => {
                     stats.insert(
@@ -1123,7 +1165,7 @@ impl App {
                         FolderStats {
                             size: meta.size,
                             blob_count: 1,
-                            last_modified: meta.last_modified,
+                            last_modified: modified_at(&meta),
                         },
                     );
                 }
@@ -1140,7 +1182,7 @@ impl App {
             if let Some(folder_stats) = stats.get(&item.actual_name) {
                 item.size = Some(folder_stats.size);
                 item.blob_count = Some(folder_stats.blob_count);
-                item.last_modified = Some(folder_stats.last_modified);
+                item.last_modified = folder_stats.last_modified;
             }
         }
     }
@@ -2197,8 +2239,9 @@ impl App {
             }
 
             // Create timestamp in RFC 1123 format
-            let now = Utc::now();
-            let date = now.format("%a, %d %b %Y %H:%M:%S GMT").to_string();
+            let date = Timestamp::now()
+                .strftime("%a, %d %b %Y %H:%M:%S GMT")
+                .to_string();
 
             // Resolve credentials for each page so an expired token is refreshed.
             let response = Self::container_list_request(credentials, &client, &url)
@@ -2471,10 +2514,7 @@ impl App {
             Ok(meta) => Ok(BlobInfo::File {
                 name: blob_name.to_string(),
                 size: meta.size,
-                last_modified: meta
-                    .last_modified
-                    .format("%Y-%m-%d %H:%M:%S UTC")
-                    .to_string(),
+                last_modified: modified_at(&meta),
                 etag: meta.e_tag.clone(),
             }),
             Err(e) => Err(color_eyre::eyre::eyre!("Failed to get blob metadata: {e}",)),
@@ -3244,8 +3284,8 @@ mod tests {
         ParquetSchemaPreview, PreviewData, PreviewFileType, PreviewScope, TablePreview,
     };
     use crate::terminal_icons::detect_terminal_icons;
-    use chrono::{TimeZone, Utc};
     use futures::{StreamExt, stream::BoxStream};
+    use jiff::Timestamp;
     use object_store::{ObjectStoreExt, path::Path as ObjectPath};
     use proptest::prelude::*;
     use std::collections::BTreeMap;
@@ -3265,11 +3305,9 @@ mod tests {
         ]
     }
 
-    fn arb_timestamp() -> impl Strategy<Value = Option<chrono::DateTime<chrono::Utc>>> {
+    fn arb_timestamp() -> impl Strategy<Value = Option<Timestamp>> {
         prop::option::of((-2_208_988_800_i64..4_102_444_800_i64).prop_map(|secs| {
-            Utc.timestamp_opt(secs, 0)
-                .single()
-                .expect("generated timestamp should be valid")
+            Timestamp::from_second(secs).expect("generated timestamp should be valid")
         }))
     }
 
@@ -5024,7 +5062,7 @@ mod tests {
                     } else {
                         "%Y-%m-%d"
                     };
-                    let modified = item.last_modified.unwrap().format(format).to_string();
+                    let modified = item.last_modified.unwrap().strftime(format).to_string();
                     assert_eq!(
                         cell_text(list_width - 1 - modified_width, list_width - 1, row),
                         modified,
@@ -5235,12 +5273,15 @@ mod tests {
             let path = dir.path().join(base).join(path);
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
             std::fs::write(&path, vec![0_u8; size]).unwrap();
-            let modified = Utc.with_ymd_and_hms(year, 1, 1, 0, 0, 0).unwrap();
+            let modified = jiff::civil::date(year, 1, 1)
+                .to_zoned_datetime(jiff::tz::TimeZone::UTC)
+                .unwrap()
+                .timestamp();
             std::fs::File::options()
                 .write(true)
                 .open(&path)
                 .unwrap()
-                .set_modified(modified.into())
+                .set_modified(modified.try_into().unwrap())
                 .unwrap();
         }
         let store = object_store::local::LocalFileSystem::new_with_prefix(dir.path()).unwrap();
@@ -5292,6 +5333,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn settings_switch_timestamps_to_local_and_save_the_choice() {
+        use crate::config::TimeDisplay;
+        let (_files, mut app) = folder_sort_test_app("").await;
+        let config_dir = tempfile::tempdir().unwrap();
+        app.config_path = config_dir.path().join("config.json");
+
+        app.handle_key_event(KeyEvent::from(KeyCode::Char(',')))
+            .unwrap();
+        assert!(matches!(app.modal, Modal::Settings));
+        app.handle_key_event(KeyEvent::from(KeyCode::Enter))
+            .unwrap();
+        assert!(rendered_at(&app, 160).contains("Settings"));
+        app.handle_key_event(KeyEvent::from(KeyCode::Esc)).unwrap();
+        assert!(matches!(app.modal, Modal::None));
+
+        let saved = crate::config::Config::load(&app.config_path).unwrap();
+        assert_eq!(saved.time_display(), TimeDisplay::Local);
+        assert!(rendered_at(&app, 160).contains("Modified (Local)"));
+    }
+
+    #[tokio::test]
     async fn folder_columns_reuse_recursive_sort_statistics() {
         let (_dir, mut app) = folder_sort_test_app("").await;
         assert!(
@@ -5313,7 +5375,7 @@ mod tests {
         );
         assert_eq!(
             items[1].last_modified.unwrap(),
-            Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap()
+            "2024-01-01T00:00:00Z".parse::<Timestamp>().unwrap()
         );
         // Wide enough that the list beside the preview shows full timestamps.
         let text = rendered_at(&app, 160);
@@ -5878,8 +5940,8 @@ mod tests {
                 String,
                 bool,
                 Option<u64>,
-                Option<chrono::DateTime<chrono::Utc>>,
-                Option<chrono::DateTime<chrono::Utc>>,
+                Option<Timestamp>,
+                Option<Timestamp>,
             );
 
             let mut sorted = items.clone();

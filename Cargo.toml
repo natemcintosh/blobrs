@@ -17,7 +17,6 @@ url = "2.5"
 futures = "0.3"
 reqwest = { version = "0.13", features = ["json"] }
 serde = { version = "1.0", features = ["derive"] }
-chrono = { version = "0.4", features = ["serde"] }
 regex = "1.12"
 rfd = { version = "0.17", default-features = false, features = ["xdg-portal"] }
 arboard = "3.6"
@@ -30,6 +29,7 @@ arrow = "58"
 bytes = "1.11"
 tempfile = "3"
 tokio-util = "0.7"
+jiff = "1.0.1"
 
 [dev-dependencies]
 async-trait = "0.1"

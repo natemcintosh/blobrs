@@ -209,6 +209,11 @@ impl App {
                     Hint::new("Esc", "Cancel"),
                 ],
                 Modal::BlobInfo { .. } => &[Hint::new("Esc/←/h", "Close"), Hint::new("q", "Quit")],
+                Modal::Settings => &[
+                    Hint::new("Enter/←/→", "Change"),
+                    Hint::new("Esc/,", "Close"),
+                    Hint::new("q", "Quit"),
+                ],
                 Modal::None if self.ui.preview == PreviewPanel::Focused => {
                     return self.preview_command_bar(width);
                 }
@@ -219,6 +224,7 @@ impl App {
                         Hint::new("Enter/→/l", "Open"),
                         Hint::new("/", "Search"),
                         Hint::new("f", "Favorite"),
+                        Hint::new(",", "Settings"),
                         Hint::new("r/F5", "Refresh"),
                         Hint::new("a/Esc", "Accounts"),
                         Hint::new("q", "Quit"),
@@ -236,6 +242,7 @@ impl App {
                         Hint::new("u", "Upload"),
                         Hint::new("c", "Clone"),
                         Hint::new("x", "Delete"),
+                        Hint::new(",", "Settings"),
                         Hint::new("r/F5", "Refresh"),
                         Hint::new("q", "Quit"),
                     ],

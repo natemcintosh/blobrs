@@ -6,7 +6,10 @@ use ratatui::{
     widgets::{Clear, Padding, Paragraph, Widget, Wrap},
 };
 
-use crate::app::{App, BlobInfo};
+use crate::{
+    app::{App, BlobInfo},
+    config::TimeDisplay,
+};
 
 use super::{
     ACCENT, BACKGROUND, DANGER, MUTED, SURFACE, TEXT,
@@ -131,7 +134,17 @@ impl App {
                     detail("Name", truncate_with_ellipsis(name, value_width)),
                     Line::default(),
                     detail("Size", format_bytes(*size)),
-                    detail("Modified", last_modified.clone()),
+                    detail(
+                        "Modified",
+                        last_modified.map_or_else(
+                            || "Unknown".to_owned(),
+                            |time| {
+                                self.config
+                                    .time_display()
+                                    .format(time, "%Y-%m-%d %H:%M:%S %Z")
+                            },
+                        ),
+                    ),
                 ];
                 if let Some(etag) = etag {
                     lines.push(detail("ETag", truncate_with_ellipsis(etag, value_width)));
@@ -238,6 +251,45 @@ impl App {
             Line::default(),
             Line::styled(
                 "Date and size sorts scan all blobs in folders.",
+                Style::default().fg(MUTED),
+            ),
+        ])
+        .wrap(Wrap { trim: false })
+        .render(body, buf);
+    }
+
+    pub(super) fn render_settings_popup(&self, area: Rect, buf: &mut Buffer) {
+        let current = self.config.time_display();
+        let mut timestamps = vec![Span::styled("Timestamps: ", Style::default().fg(MUTED))];
+        for option in [TimeDisplay::Utc, TimeDisplay::Local] {
+            let style = if option == current {
+                Style::default()
+                    .fg(BACKGROUND)
+                    .bg(ACCENT)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(MUTED)
+            };
+            timestamps.push(Span::styled(format!(" {} ", option.label()), style));
+            timestamps.push(Span::raw(" "));
+        }
+        let zone = TimeDisplay::Local.format(jiff::Timestamp::now(), "%Z");
+        let body = popup(
+            area,
+            buf,
+            "Settings",
+            56,
+            3,
+            &[
+                Hint::new("Enter/←/→", "Change"),
+                Hint::new("Esc/,", "Close"),
+            ],
+        );
+        Paragraph::new(vec![
+            Line::from(timestamps),
+            Line::default(),
+            Line::styled(
+                format!("Local uses this computer's time zone (now {zone})."),
                 Style::default().fg(MUTED),
             ),
         ])

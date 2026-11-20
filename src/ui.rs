@@ -12,6 +12,7 @@ use ratatui::{
 use crate::app::{
     AccountPicker, App, EntryKind, FileItem, Modal, ParquetPreviewMode, PreviewPanel, Session,
 };
+use crate::config::TimeDisplay;
 use crate::preview::PreviewData;
 
 mod command_bar;
@@ -97,7 +98,12 @@ impl Widget for &App {
         buf.set_style(area, Style::default().fg(TEXT));
         match &self.session {
             Session::Accounts(picker) => self.render_accounts(area, buf, picker),
-            Session::Selecting => self.render_container_selection(area, buf),
+            Session::Selecting => {
+                self.render_container_selection(area, buf);
+                if matches!(self.modal, Modal::Settings) {
+                    self.render_settings_popup(area, buf);
+                }
+            }
             Session::Browsing(_) => {
                 self.render_blob_browsing(area, buf);
 
@@ -128,6 +134,7 @@ impl Widget for &App {
                     Modal::SortPicker => {
                         App::render_sort_popup(area, buf);
                     }
+                    Modal::Settings => self.render_settings_popup(area, buf),
                     Modal::None => {}
                 }
             }
@@ -436,12 +443,18 @@ impl App {
         );
         // Reserve borders, the selection marker, column spacing, and 12 cells
         // for names before adding a timestamp column.
+        // Headings name the zone; they must fit in the column width.
+        let time_display = self.config.time_display();
+        let (modified_heading, date_heading) = match time_display {
+            TimeDisplay::Utc => ("Modified (UTC)", "Date (UTC)"),
+            TimeDisplay::Local => ("Modified (Local)", "Local date"),
+        };
         let modified_column = match file_list_area
             .width
             .saturating_sub(size_width + 16 + 2 * FILE_LIST_COLUMN_SPACING)
         {
-            16.. => Some((16, "Modified (UTC)", "%Y-%m-%d %H:%M")),
-            10.. => Some((10, "Date (UTC)", "%Y-%m-%d")),
+            16.. => Some((16, modified_heading, "%Y-%m-%d %H:%M")),
+            10.. => Some((10, date_heading, "%Y-%m-%d")),
             _ => None,
         };
         let mut widths = vec![Constraint::Min(0), Constraint::Length(size_width)];
@@ -483,7 +496,7 @@ impl App {
                     if let Some((_, _, format)) = modified_column {
                         let modified = item
                             .and_then(|item| item.last_modified)
-                            .map_or_default(|date| date.format(format).to_string());
+                            .map_or_default(|time| time_display.format(time, format));
                         cells.push(Cell::from(modified));
                     }
                     Row::new(cells)

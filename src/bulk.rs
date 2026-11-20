@@ -100,10 +100,14 @@ mod tests {
     use futures::stream;
     use std::cell::Cell;
 
+    #[expect(
+        clippy::default_trait_access,
+        reason = "object_store's chrono timestamp type is not a direct dependency"
+    )]
     fn meta(name: &str) -> ObjectMeta {
         ObjectMeta {
             location: Path::from(name),
-            last_modified: chrono::Utc::now(),
+            last_modified: Default::default(),
             size: 1,
             e_tag: None,
             version: None,
